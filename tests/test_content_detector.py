@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from cigilbot.content.detector import ContentRule, check_content
-from cigilbot.types import ContentCategory
+from cigilbot.domain.types import ContentCategory
 
 
 def make_rule(**overrides: object) -> ContentRule:

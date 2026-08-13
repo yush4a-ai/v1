@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from cigilbot.store import ModerationStore
+from cigilbot.storage.store import ModerationStore
 from tests.panel.conftest import login_as
 
 
@@ -181,7 +181,7 @@ class TestContentEventsEndpoint:
     async def test_viewer_can_read(
         self, app_client: TestClient, store: ModerationStore
     ) -> None:
-        from cigilbot.types import ContentCategory
+        from cigilbot.domain.types import ContentCategory
 
         await store.record_content_event(
             user_id="1", login="viewer1", message_id=None, category=ContentCategory.RACISM,
@@ -226,7 +226,7 @@ class TestContentEventManualActionEndpoint:
     async def test_moderator_can_mark(
         self, app_client: TestClient, store: ModerationStore
     ) -> None:
-        from cigilbot.types import ContentCategory
+        from cigilbot.domain.types import ContentCategory
 
         event_id = await store.record_content_event(
             user_id="1", login="viewer1", message_id=None, category=ContentCategory.RACISM,

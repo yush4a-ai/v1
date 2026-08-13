@@ -8,9 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from cigilbot.normalize import fingerprint
-from cigilbot.store import ModerationStore, PatternInput
-from cigilbot.types import (
+from cigilbot.domain.normalize import fingerprint
+from cigilbot.domain.types import (
     Action,
     ClusterInfo,
     Mode,
@@ -19,6 +18,7 @@ from cigilbot.types import (
     TrustLevel,
     Verdict,
 )
+from cigilbot.storage.store import ModerationStore, PatternInput
 from tests.conftest import EventFactory
 
 

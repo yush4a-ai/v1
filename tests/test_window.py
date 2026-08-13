@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from cigilbot.normalize import fingerprint
-from cigilbot.window import SlidingWindow
+from cigilbot.domain.normalize import fingerprint
+from cigilbot.domain.window import SlidingWindow
 from tests.conftest import EventFactory
 
 

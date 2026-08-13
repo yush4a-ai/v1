@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from cigilbot.fingerprints_store import FingerprintStore
+from cigilbot.storage.fingerprints_store import FingerprintStore
 
 
 @pytest.fixture

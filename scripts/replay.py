@@ -19,10 +19,8 @@ import asyncio
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from cigilbot.config import load_channel_profile, load_config  # noqa: E402
-from cigilbot.replay import read_messages, run_replay, to_events  # noqa: E402
+from cigilbot.domain.config import load_channel_profile, load_config
+from cigilbot.orchestration.replay import read_messages, run_replay, to_events
 
 
 def parse_args() -> argparse.Namespace:

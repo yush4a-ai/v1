@@ -15,10 +15,10 @@ from pathlib import Path
 
 import pytest
 
-from cigilbot.config import ChannelProfile, default_config
-from cigilbot.engine import ESCALATION_CLUSTER_THRESHOLD, ModerationEngine
-from cigilbot.store import ModerationStore, PatternInput
-from cigilbot.types import Action, ClusterInfo, Mode
+from cigilbot.domain.config import ChannelProfile, default_config
+from cigilbot.domain.types import Action, ClusterInfo, Mode
+from cigilbot.orchestration.engine import ESCALATION_CLUSTER_THRESHOLD, ModerationEngine
+from cigilbot.storage.store import ModerationStore, PatternInput
 from tests.conftest import EventFactory
 
 
@@ -270,7 +270,7 @@ class TestUserCacheEviction:
         # Маленький потолок ради скорости теста — подменяем модульную
         # константу, а не гоняем MAX_CACHED_USERS+ сообщений.
         engine_max = 5
-        import cigilbot.engine as engine_module
+        import cigilbot.orchestration.engine as engine_module
 
         original = engine_module.MAX_CACHED_USERS
         engine_module.MAX_CACHED_USERS = engine_max
@@ -288,7 +288,7 @@ class TestUserCacheEviction:
         await store.connect()
         engine = make_engine(store=store)
 
-        import cigilbot.engine as engine_module
+        import cigilbot.orchestration.engine as engine_module
 
         original = engine_module.MAX_CACHED_USERS
         engine_module.MAX_CACHED_USERS = 2
@@ -318,7 +318,7 @@ class TestUserCacheEviction:
     ) -> None:
         engine = make_engine(store=None)
 
-        import cigilbot.engine as engine_module
+        import cigilbot.orchestration.engine as engine_module
 
         original = engine_module.MAX_CACHED_USERS
         engine_module.MAX_CACHED_USERS = 3
@@ -591,7 +591,7 @@ class TestAutoChannelContext:
         assert engine.raid_active is True
 
     async def test_raid_expires_after_context_window(self, event_factory: EventFactory) -> None:
-        from cigilbot.engine import RAID_CONTEXT_SECONDS
+        from cigilbot.orchestration.engine import RAID_CONTEXT_SECONDS
 
         engine = make_engine()
         long_ago = time.time() - RAID_CONTEXT_SECONDS - 1
@@ -601,7 +601,7 @@ class TestAutoChannelContext:
     async def test_explicit_channel_context_not_overridden(
         self, event_factory: EventFactory
     ) -> None:
-        from cigilbot.types import ChannelContext
+        from cigilbot.domain.types import ChannelContext
 
         engine = make_engine()
         # Явно переданный контекст должен использоваться как есть, даже
@@ -917,7 +917,7 @@ class TestNewClusterAlert:
         async def fake_send_cluster_alert(webhook, cluster, *, channel, transport=None):  # type: ignore[no-untyped-def]
             sent.append(cluster)
 
-        monkeypatch.setattr("cigilbot.engine.send_cluster_alert", fake_send_cluster_alert)
+        monkeypatch.setattr("cigilbot.orchestration.engine.send_cluster_alert", fake_send_cluster_alert)
 
         store = ModerationStore(str(tmp_path / "mod.db"))
         await store.connect()
@@ -940,7 +940,7 @@ class TestNewClusterAlert:
         async def fake_send_cluster_alert(webhook, cluster, *, channel, transport=None):  # type: ignore[no-untyped-def]
             sent.append(cluster)
 
-        monkeypatch.setattr("cigilbot.engine.send_cluster_alert", fake_send_cluster_alert)
+        monkeypatch.setattr("cigilbot.orchestration.engine.send_cluster_alert", fake_send_cluster_alert)
 
         store = ModerationStore(str(tmp_path / "mod.db"))
         await store.connect()
@@ -966,7 +966,7 @@ class TestAlertConfidenceFilter:
         async def fake_send_cluster_alert(webhook, cluster, *, channel, transport=None):  # type: ignore[no-untyped-def]
             sent.append(cluster)
 
-        monkeypatch.setattr("cigilbot.engine.send_cluster_alert", fake_send_cluster_alert)
+        monkeypatch.setattr("cigilbot.orchestration.engine.send_cluster_alert", fake_send_cluster_alert)
 
         store = ModerationStore(str(tmp_path / "mod.db"))
         await store.connect()
@@ -989,7 +989,7 @@ class TestAlertConfidenceFilter:
         async def fake_send_cluster_alert(webhook, cluster, *, channel, transport=None):  # type: ignore[no-untyped-def]
             sent.append(cluster)
 
-        monkeypatch.setattr("cigilbot.engine.send_cluster_alert", fake_send_cluster_alert)
+        monkeypatch.setattr("cigilbot.orchestration.engine.send_cluster_alert", fake_send_cluster_alert)
 
         store = ModerationStore(str(tmp_path / "mod.db"))
         await store.connect()
@@ -1029,8 +1029,8 @@ class TestEscalation:
         async def fake_send_escalation(webhook, *, channel, cluster_count, window_hours, transport=None):  # type: ignore[no-untyped-def]
             escalations.append(cluster_count)
 
-        monkeypatch.setattr("cigilbot.engine.send_cluster_alert", _noop_alert)
-        monkeypatch.setattr("cigilbot.engine.send_escalation", fake_send_escalation)
+        monkeypatch.setattr("cigilbot.orchestration.engine.send_cluster_alert", _noop_alert)
+        monkeypatch.setattr("cigilbot.orchestration.engine.send_escalation", fake_send_escalation)
 
         store = ModerationStore(str(tmp_path / "mod.db"))
         await store.connect()
@@ -1054,8 +1054,8 @@ class TestEscalation:
         async def fake_send_escalation(webhook, *, channel, cluster_count, window_hours, transport=None):  # type: ignore[no-untyped-def]
             escalations.append(cluster_count)
 
-        monkeypatch.setattr("cigilbot.engine.send_cluster_alert", _noop_alert)
-        monkeypatch.setattr("cigilbot.engine.send_escalation", fake_send_escalation)
+        monkeypatch.setattr("cigilbot.orchestration.engine.send_cluster_alert", _noop_alert)
+        monkeypatch.setattr("cigilbot.orchestration.engine.send_escalation", fake_send_escalation)
 
         store = ModerationStore(str(tmp_path / "mod.db"))
         await store.connect()
@@ -1079,8 +1079,8 @@ class TestEscalation:
         async def fake_send_escalation(webhook, *, channel, cluster_count, window_hours, transport=None):  # type: ignore[no-untyped-def]
             escalations.append(cluster_count)
 
-        monkeypatch.setattr("cigilbot.engine.send_cluster_alert", _noop_alert)
-        monkeypatch.setattr("cigilbot.engine.send_escalation", fake_send_escalation)
+        monkeypatch.setattr("cigilbot.orchestration.engine.send_cluster_alert", _noop_alert)
+        monkeypatch.setattr("cigilbot.orchestration.engine.send_escalation", fake_send_escalation)
 
         store = ModerationStore(str(tmp_path / "mod.db"))
         await store.connect()

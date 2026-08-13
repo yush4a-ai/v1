@@ -10,9 +10,9 @@ import time
 
 from fastapi.testclient import TestClient
 
-from cigilbot.normalize import fingerprint
-from cigilbot.store import ModerationStore
-from cigilbot.types import ChatEvent
+from cigilbot.domain.normalize import fingerprint
+from cigilbot.domain.types import ChatEvent
+from cigilbot.storage.store import ModerationStore
 from tests.panel.conftest import login_as
 
 PASTE = "Привет, это я - твой единственный зритель, смотрю тебя годами."

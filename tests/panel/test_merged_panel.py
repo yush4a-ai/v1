@@ -25,7 +25,7 @@ from pathlib import Path
 import pytest
 
 import paths
-from cigilbot.registry_store import RegistryStore
+from cigilbot.storage.registry_store import RegistryStore
 from panel.auth import (
     DEFAULT_AFTER_LOGIN,
     _list_env_profile_channels,

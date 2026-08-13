@@ -16,10 +16,8 @@ import asyncio
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from cigilbot.report import build_report  # noqa: E402
-from cigilbot.store import ModerationStore  # noqa: E402
+from cigilbot.orchestration.report import build_report
+from cigilbot.storage.store import ModerationStore
 
 
 def parse_args() -> argparse.Namespace:

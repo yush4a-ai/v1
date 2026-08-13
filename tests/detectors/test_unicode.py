@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from cigilbot.config import default_config
 from cigilbot.detectors import unicode as unicode_detector
+from cigilbot.domain.config import default_config
 from tests.conftest import EventFactory, make_context
 
 

@@ -20,8 +20,8 @@ from bot.voice_queue import VoiceQueue
 # Обычный импорт: пакеты лежат в одном корне. Пока bot/ и cigilbot/ были
 # разными каталогами под apps/, здесь стояла вставка пути в sys.path, а
 # импорт приходилось уводить вниз под неё с noqa: E402.
-from cigilbot.pipeline import ModerationHub
-from cigilbot.registry_store import RegistryStore
+from cigilbot.orchestration.pipeline import ModerationHub
+from cigilbot.storage.registry_store import RegistryStore
 
 cfg = load_config()
 

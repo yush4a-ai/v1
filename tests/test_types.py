@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from cigilbot.types import (
+from cigilbot.domain.types import (
     Action,
     RiskLevel,
     Signal,

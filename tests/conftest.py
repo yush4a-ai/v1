@@ -13,11 +13,11 @@ from collections.abc import Callable
 
 import pytest
 
-from cigilbot.config import ChannelProfile, ModerationConfig, default_config
 from cigilbot.detectors.base import DetectionContext
-from cigilbot.normalize import fingerprint
-from cigilbot.types import ChannelContext, ChatEvent, UserState
-from cigilbot.window import SlidingWindow
+from cigilbot.domain.config import ChannelProfile, ModerationConfig, default_config
+from cigilbot.domain.normalize import fingerprint
+from cigilbot.domain.types import ChannelContext, ChatEvent, UserState
+from cigilbot.domain.window import SlidingWindow
 
 _user_id_counter = itertools.count(1)
 

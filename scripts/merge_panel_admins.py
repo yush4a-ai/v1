@@ -27,16 +27,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sqlite3
-import sys
 from pathlib import Path
 
-# Скрипт запускается как файл (`python scripts/merge_panel_admins.py`), а
-# не как модуль пакета, поэтому sys.path[0] — каталог scripts/, и корень
-# проекта в него не входит.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from cigilbot.store import ModerationStore  # noqa: E402
-from paths import BOT_VAR, MOD_DB  # noqa: E402
+from cigilbot.storage.store import ModerationStore
+from paths import BOT_VAR, MOD_DB
 
 # Та же иерархия, что panel/moderation_api.py::_ROLE_RANK.
 _ROLE_RANK = {"VIEWER": 0, "MODERATOR": 1, "ADMIN": 2, "OWNER": 3}

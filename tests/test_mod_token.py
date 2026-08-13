@@ -9,7 +9,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from cigilbot.mod_token import (
+from cigilbot.integrations.mod_token import (
     ModTokenError,
     ModTokenManager,
     load_mod_token_manager,

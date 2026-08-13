@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from cigilbot.detectors import duplicate
-from cigilbot.window import SlidingWindow
+from cigilbot.domain.window import SlidingWindow
 from tests.conftest import EventFactory, add_message, make_context
 
 

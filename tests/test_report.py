@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from cigilbot.report import build_report
-from cigilbot.store import ModerationStore
+from cigilbot.orchestration.report import build_report
+from cigilbot.storage.store import ModerationStore
 
 
 @pytest.fixture

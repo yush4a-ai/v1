@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from cigilbot.config import default_config
 from cigilbot.detectors import cross_channel
-from cigilbot.types import SignalFamily
+from cigilbot.domain.config import default_config
+from cigilbot.domain.types import SignalFamily
 from tests.conftest import EventFactory, make_context
 
 

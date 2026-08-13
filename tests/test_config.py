@@ -6,13 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from cigilbot.config import (
+from cigilbot.domain.config import (
     ConfigError,
     default_config,
     load_channel_profile,
     load_config,
 )
-from cigilbot.types import Sensitivity, SignalFamily
+from cigilbot.domain.types import Sensitivity, SignalFamily
 
 
 class TestDefaultConfig:

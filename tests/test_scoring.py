@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from cigilbot.config import default_config
-from cigilbot.scoring import families_triggered, risk_score
-from cigilbot.types import Sensitivity, Signal, SignalFamily
+from cigilbot.domain.config import default_config
+from cigilbot.domain.scoring import families_triggered, risk_score
+from cigilbot.domain.types import Sensitivity, Signal, SignalFamily
 
 
 def sig(name: str, family: SignalFamily, weight: float, value: float = 1.0) -> Signal:

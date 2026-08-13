@@ -17,10 +17,10 @@ from pathlib import Path
 
 import pytest
 
-from cigilbot.config import ChannelProfile, default_config
-from cigilbot.engine import ModerationEngine
-from cigilbot.store import ModerationStore
-from cigilbot.types import Action, ContentCategory, Mode
+from cigilbot.domain.config import ChannelProfile, default_config
+from cigilbot.domain.types import Action, ContentCategory, Mode
+from cigilbot.orchestration.engine import ModerationEngine
+from cigilbot.storage.store import ModerationStore
 from tests.conftest import EventFactory
 
 

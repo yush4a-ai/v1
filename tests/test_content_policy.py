@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 
 from cigilbot.content.policy import decide_content
-from cigilbot.types import (
+from cigilbot.domain.types import (
     Action,
     ChatEvent,
     ContentCategory,

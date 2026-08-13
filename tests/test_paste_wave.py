@@ -11,9 +11,9 @@ from pathlib import Path
 
 import pytest
 
-from cigilbot.normalize import fingerprint
-from cigilbot.store import ModerationStore
-from cigilbot.types import ChatEvent
+from cigilbot.domain.normalize import fingerprint
+from cigilbot.domain.types import ChatEvent
+from cigilbot.storage.store import ModerationStore
 
 
 @pytest.fixture

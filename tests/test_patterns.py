@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import time
 
-from cigilbot.patterns import Pattern, match_patterns
-from cigilbot.types import Action, ClusterInfo, Mode, Signal, SignalFamily, Verdict
+from cigilbot.domain.patterns import Pattern, match_patterns
+from cigilbot.domain.types import Action, ClusterInfo, Mode, Signal, SignalFamily, Verdict
 
 
 def make_pattern(**overrides: object) -> Pattern:

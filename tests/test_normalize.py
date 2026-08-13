@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from cigilbot.normalize import (
+from cigilbot.domain.normalize import (
     extract_links,
     find_invisible_chars,
     fingerprint,

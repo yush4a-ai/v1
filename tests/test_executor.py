@@ -13,7 +13,8 @@ from pathlib import Path
 import httpx
 import pytest
 
-from cigilbot.executor import (
+from cigilbot.integrations.twitch_api import HelixClient
+from cigilbot.orchestration.executor import (
     DEFAULT_TIMEOUT_DURATION_SECONDS,
     MAX_TIMEOUT_DURATION_SECONDS,
     ActionExecutor,
@@ -21,9 +22,8 @@ from cigilbot.executor import (
     parse_payload,
     process_pending,
 )
-from cigilbot.fingerprints_store import FingerprintStore
-from cigilbot.store import ModerationStore
-from cigilbot.twitch_api import HelixClient
+from cigilbot.storage.fingerprints_store import FingerprintStore
+from cigilbot.storage.store import ModerationStore
 from tests.conftest import EventFactory
 
 

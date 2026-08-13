@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from cigilbot.config import default_config
 from cigilbot.detectors import links
-from cigilbot.window import SlidingWindow
+from cigilbot.domain.config import default_config
+from cigilbot.domain.window import SlidingWindow
 from tests.conftest import EventFactory, add_message, make_context
 
 

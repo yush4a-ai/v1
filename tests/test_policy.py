@@ -9,9 +9,9 @@ from __future__ import annotations
 import time
 from dataclasses import replace
 
-from cigilbot import policy
-from cigilbot.config import default_config
-from cigilbot.types import (
+from cigilbot.domain import policy
+from cigilbot.domain.config import default_config
+from cigilbot.domain.types import (
     Action,
     ChatEvent,
     Sensitivity,

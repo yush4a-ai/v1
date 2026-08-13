@@ -17,9 +17,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from cigilbot.registry_store import RegistryStore
-from cigilbot.store import ModerationStore, PatternInput
-from cigilbot.types import (
+from cigilbot.domain.types import (
     Action,
     ChatEvent,
     ClusterInfo,
@@ -28,6 +26,8 @@ from cigilbot.types import (
     SignalFamily,
     Verdict,
 )
+from cigilbot.storage.registry_store import RegistryStore
+from cigilbot.storage.store import ModerationStore, PatternInput
 from tests.panel.conftest import login_as
 
 
@@ -1349,7 +1349,7 @@ class TestContentWebSocket:
     async def test_sends_recorded_event(
         self, app_client: TestClient, store: ModerationStore
     ) -> None:
-        from cigilbot.types import ContentCategory
+        from cigilbot.domain.types import ContentCategory
 
         await store.record_content_event(
             user_id="1", login="viewer1", message_id=None, category=ContentCategory.RACISM,

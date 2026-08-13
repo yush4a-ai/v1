@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from cigilbot.config import ChannelProfile, default_config
 from cigilbot.detectors import language
+from cigilbot.domain.config import ChannelProfile, default_config
 from tests.conftest import EventFactory, make_context
 
 

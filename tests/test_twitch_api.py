@@ -10,7 +10,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from cigilbot.twitch_api import (
+from cigilbot.integrations.twitch_api import (
     MAX_USERS_PER_REQUEST,
     HelixClient,
     HelixError,

@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 from starlette.middleware.sessions import SessionMiddleware
 
 import panel.auth as auth
-from cigilbot.store import ModerationStore
+from cigilbot.storage.store import ModerationStore
 from paths import PanelRoots
 
 

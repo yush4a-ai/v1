@@ -10,21 +10,30 @@ Russian prose to English, and write new comments in Russian.
 
 ## Repository layout
 
-One project, one process pair. Packages sit at the repo root; there is no `apps/` and no
-per-package `pyproject.toml`.
+One project, one process pair. Packages live under `src/`, with `cigilbot/` split into layers.
 
 ```
-bot/            chat bot: Twitch IRC, DeepSeek replies, voice input
-cigilbot/       moderation engine: detectors, clustering, scoring, policy
-panel/          web panel (port 8766), two screens, one login
+src/
+  bot/            chat bot: Twitch IRC, DeepSeek replies, voice input
+  cigilbot/       moderation engine, by layer:
+    domain/         pure logic — types, scoring, confidence, policy, clustering, config
+    storage/        SQLite — three independent store+migrations pairs
+    integrations/   Twitch Helix, Discord webhooks, bot process control
+    orchestration/  engine/pipeline/executor — wire the layers together
+    detectors/      spam/bot detectors, a vertical slice (unchanged internally)
+    content/        banned-word rule engine, a vertical slice (unchanged internally)
+  panel/          web panel (port 8766), two screens, one login
+  paths.py        the single source of truth for where things live — outside all three
+                   packages, a package itself (not a bare module) so editable install
+                   redirects it to src/ instead of copying it into site-packages
 config/         detector thresholds and per-channel profiles
 prompts/        saved bot prompts
 scripts/        one-offs: registry import, replay, reports, admin merge
 tests/          615 tests, one suite
 docs/           plans and per-area descriptions
-main.py         entry point: chat + moderation
-voice_main.py   entry point: voice input
-paths.py        the single source of truth for where things live
+main.py         entry point: chat + moderation (imported by run.py, not run directly)
+run.py          the one command: chat bot, moderation, panel, voice
+voice_main.py   entry point: voice input (child process)
 var/            runtime state — databases, logs, pids (gitignored)
 ```
 
@@ -33,6 +42,14 @@ inserts in `main.py`, a bootstrap module in `panel/__init__.py` whose only job w
 imports, three `paths.py` with duplicated constants plus a test guarding their agreement, and
 three `pyproject.toml` with `mypy_path` reaching through `../`. All of it is gone.
 
+Packages later moved under `src/`, and `cigilbot/` gained layers inside — not a return to three
+directories: one `pip install -e .`, one `.venv`, one `pyproject.toml`. Imports are unchanged
+(`import cigilbot`, `import bot`, `import panel`, `import paths`); only what's on disk moved.
+`paths.py` is a package (`src/paths/__init__.py`), not a bare file — hatchling's editable
+install *copies* single force-included files into site-packages, which breaks
+`Path(__file__).resolve()`; a package with one `__init__.py` gets an honest redirect instead,
+the same guarantee the other three packages get.
+
 | | `bot` | `cigilbot` | `panel` |
 |---|---|---|---|
 | Purpose | AI chat companion (DeepSeek) + voice input | Anti-spam moderation engine | Web panel for both, port 8766 |
@@ -40,8 +57,8 @@ three `pyproject.toml` with `mypy_path` reaching through `../`. All of it is gon
 
 **Moderation runs inside the bot process.** It used to be a separate process per channel
 (`consumer.py`) fed by a `mod_inbox` table on disk, under a supervisor. That boundary is gone:
-`main.py` builds a `ModerationHub` (`cigilbot/pipeline.py`) that holds one `ModerationEngine`
-per channel and reconciles the set against the Channel Registry itself.
+`main.py` builds a `ModerationHub` (`cigilbot/orchestration/pipeline.py`) that holds one
+`ModerationEngine` per channel and reconciles the set against the Channel Registry itself.
 
 What survived the merge, and must keep surviving:
 
@@ -68,8 +85,11 @@ inside the panel, so closing it stopped restart-on-crash for consumers.
 Two processes total: the bot (chat + moderation) and the panel. One `.venv`, one `.env`, both
 in the repo root. Voice dependencies (~600 MB) are optional, in `requirements-voice.txt`.
 
-Python 3.12 on Windows. Not a package — `pyproject.toml` intentionally has no
-`[build-system]`/`[project]` section, only ruff/pytest/mypy config.
+Python 3.12 on Windows. `pyproject.toml` has a minimal `[build-system]`/`[project]` — not to
+publish a package (`dependencies` is deliberately empty; `requirements*.txt` stays the single
+source of truth), but so `pip install -e .` makes `src/bot`, `src/cigilbot`, `src/panel`,
+`src/paths` importable at all. Python only adds the launched script's own directory to
+`sys.path` (the repo root, where `run.py`/`main.py` live), not `src/`.
 
 ## Commands
 
@@ -81,6 +101,7 @@ directories to `cd` into any more.
 # Setup (once)
 python -m venv .venv
 .\.venv\Scripts\pip install -r requirements-dev.txt   # includes requirements.txt
+.\.venv\Scripts\pip install -e . --no-deps             # makes src/bot, src/cigilbot, src/panel, src/paths importable
 copy .env.example .env
 .\.venv\Scripts\pip install -r requirements-voice.txt # only if VOICE_ENABLED=true
 
@@ -143,7 +164,7 @@ connection and the engines' warm state (sliding window, user cache, clusters):
 In-process, through an `asyncio.Queue`:
 
 ```
-main.py                  cigilbot/pipeline.py (same process)
+main.py                  cigilbot/orchestration/pipeline.py (same process)
   reads Twitch IRC                          ModerationHub, one engine per channel
   hub.submit(event)      --queue-->         consumer task analyses, writes
   (returns immediately)                      verdicts into mod.<broadcaster_id>.db
@@ -184,12 +205,11 @@ The whole directory is one line in `.gitignore`, replacing a list of masks (`*.d
 `logs/`, `usage*.json`, …) that had to grow with every new kind of working file, where a miss
 meant a live database or a secret in a commit.
 
-Three modules define these paths and **must agree**: `bot/paths.py`, `cigilbot/paths.py` and
-`panel/paths.py`. The panel duplicates the definitions rather than importing them, because
-its own `sys.path` bootstrap (`panel/__init__.py`) imports `panel.paths` and cannot depend on
-the engines being importable yet. `test_merged_panel.py::test_panel_and_engines_agree_on_state_dirs`
-asserts the duplicate has not drifted — if it does, the panel writes one file while the engine
-reads another.
+One module defines these paths — `paths.py` (`src/paths/__init__.py`), imported the same way
+by `bot`, `cigilbot`, `panel`, and the entry points. This used to be three separate copies
+(`bot/paths.py`, `cigilbot/paths.py`, `panel/paths.py`) with a test guarding that they hadn't
+drifted; the copies and the test are both gone along with the `apps/` boundary that forced
+them to exist.
 
 Paths are absolute. `bot/config.py` used to return `"bot.db"` relative to the current
 directory, which worked only because the panel always launched `main.py` with
@@ -203,7 +223,7 @@ the lock file itself lives in `var/*/run/`.
 `bot.db` may carry an `INSTANCE` suffix (`bot.<instance>.db`) under the legacy profile model
 — see below. `bot/database.py` runs `executescript` on every connect with no versioning;
 `registry.db` and `mod.*.db` use real migrations (`PRAGMA user_version` /
-`cigilbot/migrations.py`).
+`cigilbot/storage/migrations.py`).
 
 ### Channel identity
 
@@ -279,7 +299,7 @@ now. `_list_profile_channels` returns the **union** of both channel models, beca
 `role_for_profile` receives a `broadcaster_id` from `moderation_api` and a profile name from
 the bots screen; Registry wins on key collision.
 
-The panel controls `main.py` directly via subprocess (`cigilbot/bot_process_control.py`),
+The panel controls `main.py` directly via subprocess (`cigilbot/integrations/bot_process_control.py`),
 because twitchio cannot join a new channel without a reconnect. Auto-restart is deliberately
 not implemented there: one `main.py` serves every channel, so restarting it would drop
 moderation on channels that are live right now.
@@ -338,9 +358,10 @@ a comment or a template:
 1. `docs/*.html` and `docs/moderation-plan.md` still describe the two-panel split and the
    `mod_inbox` handoff as current. They are the design record for Phase 1 and were not
    rewritten; read them as history, not as the present shape.
-2. `scripts/import_registry.py` is a one-off from the Registry migration.
-   It still works; the Cigilbot copy of it was deleted because that project dropped
-   `.env.<profile>` in Phase 1, so it could only ever print "импортировать нечего".
+2. `scripts/import_registry.py` is a one-off from the Registry migration. It imports
+   `bot.registry.ChannelRegistry`, which does not exist — `bot/` has no `registry.py`. Broken
+   independently of the `src/` move (confirmed both before and after); the `sys.path` insert
+   was deliberately left in place rather than "fixed" toward a script that still can't run.
 3. `registry_store.py` still carries comments saying `process_status` is written "only by
    supervisor.py". The writer is now `ModerationHub`; the rule (one writer, and never the
    panel) is unchanged.
@@ -352,4 +373,7 @@ Earlier entries here are fixed and gone: missing `streamlink`/`av` (now pinned i
 `.env.example` documents every key both engines read, `INTERNAL_SYNC_TOKEN` included),
 stale pre-monorepo paths in comments (`bot/moderation/...`, `mod.<profile>.db`,
 `../TWITCH BOTS`), the dead per-project `.venv`, and runtime state living inside the
-source trees — all state now lives in `var/`, see below.
+source trees — all state now lives in `var/`, see below. The `src/` migration (bot/,
+cigilbot/, panel/, paths.py moved; cigilbot/ split into domain/storage/integrations/
+orchestration/detectors/content) is complete — every import, config path, and doc
+reference in this file already reflects it, not a pending item.

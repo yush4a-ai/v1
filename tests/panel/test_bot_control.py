@@ -22,7 +22,7 @@ from fastapi.testclient import TestClient
 from starlette.middleware.sessions import SessionMiddleware
 
 import panel.registry_api as registry_api
-from cigilbot import bot_process_control
+from cigilbot.integrations import bot_process_control
 from panel.auth import SESSION_KEY
 
 

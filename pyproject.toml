@@ -1,10 +1,31 @@
-# Конфигурация инструментов разработки. Проект не пакет и не собирается —
-# секции [build-system]/[project] намеренно отсутствуют, чтобы никто не
-# пытался его устанавливать. Здесь только настройки ruff/pytest/mypy.
+# Конфигурация инструментов разработки плюс минимальный [build-system]/
+# [project] — не ради публикации пакета (dependencies намеренно пустой,
+# requirements.txt остаётся единственным источником правды по зависимостям),
+# а ради `pip install -e .`: bot/, cigilbot/, panel/ переехали под src/, и
+# без editable install интерпретатор не видит их как импортируемые пакеты
+# (Python добавляет в sys.path каталог запускаемого скрипта, не src/).
 #
-# Файлов было три, по одному на каталог в apps/. Каталог теперь один, и
-# вместе с ними исчезли mypy_path через ../ и необходимость держать три
-# набора одинаковых правил ruff синхронными руками.
+# Файлов конфига было три, по одному на каталог в apps/. Каталог теперь
+# один, и вместе с ним исчезли mypy_path через ../ и необходимость держать
+# три набора одинаковых правил ruff синхронными руками.
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cigilbot-monorepo"
+version = "0.0.0"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.hatch.build.targets.wheel]
+# paths — пакет (src/paths/__init__.py), не одиночный файл: force-include
+# копирует одиночные файлы в site-packages вместо editable-редиректа, из-за
+# чего Path(__file__) в них после установки указывает на .venv, а не на
+# src/ (см. докстринг src/paths/__init__.py). Пакет с одним __init__.py
+# получает честный editable-редирект — та же гарантия, что и у остальных.
+packages = ["src/bot", "src/cigilbot", "src/panel", "src/paths"]
 
 [tool.ruff]
 line-length = 100
@@ -36,7 +57,7 @@ ignore = [
 # SIM103 в _is_skip_reply: прямой возврат условия отдал бы объект Match от
 # SILENCE_PATTERN.match(), а не bool, как объявлено в сигнатуре. Цепочка
 # guard-clause'ов здесь и честнее по типу, и читается ровнее.
-"bot/brain.py" = ["SIM103"]
+"src/bot/brain.py" = ["SIM103"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -57,17 +78,22 @@ markers = [
 # значит утонуть в шуме. panel/bots_api.py — тот же непроверяемый код,
 # просто переехавший в пакет панели (бывшая панель нейроботов).
 files = [
-    "cigilbot",
-    "paths.py",
-    "panel/auth.py",
-    "panel/moderation_api.py",
-    "panel/registry_api.py",
-    "panel/server.py",
+    "src/cigilbot",
+    "src/paths",
+    "src/panel/auth.py",
+    "src/panel/moderation_api.py",
+    "src/panel/registry_api.py",
+    "src/panel/server.py",
     "tests",
 ]
 python_version = "3.12"
 strict = true
 warn_unreachable = true
+# editable install кладёт cigilbot/bot/panel/paths в site-packages как
+# редиректы на src/ (см. докстринг src/paths/__init__.py), но mypy_path
+# указан явно и здесь: mypy резолвит импорты не так, как интерпретатор,
+# и не всегда подхватывает editable-хуки сам.
+mypy_path = "src"
 
 # Библиотеки без типов — не наша забота
 [[tool.mypy.overrides]]

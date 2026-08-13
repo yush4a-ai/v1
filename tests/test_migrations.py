@@ -6,7 +6,7 @@ from pathlib import Path
 
 import aiosqlite
 
-from cigilbot.migrations import MIGRATIONS, current_version, migrate
+from cigilbot.storage.migrations import MIGRATIONS, current_version, migrate
 
 
 async def _tables(conn: aiosqlite.Connection) -> set[str]:

@@ -27,8 +27,8 @@ from starlette.middleware.sessions import SessionMiddleware
 
 import panel.moderation_api as moderation_api
 import panel.registry_api as registry_api
-from cigilbot.registry_store import RegistryStore
-from cigilbot.store import ModerationStore
+from cigilbot.storage.registry_store import RegistryStore
+from cigilbot.storage.store import ModerationStore
 from panel.auth import SESSION_KEY, _list_profile_channels
 from paths import PanelRoots
 

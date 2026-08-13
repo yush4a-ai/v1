@@ -9,10 +9,10 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from cigilbot.clustering import find_clusters
-from cigilbot.config import default_config
-from cigilbot.types import ChannelContext
-from cigilbot.window import SlidingWindow
+from cigilbot.domain.clustering import find_clusters
+from cigilbot.domain.config import default_config
+from cigilbot.domain.types import ChannelContext
+from cigilbot.domain.window import SlidingWindow
 from tests.conftest import EventFactory, add_message, make_user_state
 
 
@@ -235,7 +235,7 @@ class TestDisabled:
 
 class TestExcludedPhrases:
     def test_manually_excluded_phrase_does_not_cluster(self, event_factory: EventFactory) -> None:
-        from cigilbot.normalize import normalize_for_matching
+        from cigilbot.domain.normalize import normalize_for_matching
 
         cfg = default_config()
         common = "спасибо стример хороший стрим было очень интересно"

@@ -5,9 +5,9 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from cigilbot.config import ChannelProfile, default_config
-from cigilbot.replay import ReplayRow, read_messages, run_replay, to_events
-from cigilbot.types import Action
+from cigilbot.domain.config import ChannelProfile, default_config
+from cigilbot.domain.types import Action
+from cigilbot.orchestration.replay import ReplayRow, read_messages, run_replay, to_events
 
 
 def make_legacy_db(path: Path, rows: list[tuple[str, str, float]]) -> None:

@@ -7,9 +7,9 @@ family_factor_for(1) существенно ниже confidence.minimum_for_time
 
 from __future__ import annotations
 
-from cigilbot.confidence import confidence
-from cigilbot.config import default_config
-from cigilbot.types import ChannelContext, Signal, SignalFamily
+from cigilbot.domain.confidence import confidence
+from cigilbot.domain.config import default_config
+from cigilbot.domain.types import ChannelContext, Signal, SignalFamily
 
 
 def sig(name: str, family: SignalFamily, weight: float = 20, value: float = 1.0) -> Signal:

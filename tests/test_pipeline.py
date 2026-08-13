@@ -19,12 +19,12 @@ from pathlib import Path
 
 import pytest
 
-from cigilbot import pipeline as pipeline_mod
-from cigilbot.fingerprints_store import FingerprintStore
-from cigilbot.pipeline import ChannelPipeline, ModerationHub
-from cigilbot.registry_store import RegistryStore
-from cigilbot.twitch_api import HelixClient
-from cigilbot.types import RiskLevel
+from cigilbot.domain.types import RiskLevel
+from cigilbot.integrations.twitch_api import HelixClient
+from cigilbot.orchestration import pipeline as pipeline_mod
+from cigilbot.orchestration.pipeline import ChannelPipeline, ModerationHub
+from cigilbot.storage.fingerprints_store import FingerprintStore
+from cigilbot.storage.registry_store import RegistryStore
 
 
 class StubEngine:
@@ -435,8 +435,8 @@ class TestPollActionQueueUsesOwnBroadcasterId:
     async def test_executor_receives_pipeline_broadcaster_id_not_token_state(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from cigilbot.executor import ActionExecutor
-        from cigilbot.mod_token import ModTokenManager
+        from cigilbot.integrations.mod_token import ModTokenManager
+        from cigilbot.orchestration.executor import ActionExecutor
 
         pipeline = ChannelPipeline(
             broadcaster_id="second_channel",

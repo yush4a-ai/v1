@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from cigilbot.store import ModerationStore
+from cigilbot.storage.store import ModerationStore
 
 
 @pytest.fixture
