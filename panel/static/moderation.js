@@ -387,14 +387,15 @@ async function loadChannels() {
 
 const SCREEN_TITLES = {
   channels: "Каналы",
-  live: "Live — активные кластеры",
-  users: "Users — зрители канала",
-  audit: "Audit — журнал действий модераторов",
-  patterns: "Bot Pattern Library",
-  attack: "Attack Mode",
-  content: "Content — словарный детектор",
-  stats: "Stats — статистика и FP-rate",
-  settings: "Settings — конфигурация и токен бота",
+  live: "Прямой эфир — активные кластеры",
+  users: "Пользователи — зрители канала",
+  trusted: "Доверенные зрители",
+  audit: "Аудит — журнал действий модераторов",
+  patterns: "Библиотека паттернов",
+  attack: "Режим атаки",
+  content: "Словарный детектор",
+  stats: "Статистика и FP-rate",
+  settings: "Настройки — конфигурация и токен бота",
 };
 
 function switchScreen(name) {
@@ -404,6 +405,7 @@ function switchScreen(name) {
   el("screen-title").textContent = SCREEN_TITLES[name] || "";
   if (name === "channels") loadChannels();
   if (name === "users") loadUsers();
+  if (name === "trusted") loadTrustedUsers();
   if (name === "audit") loadAudit();
   if (name === "patterns") loadPatterns();
   if (name === "attack") {
@@ -891,6 +893,63 @@ el("btn-users-search").addEventListener("click", () => loadUsers());
 el("users-search").addEventListener("keydown", (e) => {
   if (e.key === "Enter") loadUsers();
 });
+
+// --- доверенные зрители (направление 04 master-plan.html) ----------------
+
+async function loadTrustedUsers() {
+  const body = el("trusted-body");
+  const empty = el("trusted-empty");
+  try {
+    const resp = await apiFetch(`/api/moderation/trusted?profile=${encodeURIComponent(currentProfile())}`);
+    const rows = await resp.json();
+    if (!rows.length) {
+      body.innerHTML = "";
+      empty.style.display = "block";
+      return;
+    }
+    empty.style.display = "none";
+    body.innerHTML = rows
+      .map(
+        (r) => `
+        <tr>
+          <td>${escapeHtml(r.login || r.user_id)}</td>
+          <td>${r.message_count ?? "—"}</td>
+          <td>${formatTime(r.added_at)}</td>
+          <td>${escapeHtml(r.added_by)}</td>
+          <td>${escapeHtml(r.reason || "—")}</td>
+          <td><button class="btn btn-ghost btn-small" data-unmark="${escapeHtml(r.user_id)}" data-login="${escapeHtml(r.login || r.user_id)}">Снять</button></td>
+        </tr>`
+      )
+      .join("");
+    body.querySelectorAll("[data-unmark]").forEach((btn) => {
+      btn.addEventListener("click", () => unmarkTrusted(btn.dataset.unmark, btn.dataset.login));
+    });
+  } catch {
+    body.innerHTML = "";
+    empty.style.display = "block";
+  }
+}
+
+async function unmarkTrusted(userId, login) {
+  if (!canAct()) {
+    toast("Требуется роль MODERATOR и выше", "error");
+    return;
+  }
+  try {
+    const resp = await apiFetch(`/api/moderation/users/${encodeURIComponent(userId)}/unmark_safe`, {
+      method: "POST",
+      body: JSON.stringify({ profile: currentProfile() }),
+    });
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      throw new Error(body.detail || resp.statusText);
+    }
+    toast(`${login || userId}: пометка снята`, "success");
+    loadTrustedUsers();
+  } catch (e) {
+    toast(`Ошибка: ${e.message}`, "error");
+  }
+}
 
 // --- audit ----------------------------------------------------------
 

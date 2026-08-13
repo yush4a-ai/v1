@@ -651,6 +651,7 @@ class TestTrustedUsersEndpoints:
         data = resp.json()
         assert len(data) == 1
         assert data[0]["user_id"] == "1"
+        assert data[0]["login"] == "viewer1"
 
 
 class TestPatternsEndpoints:

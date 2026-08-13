@@ -601,42 +601,55 @@ input::placeholder { color: var(--text-faint); }
       <div class="brand-name">Модерация</div>
     </a>
 
-    <div class="nav-label">Экраны</div>
     <div class="nav-item active" data-screen="channels" role="button" tabindex="0">
       <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><rect x="1.5" y="2.5" width="5.5" height="5.5" rx="1.2" stroke="currentColor" stroke-width="1.5"/><rect x="9" y="2.5" width="5.5" height="5.5" rx="1.2" stroke="currentColor" stroke-width="1.5"/><rect x="1.5" y="9.5" width="5.5" height="4" rx="1.2" stroke="currentColor" stroke-width="1.5"/><rect x="9" y="9.5" width="5.5" height="4" rx="1.2" stroke="currentColor" stroke-width="1.5"/></svg>
       Каналы
     </div>
+
+    <div class="nav-label">Прямой эфир</div>
     <div class="nav-item" data-screen="live" role="button" tabindex="0">
       <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="3" fill="currentColor"/><path d="M3.5 3.5a7 7 0 0 0 0 9M12.5 3.5a7 7 0 0 1 0 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
-      Live
+      Кластеры и лента
     </div>
-    <div class="nav-item" data-screen="users" role="button" tabindex="0">
-      <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><circle cx="6" cy="5.5" r="2.5" stroke="currentColor" stroke-width="1.5"/><path d="M1.5 14c.5-3 2.2-4.5 4.5-4.5s4 1.5 4.5 4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M10.5 3.2c1.2.3 2 1.3 2 2.6s-.8 2.3-2 2.6M12 9.7c1.7.5 2.7 1.9 3 4.3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
-      Users
-    </div>
+
+    <div class="nav-label">Аналитика</div>
     <div class="nav-item" data-screen="audit" role="button" tabindex="0">
       <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><rect x="3" y="1.5" width="10" height="13" rx="1.5" stroke="currentColor" stroke-width="1.5"/><path d="M5.5 5.5h5M5.5 8h5M5.5 10.5h3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
-      Audit
-    </div>
-    <div class="nav-item" data-screen="patterns" role="button" tabindex="0">
-      <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><rect x="1.5" y="1.5" width="5.5" height="5.5" rx="1.2" stroke="currentColor" stroke-width="1.5"/><rect x="9" y="9" width="5.5" height="5.5" rx="1.2" stroke="currentColor" stroke-width="1.5"/><path d="M9 4.3h2.7A2.3 2.3 0 0 1 14 6.6V9M7 11.7H4.3A2.3 2.3 0 0 1 2 9.4V7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
-      Patterns
-    </div>
-    <div class="nav-item" data-screen="attack" role="button" tabindex="0">
-      <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><path d="M8 1.5 14.5 13h-13L8 1.5Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M8 6.2v3M8 11h.01" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
-      Attack Mode
-    </div>
-    <div class="nav-item" data-screen="content" role="button" tabindex="0">
-      <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><rect x="2" y="2.5" width="12" height="11" rx="1.5" stroke="currentColor" stroke-width="1.5"/><path d="M5 6.5h6M5 9h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
-      Content
+      Аудит
     </div>
     <div class="nav-item" data-screen="stats" role="button" tabindex="0">
       <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><path d="M2 13.5h12M4 13.5V8M8 13.5V3.5M12 13.5V6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      Stats
+      Статистика
     </div>
+
+    <div class="nav-label">Пользователи</div>
+    <div class="nav-item" data-screen="users" role="button" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><circle cx="6" cy="5.5" r="2.5" stroke="currentColor" stroke-width="1.5"/><path d="M1.5 14c.5-3 2.2-4.5 4.5-4.5s4 1.5 4.5 4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M10.5 3.2c1.2.3 2 1.3 2 2.6s-.8 2.3-2 2.6M12 9.7c1.7.5 2.7 1.9 3 4.3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      Все пользователи
+    </div>
+    <div class="nav-item" data-screen="trusted" role="button" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><path d="M8 1.5 2.5 4v4c0 3.5 2.3 5.9 5.5 7 3.2-1.1 5.5-3.5 5.5-7V4L8 1.5Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M5.5 8.2 7.2 10 10.5 6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Доверенные зрители
+    </div>
+
+    <div class="nav-label">Автоматизация</div>
+    <div class="nav-item" data-screen="patterns" role="button" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><rect x="1.5" y="1.5" width="5.5" height="5.5" rx="1.2" stroke="currentColor" stroke-width="1.5"/><rect x="9" y="9" width="5.5" height="5.5" rx="1.2" stroke="currentColor" stroke-width="1.5"/><path d="M9 4.3h2.7A2.3 2.3 0 0 1 14 6.6V9M7 11.7H4.3A2.3 2.3 0 0 1 2 9.4V7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      Паттерны
+    </div>
+    <div class="nav-item" data-screen="attack" role="button" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><path d="M8 1.5 14.5 13h-13L8 1.5Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M8 6.2v3M8 11h.01" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      Атака / Розыгрыш
+    </div>
+    <div class="nav-item" data-screen="content" role="button" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><rect x="2" y="2.5" width="12" height="11" rx="1.5" stroke="currentColor" stroke-width="1.5"/><path d="M5 6.5h6M5 9h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      Словарный детектор
+    </div>
+
+    <div class="nav-label">Настройки</div>
     <div class="nav-item" data-screen="settings" role="button" tabindex="0">
       <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="2.2" stroke="currentColor" stroke-width="1.5"/><path d="M8 1.8v1.6M8 12.6v1.6M14.2 8h-1.6M3.4 8H1.8M12.3 3.7l-1.1 1.1M4.8 11.1l-1.1 1.1M12.3 12.3l-1.1-1.1M4.8 4.9 3.7 3.8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
-      Settings
+      Канал и токен
     </div>
 
     <!-- Ссылки на экран ботов здесь раньше не было вовсе: он жил в другом
@@ -751,6 +764,23 @@ input::placeholder { color: var(--text-faint); }
             <tbody id="users-body"></tbody>
           </table>
           <div class="empty" id="users-empty" style="display:none;">Зрителей пока нет</div>
+        </div>
+      </div>
+
+      <div class="screen" id="screen-trusted">
+        <div class="card">
+          <div class="note" style="margin-bottom:14px;">
+            Пометка снимает risk-boost с обычных сигналов — доверенный зритель всё ещё может получить BAN,
+            если сработало минимум два независимых семейства сигналов. Добавить зрителя можно кликом по его
+            нику в карточке кластера на экране «Прямой эфир».
+          </div>
+          <table class="users-table">
+            <thead>
+              <tr><th>Ник</th><th>Сообщений</th><th>Отмечен</th><th>Кем</th><th>Причина</th><th></th></tr>
+            </thead>
+            <tbody id="trusted-body"></tbody>
+          </table>
+          <div class="empty" id="trusted-empty" style="display:none;">Доверенных зрителей пока нет</div>
         </div>
       </div>
 

@@ -1076,6 +1076,19 @@ class TestTrustedUsers:
         assert rows[0]["added_by"] == "mod2"
         assert rows[0]["reason"] == "updated reason"
 
+    async def test_list_trusted_includes_login_and_message_count(
+        self, store: ModerationStore, event_factory: EventFactory
+    ) -> None:
+        event = event_factory(user_id="1", login="viewer1")
+        await store.upsert_user(event)
+        await store.upsert_user(event)  # message_count = 2
+        await store.mark_trusted("1", added_by="mod1", reason="regular")
+
+        rows = await store.list_trusted()
+
+        assert rows[0]["login"] == "viewer1"
+        assert rows[0]["message_count"] == 2
+
 
 def make_pattern_input(**overrides: object) -> PatternInput:
     defaults: dict[str, object] = {

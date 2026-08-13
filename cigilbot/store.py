@@ -852,14 +852,22 @@ class ModerationStore:
         return await cursor.fetchone() is not None
 
     async def list_trusted(self) -> list[dict[str, Any]]:
+        """login/message_count — из mod_users, для экрана "Доверенные
+        зрители" (направление 04 master-plan.html): без них панель не
+        может показать ник и историю активности, только голый user_id."""
         self._db.row_factory = aiosqlite.Row
         cursor = await self._db.execute(
             # rowid, а не id: у mod_trusted первичный ключ — user_id (TEXT),
             # отдельной колонки id нет, но неявный rowid растёт по порядку
             # вставки и годится как разрыв ничьей. Ничья здесь обычная:
             # added_at приходит из time.time(), см. get_signal_fp_penalty.
-            "SELECT user_id, added_by, added_at, reason FROM mod_trusted "
-            "ORDER BY added_at DESC, rowid DESC"
+            """
+            SELECT t.user_id, t.added_by, t.added_at, t.reason,
+                   u.login, u.message_count
+            FROM mod_trusted t
+            LEFT JOIN mod_users u ON u.user_id = t.user_id
+            ORDER BY t.added_at DESC, t.rowid DESC
+            """
         )
         return [dict(row) for row in await cursor.fetchall()]
 
