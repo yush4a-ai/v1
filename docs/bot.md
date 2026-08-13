@@ -56,13 +56,12 @@ copy .env.example .env
 конфликтовали и падали). Держи открытыми оба окна во время стрима:
 
 ```powershell
-cd apps\twitch-bots
+# Обычный запуск — одна команда из корня репозитория, поднимает чат-бота,
+# модерацию, панель и (если VOICE_ENABLED=true) голос дочерним процессом:
+.\.venv\Scripts\python run.py
 
-# Окно 1 — Twitch-чат (нужен всегда)
-..\..\.venv\Scripts\python main.py
-
-# Окно 2 — голосовой ввод (нужен только если VOICE_ENABLED=true)
-..\..\.venv\Scripts\python voice_main.py
+# Только чат-бот и модерация, без панели и без голоса — для отладки:
+.\.venv\Scripts\python run.py --bot-only
 ```
 
 Бот подключится к чату и будет отвечать, когда зрители пишут сообщение,

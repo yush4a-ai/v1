@@ -522,25 +522,8 @@ class ChatBot(commands.Bot):
         await ctx.send(f"Я ИИ-бот этого канала. Позовите меня: {names}")
 
 
-if __name__ == "__main__":
-    # Запуск ТОЛЬКО бота, без панели и без голоса — для отладки. Обычный
-    # рабочий запуск один: `python run.py`, он поднимает всё сразу.
-    #
-    # ChatBot.__init__ (через twitchio.Client.__init__) вызывает
-    # asyncio.get_event_loop() синхронно — в Python 3.12 это падает, если
-    # нет текущего loop в потоке (asyncio.run() в load_initial_channels()
-    # ниже создаёт свой loop и закрывает его по выходу). Явно создаём и
-    # устанавливаем loop перед созданием бота, тот же loop потом использует
-    # bot.run() изнутри twitchio.
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    channels = loop.run_until_complete(load_initial_channels())
-    if not channels:
-        raise SystemExit(
-            "Нет ни одного активного канала (Channel Registry пуст и TWITCH_CHANNEL "
-            "в .env не задан) — добавьте канал через панель перед запуском"
-        )
-    log.info("Список каналов для подключения: %s", ", ".join(channels))
-    bot = ChatBot(channels)
-    bot.run()
+# Нет отдельного if __name__ == "__main__" — единственная точка входа теперь
+# run.py (флаг --bot-only заменяет прежний `python main.py`). main.py остаётся
+# чистым модулем: ChatBot и load_initial_channels используются оттуда через
+# import main, тот же путь запуска бота (asyncio.create_task(bot.start())),
+# что и в полном режиме — не отдельный синхронный bot.run().

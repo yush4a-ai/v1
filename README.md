@@ -111,7 +111,7 @@ copy .env.example .env
 
 ```powershell
 .\.venv\Scripts\python -m panel.server   # только панель
-.\.venv\Scripts\python main.py           # только бот и модерация
+.\.venv\Scripts\python run.py --bot-only # только бот и модерация
 ```
 
 Подробности по каждому проекту — в README внутри:

@@ -33,10 +33,16 @@
 движка (скользящее окно, кэш пользователей, кластеры):
 
     .venv\\Scripts\\python -m panel.server
+
+Бот отдельно, без панели и без голоса — для отладки чат-бота, замена
+прежнего отдельного `python main.py`:
+
+    .venv\\Scripts\\python run.py --bot-only
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import os
@@ -125,7 +131,7 @@ async def _serve_panel() -> None:
     await uvicorn.Server(config).serve()
 
 
-async def _run_all(main: object) -> None:
+async def _run_all(main: object, *, bot_only: bool) -> None:
     channels = await main.load_initial_channels()  # type: ignore[attr-defined]
     if not channels:
         raise SystemExit(
@@ -135,7 +141,6 @@ async def _run_all(main: object) -> None:
     log.info("Список каналов для подключения: %s", ", ".join(channels))
 
     bot = main.ChatBot(channels)  # type: ignore[attr-defined]
-    log.info("Панель: http://localhost:%d/", PANEL_PORT)
 
     # Задачи НЕ снимают друг друга при падении, и это осознанно.
     #
@@ -149,10 +154,14 @@ async def _run_all(main: object) -> None:
     # Цена — процесс может жить наполовину. Поэтому падение каждой задачи
     # логируется немедленно через колбэк, а не всплывает в конце: молча
     # работающая половина выглядит как работающее целое, и это хуже всего.
-    tasks = [
-        asyncio.create_task(bot.start(), name="чат-бот"),
-        asyncio.create_task(_serve_panel(), name="панель"),
-    ]
+    tasks = [asyncio.create_task(bot.start(), name="чат-бот")]
+    # --bot-only (замена прежнего отдельного `python main.py`): панель не
+    # поднимается вовсе, а не поднимается и сразу глушится — иначе порт 8766
+    # оказался бы ненадолго занят самим этим процессом, мешая параллельно
+    # запущенной `python -m panel.server` для отладки её кода.
+    if not bot_only:
+        log.info("Панель: http://localhost:%d/", PANEL_PORT)
+        tasks.append(asyncio.create_task(_serve_panel(), name="панель"))
     for task in tasks:
         task.add_done_callback(_log_if_failed)
 
@@ -166,6 +175,13 @@ async def _run_all(main: object) -> None:
 
 
 def main_entry() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "--bot-only", action="store_true",
+        help="только чат-бот и модерация, без панели и без голоса — замена `python main.py`",
+    )
+    args = parser.parse_args()
+
     # main импортируется ПЕРВЫМ и настраивает логирование сам (файл
     # var/bot/logs/bot.log + консоль). Свой logging.basicConfig здесь
     # молча отобрал бы файловый обработчик: повторный вызов basicConfig
@@ -173,9 +189,9 @@ def main_entry() -> None:
     # файл просто перестала бы происходить, без единой ошибки.
     import main
 
-    voice = _start_voice(enabled=main.cfg.voice_enabled)
+    voice = _start_voice(enabled=main.cfg.voice_enabled and not args.bot_only)
     try:
-        asyncio.run(_run_all(main))
+        asyncio.run(_run_all(main, bot_only=args.bot_only))
     except KeyboardInterrupt:
         log.info("Остановка по Ctrl+C")
     finally:

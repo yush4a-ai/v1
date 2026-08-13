@@ -133,7 +133,7 @@ connection and the engines' warm state (sliding window, user cache, clusters):
 
 ```powershell
 .\.venv\Scripts\python -m panel.server   # panel only
-.\.venv\Scripts\python main.py           # bot + moderation only
+.\.venv\Scripts\python run.py --bot-only # bot + moderation only
 ```
 
 ## Architecture
