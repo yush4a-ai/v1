@@ -96,6 +96,11 @@ OAUTH_SCOPES = "user:read:moderated_channels"
 # panel-login (см. _fetch_moderated_channel_ids).
 BOT_TOKEN_OAUTH_SCOPES = "moderator:manage:banned_users moderator:manage:chat_messages"
 
+# Права БОТА для чтения/отправки в IRC-чат (main.py::ChatBot, twitchio) —
+# отдельный набор от BOT_TOKEN_OAUTH_SCOPES: тот про Helix-модерацию
+# (баны/таймауты через executor.py), этот про обычные сообщения в чате.
+CHAT_TOKEN_OAUTH_SCOPES = "chat:read chat:edit"
+
 SESSION_KEY = "panel_user"
 _STATE_TTL_SECONDS = 600  # окно на прохождение логина на Twitch
 
@@ -121,7 +126,13 @@ _pending_states: dict[str, float] = {}
 # разный смысл "кто сейчас на Twitch в браузере" (владелец панели vs
 # аккаунт бота). Общий словарь state создал бы риск спутать один код с
 # другим, если оба flow запущены почти одновременно в одной панели.
-_pending_bot_states: dict[str, float] = {}
+#
+# Значение — не только момент создания, но и purpose ("mod"/"chat"):
+# оба под-flow используют один и тот же bot_redirect_uri (Twitch требует
+# точного совпадения redirect_uri, второй адрес пришлось бы регистрировать
+# в Dev Console отдельно), поэтому единственный способ callback'у узнать,
+# какой из них завершился — прочитать это из state, не из URL.
+_pending_bot_states: dict[str, tuple[float, str]] = {}
 
 
 def _prune_states() -> None:
@@ -132,7 +143,7 @@ def _prune_states() -> None:
 
 def _prune_bot_states() -> None:
     cutoff = time.time() - _STATE_TTL_SECONDS
-    for state in [s for s, created in _pending_bot_states.items() if created < cutoff]:
+    for state in [s for s, (created, _purpose) in _pending_bot_states.items() if created < cutoff]:
         _pending_bot_states.pop(state, None)
 
 
@@ -726,7 +737,7 @@ async def auth_bot_login(request: Request) -> RedirectResponse:
 
     _prune_bot_states()
     state = secrets.token_urlsafe(24)
-    _pending_bot_states[state] = time.time()
+    _pending_bot_states[state] = (time.time(), "mod")
 
     params = {
         "client_id": cfg.client_id,
@@ -743,18 +754,61 @@ async def auth_bot_login(request: Request) -> RedirectResponse:
     return RedirectResponse(f"{TWITCH_AUTHORIZE_URL}?{urlencode(params)}")
 
 
+@router.get("/bot/chat_login")
+async def auth_bot_chat_login(request: Request) -> RedirectResponse:
+    """Тот же flow, что /bot/login, но для чат-токена бота (TWITCH_BOT_TOKEN,
+    IRC chat:read/chat:edit) — не Helix moderator:manage:* из BOT_TOKEN_OAUTH_SCOPES.
+
+    Раньше TWITCH_BOT_TOKEN выпускался вручную (сторонний генератор токена)
+    и не имел refresh_token вовсе — истекал молча: чтение чата продолжало
+    работать на уже установленном IRC-соединении, а PRIVMSG (отправка)
+    Twitch тихо отклонял без ошибки на клиенте (см. main.py::MessageQueue).
+    Этот flow и mod_token.py-подобное автообновление (main.py::ChatTokenManager)
+    заменяют его тем же паттерном, что уже работает для токена модерации."""
+    cfg: PanelAuthConfig = request.app.state.panel_auth_config
+    if not cfg.configured:
+        raise HTTPException(
+            status_code=503,
+            detail="Вход через Twitch не настроен: заполните PANEL_TWITCH_CLIENT_ID/"
+            "PANEL_TWITCH_CLIENT_SECRET/PANEL_TWITCH_CHANNEL в .env",
+        )
+    role, _login = require_authenticated(request)
+    if role not in ("ADMIN", "OWNER"):
+        raise HTTPException(status_code=403, detail="Получение токена бота требует роль ADMIN+")
+
+    _prune_bot_states()
+    state = secrets.token_urlsafe(24)
+    _pending_bot_states[state] = (time.time(), "chat")
+
+    params = {
+        "client_id": cfg.client_id,
+        "redirect_uri": cfg.bot_redirect_uri,
+        "response_type": "code",
+        "scope": CHAT_TOKEN_OAUTH_SCOPES,
+        "state": state,
+        "force_verify": "true",
+    }
+    return RedirectResponse(f"{TWITCH_AUTHORIZE_URL}?{urlencode(params)}")
+
+
 async def _process_bot_callback(
     request: Request, *, code: str, state: str, error: str
 ) -> dict[str, object]:
     """Логика обмена code -> токен бота + запись в .env, без привязки к
     формату ответа — используется и JSON-, и HTML-эндпоинтом ниже, чтобы
-    не дублировать сам OAuth-обмен."""
+    не дублировать сам OAuth-обмен.
+
+    Один callback на оба под-flow (mod-токен для банов, chat-токен для IRC)
+    — Twitch требует точного совпадения redirect_uri с тем, что был указан
+    при запросе авторизации, поэтому оба используют bot_redirect_uri, а
+    какой именно flow завершился, читаем из purpose, сохранённого в state
+    при /bot/login или /bot/chat_login."""
     if error:
         raise HTTPException(status_code=400, detail=f"Twitch отказал во входе: {error}")
 
     if state not in _pending_bot_states:
         raise HTTPException(status_code=400, detail="Неизвестный или истёкший state — начните вход заново")
-    _pending_bot_states.pop(state, None)
+    _created_at, purpose = _pending_bot_states.pop(state)
 
     cfg: PanelAuthConfig = request.app.state.panel_auth_config
     if not cfg.configured:
@@ -765,28 +819,41 @@ async def _process_bot_callback(
             cfg, code, redirect_uri=cfg.bot_redirect_uri
         )
         bot_login, bot_user_id = await _fetch_viewer(cfg, access_token)
-
         broadcaster_login, broadcaster_id = await _fetch_viewer_by_login(cfg, cfg.channel)
         is_broadcaster = bot_login == broadcaster_login
-        moderated_channel_ids = await _fetch_moderated_channel_ids(cfg, access_token, bot_user_id)
-        is_moderator = broadcaster_id in moderated_channel_ids
+
+        if purpose == "chat":
+            is_moderator = True  # IRC chat:edit не требует прав модератора — только валидный токен
+        else:
+            moderated_channel_ids = await _fetch_moderated_channel_ids(cfg, access_token, bot_user_id)
+            is_moderator = broadcaster_id in moderated_channel_ids
     except TwitchAuthError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     roots: PanelRoots = request.app.state.panel_roots
-    _write_env_values(
-        roots.repo,
-        {
-            "TWITCH_MOD_ACCESS_TOKEN": access_token,
-            "TWITCH_MOD_REFRESH_TOKEN": refresh_token,
-            "TWITCH_MOD_BOT_LOGIN": bot_login,
-            "TWITCH_MOD_BOT_USER_ID": bot_user_id,
-            "TWITCH_MOD_BROADCASTER_ID": broadcaster_id,
-        },
-    )
+    if purpose == "chat":
+        _write_env_values(
+            roots.repo,
+            {
+                "TWITCH_BOT_TOKEN": access_token,
+                "TWITCH_BOT_REFRESH_TOKEN": refresh_token,
+                "TWITCH_BOT_NICK": bot_login,
+            },
+        )
+    else:
+        _write_env_values(
+            roots.repo,
+            {
+                "TWITCH_MOD_ACCESS_TOKEN": access_token,
+                "TWITCH_MOD_REFRESH_TOKEN": refresh_token,
+                "TWITCH_MOD_BOT_LOGIN": bot_login,
+                "TWITCH_MOD_BOT_USER_ID": bot_user_id,
+                "TWITCH_MOD_BROADCASTER_ID": broadcaster_id,
+            },
+        )
 
     warning = None
-    if not is_moderator and not is_broadcaster:
+    if purpose != "chat" and not is_moderator and not is_broadcaster:
         warning = (
             f"Аккаунт {bot_login!r}, под которым вы только что вошли, НЕ модератор канала "
             f"{cfg.channel!r} — реальные баны через Helix вернут 401, пока не выдадите ему "
@@ -795,6 +862,7 @@ async def _process_bot_callback(
 
     return {
         "ok": True,
+        "purpose": purpose,
         "bot_login": bot_login,
         "is_broadcaster": is_broadcaster,
         "is_moderator": is_moderator,
@@ -823,9 +891,10 @@ async def auth_bot_callback(request: Request, code: str = "", state: str = "", e
         if result["is_moderator"] or result["is_broadcaster"]
         else ""
     )
+    title = "Чат-токен бота получен" if result["purpose"] == "chat" else "Токен бота получен"
     body = f"""
     <div style="font-family:sans-serif;max-width:480px;margin:60px auto;padding:24px;">
-      <h2>Токен бота получен</h2>
+      <h2>{title}</h2>
       <p>Вошли как: <b>{result["bot_login"]}</b></p>
       {ok_html}
       {warning_html}
@@ -864,4 +933,27 @@ async def auth_bot_status(request: Request) -> dict[str, object]:
     return {
         "configured": has_token,
         "bot_login": values.get("TWITCH_MOD_BOT_LOGIN", ""),
+    }
+
+
+@router.get("/bot/chat_status")
+async def auth_bot_chat_status(request: Request) -> dict[str, object]:
+    """Есть ли уже чат-токен (TWITCH_BOT_TOKEN/TWITCH_BOT_REFRESH_TOKEN) —
+    тот же принцип, что auth_bot_status: читает .env заново на каждый
+    запрос, ничего не кеширует."""
+    roots: PanelRoots = request.app.state.panel_roots
+    env_file = roots.repo / ".env"
+    values: dict[str, str] = {}
+    if env_file.exists():
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, _, value = stripped.partition("=")
+            values[key.strip()] = value
+
+    has_token = bool(values.get("TWITCH_BOT_TOKEN") and values.get("TWITCH_BOT_REFRESH_TOKEN"))
+    return {
+        "configured": has_token,
+        "bot_login": values.get("TWITCH_BOT_NICK", ""),
     }

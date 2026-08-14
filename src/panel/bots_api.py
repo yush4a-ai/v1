@@ -161,6 +161,12 @@ class SetNoteRequest(BaseModel):
     note: str
 
 
+class SendChatMessageRequest(BaseModel):
+    profile: str = MAIN_PROFILE
+    channel_login: str
+    text: str
+
+
 class PromptPreviewRequest(BaseModel):
     profile: str
     personality: str
@@ -976,6 +982,38 @@ def api_set_viewer_note(
     finally:
         conn.close()
     return JSONResponse({"saved": True})
+
+
+@router.post("/api/chat_send")
+def api_send_chat_message(
+    payload: SendChatMessageRequest, session: tuple[str, str] = require_role_min("MODERATOR")
+):
+    """Ставит сообщение в очередь panel_outbox (bot.db) — сам процесс бота
+    вычитывает её раз в секунду (main.py::_poll_panel_outbox) и отправляет
+    от своего имени в указанный канал через MessageQueue. Панель ничего не
+    исполняет сама (см. CLAUDE.md), только пишет намерение в БД, которую
+    читает бот — тот же принцип, что у desired_state/Attack Mode."""
+    text = payload.text.strip()
+    if not text:
+        return JSONResponse({"error": "Пустое сообщение"}, status_code=400)
+    if len(text) > 500:
+        return JSONResponse({"error": "Слишком длинное сообщение"}, status_code=400)
+    channel_login = payload.channel_login.strip().lower()
+    if not channel_login:
+        return JSONResponse({"error": "Не выбран канал"}, status_code=400)
+    path = db_path(payload.profile)
+    if not path.exists():
+        return JSONResponse({"error": "База данных ещё не создана"}, status_code=404)
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            "INSERT INTO panel_outbox (channel_login, text, created_at) VALUES (?, ?, ?)",
+            (channel_login, text, time.time()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return JSONResponse({"queued": True})
 
 
 # ---------------------------------------------------------------------------

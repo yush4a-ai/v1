@@ -578,6 +578,19 @@ tr:last-child td { border-bottom: none; }
       </div>
     </div>
     <div class="card">
+      <!-- Отправка от имени бота (POST /api/chat_send, panel/bots_api.py) —
+           панель только ставит сообщение в очередь panel_outbox в bot.db,
+           сам процесс бота вычитывает её раз в секунду и отправляет через
+           уже существующий MessageQueue (см. CLAUDE.md: панель ничего не
+           исполняет сама). Список каналов — активные из Channel Registry,
+           не единственный TWITCH_CHANNEL из .env: бот сидит в нескольких
+           каналах одновременно (run.py, Registry-модель). -->
+      <div class="row" style="margin-bottom:6px;">
+        <select class="chatSendChannel" style="min-width:160px;"></select>
+        <input type="text" class="chatSendText" placeholder="Сообщение от имени бота…" maxlength="500" style="flex:1;">
+        <button class="primary chatSendBtn">Отправить</button>
+      </div>
+      <div class="toast chatSendMsg" style="margin-bottom:14px;"></div>
       <div class="feed-legend">
         <span><span class="swatch" style="background:var(--l2);border:1px solid var(--border)"></span>Зритель</span>
         <span><span class="swatch" style="background:var(--accent)"></span>Бот</span>
@@ -1025,8 +1038,46 @@ function wirePage(root, profile) {
     msg.className = r.saved ? 'toast viewersMsg' : 'toast viewersMsg err';
   });
 
+  q('.chatSendBtn').onclick = async () => {
+    const channel_login = q('.chatSendChannel').value;
+    const textInput = q('.chatSendText');
+    const text = textInput.value.trim();
+    const msg = q('.chatSendMsg');
+    if (!channel_login) {
+      msg.textContent = 'Нет активных каналов'; msg.className = 'toast chatSendMsg err'; return;
+    }
+    if (!text) return;
+    const btn = q('.chatSendBtn');
+    btn.disabled = true;
+    const r = await api('/api/chat_send', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ profile, channel_login, text })
+    });
+    btn.disabled = false;
+    if (r.queued) {
+      textInput.value = '';
+      msg.textContent = ''; msg.className = 'toast chatSendMsg';
+    } else {
+      msg.textContent = r.error || 'Ошибка'; msg.className = 'toast chatSendMsg err';
+    }
+  };
+
   loadPromptList(root);
   loadChannelHistory(root);
+  loadChatSendChannels(root);
+}
+
+async function loadChatSendChannels(root) {
+  // Активные каналы из Channel Registry — бот сидит в них всех сразу
+  // (run.py, Registry-модель), не в единственном TWITCH_CHANNEL из .env
+  // (тот — только fallback для пустого Registry, см. CLAUDE.md).
+  const select = root.querySelector('.chatSendChannel');
+  if (!select) return;
+  const channels = await api('/api/registry/channels');
+  const running = (channels || []).filter(c => c.desired_state === 'running');
+  const previousValue = select.value;
+  select.innerHTML = running.map(c => `<option value="${escapeHtml(c.login)}">${escapeHtml(c.login)}</option>`).join('');
+  if (running.some(c => c.login === previousValue)) select.value = previousValue;
 }
 
 // ---------------------------------------------------------------------------

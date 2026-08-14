@@ -18,6 +18,19 @@ CREATE TABLE IF NOT EXISTS recent_messages (
     created_at REAL NOT NULL
 );
 
+-- Сообщения, поставленные оператором в панели (POST /api/chat_send,
+-- panel/bots_api.py) для отправки от имени бота в конкретный канал.
+-- sent_at IS NULL — ещё не обработано; main.py::_poll_panel_outbox
+-- вычитывает раз в секунду и шлёт через тот же MessageQueue, которым
+-- бот уже пользуется для DeepSeek-ответов.
+CREATE TABLE IF NOT EXISTS panel_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_login TEXT NOT NULL,
+    text TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    sent_at REAL
+);
+
 -- mod_inbox здесь больше не создаётся. Это была исходящая очередь чата
 -- для отдельного процесса модерации: main.py писал сюда каждое сообщение
 -- вместо прямого вызова ModerationEngine.observe(), а Cigilbot открывал
@@ -108,6 +121,24 @@ class Database:
         )
         rows = await cursor.fetchall()
         return [(row["username"], row["content"]) for row in reversed(rows)]
+
+    async def pop_pending_panel_messages(self) -> list[tuple[int, str, str]]:
+        """Сообщения из панели, ещё не отправленные в чат — вычитывается
+        циклом main.py::_poll_panel_outbox. Не удаляет строки (в отличие
+        от VoiceQueue.pop_all): sent_at остаётся аудитом того, что и когда
+        реально ушло от имени бота."""
+        self._conn.row_factory = aiosqlite.Row
+        cursor = await self._conn.execute(
+            "SELECT id, channel_login, text FROM panel_outbox WHERE sent_at IS NULL ORDER BY id"
+        )
+        rows = await cursor.fetchall()
+        return [(row["id"], row["channel_login"], row["text"]) for row in rows]
+
+    async def mark_panel_message_sent(self, message_id: int) -> None:
+        await self._conn.execute(
+            "UPDATE panel_outbox SET sent_at = ? WHERE id = ?", (time.time(), message_id)
+        )
+        await self._conn.commit()
 
     # enqueue_chat_event/prune_mod_inbox убраны вместе с самой очередью:
     # движок модерации переехал в этот же процесс и получает события

@@ -191,6 +191,11 @@ class MessageQueue:
             if channel is not None:
                 await channel.send(text)
                 await db.log_message(cfg.bot_nick, text)
+            else:
+                log.warning(
+                    "Не удалось отправить сообщение — канал %r не найден среди подключённых",
+                    channel_name,
+                )
             self._last_sent_at = time.monotonic()
 
 
@@ -292,12 +297,29 @@ class ChatBot(commands.Bot):
         if cfg.voice_enabled:
             asyncio.create_task(self._poll_voice_queue())
 
+        asyncio.create_task(self._poll_panel_outbox())
+
     async def _poll_voice_queue(self) -> None:
         log.info("Слежу за голосовыми сообщениями (файл %s)", voice_queue.path)
         while True:
             lines = voice_queue.pop_all()
             if lines:
                 await self._handle_voice_batch(lines)
+            await asyncio.sleep(1)
+
+    async def _poll_panel_outbox(self) -> None:
+        """Сообщения, поставленные оператором в панели (POST /api/chat_send,
+        panel/bots_api.py) — оператор пишет текст на экране Chat, бот
+        вычитывает и озвучивает его в выбранном канале через тот же
+        MessageQueue, которым уже пользуется для DeepSeek-ответов и
+        голосовых реплик. Опрос раз в секунду, тот же интервал, что у
+        _poll_voice_queue — доставка "секунды-две" ощущается как обычный чат.
+        Не завязано на cfg-флаг: пустая таблица ничего не стоит опрашивать."""
+        while True:
+            pending = await db.pop_pending_panel_messages()
+            for message_id, channel_login, text in pending:
+                await self._outbox.send(channel_login, text)
+                await db.mark_panel_message_sent(message_id)
             await asyncio.sleep(1)
 
     async def _handle_voice_batch(self, lines: list[str]) -> None:
