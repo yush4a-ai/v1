@@ -71,6 +71,18 @@ function signalLabel(name) {
 // обновлении.
 const dismissedVerdictIds = new Set();
 
+// user_id пользователей, чья группа в ленте вердиктов сейчас развёрнута —
+// лента перерисовывается целиком на каждое сообщение WebSocket (несколько
+// раз в минуту), без этого набора разворот схлопывался бы сам через пару
+// секунд после клика.
+const expandedVerdictGroups = new Set();
+
+// "verdictId:signalName" -> "FALSE_POSITIVE" | "CONFIRMED_BOT" — решения по
+// сигналам в этой сессии панели, чтобы кнопка feedback оставалась
+// подсвеченной после клика и до следующего ответа сервера (сам вердикт в
+// БД не меняется, только вес сигнала на будущее).
+const signalFeedbackDecisions = new Map();
+
 function toast(message, kind = "info") {
   const stack = el("toast-stack");
   const node = document.createElement("div");
@@ -509,6 +521,38 @@ function escapeHtml(s) {
 
 // --- рендер: лента вердиктов ---------------------------------------------
 
+const ACTION_RANK = { NOTHING: 0, OBSERVE: 1, TIMEOUT: 2, BAN: 3 };
+const CHEVRON_SVG = '<svg class="verdict-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 6l6 6-6 6"/></svg>';
+const ICON_X_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 6L6 18M6 6l12 12"/></svg>';
+const ICON_CHECK_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20 6L9 17l-5-5"/></svg>';
+
+// Группирует вердикты по user_id — одна строка на зрителя, не на сообщение
+// (см. комментарий у .verdict-group в moderation.html). Порядок вердиктов
+// с сервера — created_at DESC, поэтому verdicts[0] в каждой группе уже
+// самый свежий и задаёт превью/время строки; худший recommended_action
+// среди сообщений группы задаёт её бейдж.
+function groupVerdictsByUser(verdicts) {
+  const groups = new Map();
+  for (const v of verdicts) {
+    const key = v.user_id || v.login;
+    if (!groups.has(key)) {
+      groups.set(key, { userId: v.user_id, login: v.login, verdicts: [] });
+    }
+    groups.get(key).verdicts.push(v);
+  }
+  for (const g of groups.values()) {
+    g.worstAction = g.verdicts.reduce(
+      (worst, v) => (ACTION_RANK[v.recommended_action] > ACTION_RANK[worst] ? v.recommended_action : worst),
+      "NOTHING"
+    );
+    g.inCluster = g.verdicts.some((v) => v.cluster_id != null);
+    g.clusterId = g.verdicts.find((v) => v.cluster_id != null)?.cluster_id ?? null;
+  }
+  // Группы сортируются по времени самого свежего сообщения — тот же порядок,
+  // в котором вердикты и так приходят с сервера.
+  return [...groups.values()].sort((a, b) => b.verdicts[0].created_at - a.verdicts[0].created_at);
+}
+
 function renderVerdicts(allVerdicts) {
   const feed = el("verdict-feed");
   const verdicts = (allVerdicts || []).filter((v) => !dismissedVerdictIds.has(v.id));
@@ -516,59 +560,192 @@ function renderVerdicts(allVerdicts) {
     feed.innerHTML = '<div class="empty">Пока тихо — подозрительных сообщений не было</div>';
     return;
   }
+  const groups = groupVerdictsByUser(verdicts);
   feed.innerHTML = "";
-  for (const v of verdicts) {
-    const row = document.createElement("div");
-    row.className = "verdict-row";
-    const messageHtml = v.message_text
-      ? `<span class="verdict-message">«${escapeHtml(v.message_text)}»</span>`
-      : `<span class="verdict-message verdict-message-missing">(текст сообщения недоступен)</span>`;
-    row.innerHTML = `
-      <span class="verdict-login">${escapeHtml(v.login)}</span>
-      <span class="verdict-action ${v.recommended_action}">${v.recommended_action}</span>
-      <span class="verdict-time">${formatTime(v.created_at)}</span>
-      ${messageHtml}
-      <span class="verdict-reason">${escapeHtml(v.reason)}</span>
-      <span class="verdict-signals-label">Сработавшие сигналы — левый клик: это ошибка, правый клик: это точно бот</span>
-      <span class="signal-chips" style="margin-top:0;"></span>
-    `;
-    const chips = row.querySelector(".signal-chips");
-    const evidenceList = v.signal_evidence || [];
-    (v.signal_names || []).forEach((name, i) => {
-      const chip = document.createElement("span");
-      chip.className = "chip signal-fp-chip";
-      // Показываем перевод, но submitSignalFeedback получает исходное
-      // английское name — движок и API работают только с ним (см.
-      // config/moderation.yml), перевод чисто визуальный.
-      chip.textContent = signalLabel(name);
-      // evidence — конкретный факт, из-за которого сигнал сработал
-      // ("17 пользователей появились за 2.3 сек"), не только его условное
-      // имя. Показываем во всплывающей подсказке, чтобы не захламлять
-      // саму строку — по наведению видно, что именно бот засёк.
-      const evidence = evidenceList[i];
-      chip.title = evidence
-        ? `${evidence}\n\nКлик — ложное срабатывание · Правый клик — подтвердить, что это бот`
-        : "Клик — ложное срабатывание · Правый клик — подтвердить, что это бот";
-      chip.addEventListener("click", () => submitSignalFeedback(v, name, row, "FALSE_POSITIVE"));
-      // Без обеих кнопок feedback был однобоким: каждый клик "ошибка" всё
-      // сильнее занижал вес сигнала (fp_penalty = доля FALSE_POSITIVE
-      // среди решений), а подтвердить настоящего бота было нечем — за
-      // стрим 124 клика "ошибка" обнулили 8 сигналов на 100%, включая
-      // exact_duplicate/synchronized_arrival, которые реально ловят ботов.
-      chip.addEventListener("contextmenu", (e) => {
-        e.preventDefault();
-        submitSignalFeedback(v, name, row, "CONFIRMED_BOT");
-      });
-      chips.appendChild(chip);
-    });
-    feed.appendChild(row);
+  for (const g of groups) {
+    feed.appendChild(renderVerdictGroup(g));
   }
 }
 
-async function submitSignalFeedback(verdict, signalName, rowEl, decision = "FALSE_POSITIVE") {
+function renderVerdictGroup(g) {
+  const groupKey = String(g.userId || g.login);
+  const isOpen = expandedVerdictGroups.has(groupKey);
+  const latest = g.verdicts[0];
+
+  const group = document.createElement("div");
+  group.className = "verdict-group" + (isOpen ? " open" : "");
+  group.dataset.groupKey = groupKey;
+
+  // Убирает группу из ленты сразу (мгновенный отклик) и запоминает id
+  // вердиктов, чтобы следующий renderVerdicts() из WebSocket (лента
+  // приходит целиком заново на каждое сообщение) их тоже отфильтровал.
+  function dismissGroup() {
+    for (const v of g.verdicts) dismissedVerdictIds.add(v.id);
+    expandedVerdictGroups.delete(groupKey);
+    group.remove();
+    if (!el("verdict-feed").querySelector(".verdict-group")) {
+      el("verdict-feed").innerHTML = '<div class="empty">Пока тихо — подозрительных сообщений не было</div>';
+    }
+  }
+
+  async function trustGroup() {
+    const ok = await markUserSafe(g.userId, g.login);
+    // Доверенный зритель больше не должен всплывать в ленте подозрительных.
+    if (ok) dismissGroup();
+  }
+
+  // Мини-кнопки на свёрнутой строке отмечают ВСЕ сигналы ВСЕХ сообщений
+  // группы разом — без разворачивания карточки на активном чате, где
+  // решение по каждому зрителю нужно принимать за секунды, а не открывать
+  // и листать сообщение за сообщением.
+  async function confirmGroupAsBot() {
+    if (!canAct()) {
+      toast("Требуется роль MODERATOR и выше", "error");
+      return;
+    }
+    let anyFailed = false;
+    for (const v of g.verdicts) {
+      for (const name of v.signal_names || []) {
+        const ok = await submitSignalFeedback(v, name, null, "CONFIRMED_BOT", { silent: true });
+        if (!ok) anyFailed = true;
+      }
+    }
+    if (anyFailed) {
+      toast(`${g.login}: часть сигналов не удалось отметить`, "error");
+    } else {
+      toast(`${g.login}: все сигналы подтверждены как бот`, "success");
+    }
+    dismissGroup();
+  }
+
+  const head = document.createElement("div");
+  head.className = "verdict-group-head";
+  head.innerHTML = `
+    ${CHEVRON_SVG}
+    <span class="verdict-login">${escapeHtml(g.login)}</span>
+    <span class="verdict-action ${g.worstAction}">${g.worstAction}</span>
+    ${g.inCluster ? '<span class="verdict-cluster-dot" title="Участвует в кластере координации"></span>' : ""}
+    <span class="verdict-preview">${
+      latest.message_text ? `«${escapeHtml(latest.message_text)}»` : "(текст недоступен)"
+    }${g.verdicts.length > 1 ? ` <b>+${g.verdicts.length - 1}</b>` : ""}</span>
+    <span class="verdict-count">${g.verdicts.length} сообщ.</span>
+    <span class="verdict-time">${formatTime(latest.created_at)}</span>
+    <span class="verdict-quick-actions">
+      <button class="quick-btn trust" title="Доверять пользователю" ${canAct() ? "" : "disabled"}>${ICON_CHECK_SVG}</button>
+      <button class="quick-btn bad" title="Подтвердить все сигналы — это бот" ${canAct() ? "" : "disabled"}>${ICON_X_SVG}</button>
+    </span>
+  `;
+  head.addEventListener("click", () => {
+    if (expandedVerdictGroups.has(groupKey)) {
+      expandedVerdictGroups.delete(groupKey);
+    } else {
+      expandedVerdictGroups.add(groupKey);
+    }
+    group.classList.toggle("open");
+  });
+  head.querySelector(".quick-btn.trust").addEventListener("click", (e) => {
+    e.stopPropagation();
+    trustGroup();
+  });
+  head.querySelector(".quick-btn.bad").addEventListener("click", (e) => {
+    e.stopPropagation();
+    confirmGroupAsBot();
+  });
+  group.appendChild(head);
+
+  const body = document.createElement("div");
+  body.className = "verdict-body";
+
+  if (g.inCluster) {
+    const note = document.createElement("div");
+    note.className = "verdict-cluster-note";
+    note.textContent = `Участвует в кластере координации #${g.clusterId}`;
+    body.appendChild(note);
+  }
+
+  for (const v of g.verdicts) {
+    body.appendChild(renderVerdictMessage(v));
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "verdict-group-actions";
+  const trustBtn = document.createElement("button");
+  trustBtn.className = "btn btn-trust btn-sm";
+  trustBtn.textContent = "Доверять пользователю";
+  trustBtn.disabled = !canAct();
+  trustBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    trustGroup();
+  });
+  actions.appendChild(trustBtn);
+  if (g.inCluster) {
+    const clusterBtn = document.createElement("button");
+    clusterBtn.className = "btn btn-ghost btn-sm";
+    clusterBtn.textContent = `Открыть кластер #${g.clusterId}`;
+    clusterBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      pendingHighlightClusterId = g.clusterId;
+      switchScreen("live");
+      highlightClusterIfPending();
+    });
+    actions.appendChild(clusterBtn);
+  }
+  body.appendChild(actions);
+
+  group.appendChild(body);
+  return group;
+}
+
+function renderVerdictMessage(v) {
+  const row = document.createElement("div");
+  row.className = "verdict-msg";
+  const messageHtml = v.message_text
+    ? `<div class="verdict-message">«${escapeHtml(v.message_text)}»</div>`
+    : `<div class="verdict-message verdict-message-missing">(текст сообщения недоступен)</div>`;
+  row.innerHTML = `
+    <span class="verdict-msg-time">${formatTime(v.created_at)}</span>
+    ${messageHtml}
+    <div class="verdict-reason">${escapeHtml(v.reason)}</div>
+    <div class="sig-list"></div>
+  `;
+  const sigList = row.querySelector(".sig-list");
+  const evidenceList = v.signal_evidence || [];
+  (v.signal_names || []).forEach((name, i) => {
+    sigList.appendChild(renderSignalRow(v, name, evidenceList[i]));
+  });
+  return row;
+}
+
+function renderSignalRow(verdict, signalName, evidence) {
+  const key = `${verdict.id}:${signalName}`;
+  const decision = signalFeedbackDecisions.get(key);
+  const sigRow = document.createElement("div");
+  sigRow.className = "sig-row" + (decision === "FALSE_POSITIVE" ? " marked-fp" : "") + (decision === "CONFIRMED_BOT" ? " marked-bot" : "");
+  sigRow.innerHTML = `
+    <span class="sig-name">${escapeHtml(signalLabel(signalName))}</span>
+    ${evidence ? `<span class="sig-evidence" title="${escapeHtml(evidence)}">${escapeHtml(evidence)}</span>` : ""}
+    <span class="sig-fb">
+      <button class="sig-btn fp" title="Ложное срабатывание" ${canAct() ? "" : "disabled"}>${ICON_X_SVG}</button>
+      <button class="sig-btn bot" title="Подтвердить — это бот" ${canAct() ? "" : "disabled"}>${ICON_CHECK_SVG}</button>
+    </span>
+  `;
+  const fpBtn = sigRow.querySelector(".sig-btn.fp");
+  const botBtn = sigRow.querySelector(".sig-btn.bot");
+  fpBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    submitSignalFeedback(verdict, signalName, sigRow, "FALSE_POSITIVE");
+  });
+  botBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    submitSignalFeedback(verdict, signalName, sigRow, "CONFIRMED_BOT");
+  });
+  return sigRow;
+}
+
+async function submitSignalFeedback(verdict, signalName, rowEl, decision = "FALSE_POSITIVE", { silent = false } = {}) {
   if (!canAct()) {
-    toast("Требуется роль MODERATOR и выше", "error");
-    return;
+    if (!silent) toast("Требуется роль MODERATOR и выше", "error");
+    return false;
   }
   try {
     const resp = await apiFetch("/api/moderation/feedback", {
@@ -587,22 +764,22 @@ async function submitSignalFeedback(verdict, signalName, rowEl, decision = "FALS
       const body = await resp.json().catch(() => ({}));
       throw new Error(body.detail || resp.statusText);
     }
-    const verb = decision === "CONFIRMED_BOT" ? "подтверждено как бот" : "ложное срабатывание";
-    toast(`Отмечено: "${signalLabel(signalName)}" — ${verb}`, "success");
-    // Строка обработана — прячем сразу (мгновенный отклик) и запоминаем
-    // id, чтобы следующий renderVerdicts() из WebSocket (лента приходит
-    // целиком заново на каждое сообщение, вердикт в БД никуда не девается)
-    // тоже её отфильтровал, а не вернул обратно.
-    dismissedVerdictIds.add(verdict.id);
-    if (rowEl) {
-      rowEl.remove();
-      const feed = el("verdict-feed");
-      if (!feed.querySelector(".verdict-row")) {
-        feed.innerHTML = '<div class="empty">Пока тихо — подозрительных сообщений не было</div>';
-      }
+    if (!silent) {
+      const verb = decision === "CONFIRMED_BOT" ? "подтверждено как бот" : "ложное срабатывание";
+      toast(`Отмечено: "${signalLabel(signalName)}" — ${verb}`, "success");
     }
+    // Отмечаем сигнал, а не удаляем сообщение из ленты целиком — одно
+    // сообщение обычно несёт несколько сигналов, и решение по одному не
+    // должно прятать остальные до следующего обновления с сервера.
+    signalFeedbackDecisions.set(`${verdict.id}:${signalName}`, decision);
+    if (rowEl) {
+      rowEl.classList.toggle("marked-fp", decision === "FALSE_POSITIVE");
+      rowEl.classList.toggle("marked-bot", decision === "CONFIRMED_BOT");
+    }
+    return true;
   } catch (e) {
-    toast(`Ошибка: ${e.message}`, "error");
+    if (!silent) toast(`Ошибка: ${e.message}`, "error");
+    return false;
   }
 }
 
@@ -675,7 +852,7 @@ async function decideCluster(clusterId, decision) {
 async function markUserSafe(userId, login) {
   if (!canAct()) {
     toast("Требуется роль MODERATOR и выше", "error");
-    return;
+    return false;
   }
   try {
     const resp = await apiFetch(`/api/moderation/users/${encodeURIComponent(userId)}/mark_safe`, {
@@ -687,10 +864,26 @@ async function markUserSafe(userId, login) {
       throw new Error(body.detail || resp.statusText);
     }
     toast(`${login} отмечен как доверенный`, "success");
+    return true;
   } catch (e) {
     toast(`Ошибка: ${e.message}`, "error");
+    return false;
   }
 }
+
+// "Зачистить пасту" свёрнута по умолчанию (#2611-подобная жалоба: блок
+// занимал весь верх экрана Live постоянно, хотя используется от случая к
+// случаю) — состояние в localStorage, не только в памяти вкладки, чтобы
+// решение не сбрасывалось при каждом заходе на экран.
+const PASTE_WAVE_OPEN_KEY = "mod.pasteWaveOpen";
+if (localStorage.getItem(PASTE_WAVE_OPEN_KEY) === "1") {
+  el("paste-wave-section").classList.add("open");
+}
+el("paste-wave-toggle").addEventListener("click", () => {
+  const section = el("paste-wave-section");
+  const isOpen = section.classList.toggle("open");
+  localStorage.setItem(PASTE_WAVE_OPEN_KEY, isOpen ? "1" : "0");
+});
 
 el("modal-cancel").addEventListener("click", () => {
   pendingConfirm = null;
@@ -1394,7 +1587,13 @@ async function loadStats() {
 // --- settings: токен бота + config/moderation.yml ---------------------
 
 async function loadSettings() {
-  await Promise.all([loadBotTokenStatus(), loadConfig(), loadDiscordWebhook(), loadContentModeration()]);
+  await Promise.all([
+    loadBotTokenStatus(),
+    loadChatTokenStatus(),
+    loadConfig(),
+    loadDiscordWebhook(),
+    loadContentModeration(),
+  ]);
 }
 
 // --- Discord-webhook (направление 01 master-plan.html) --------------------
@@ -1692,6 +1891,47 @@ el("btn-get-bot-token").addEventListener("click", () => {
     "затем возвращайтесь сюда и жмите «Продолжить».";
   pendingConfirm = async () => {
     window.location.href = "/auth/bot/login";
+  };
+  el("modal-overlay").classList.add("open");
+});
+
+async function loadChatTokenStatus() {
+  const badge = el("chat-token-status-badge");
+  const meta = el("chat-token-status-meta");
+  const btn = el("btn-get-chat-token");
+  try {
+    const resp = await fetch("/auth/bot/chat_status");
+    const data = await resp.json();
+    if (data.configured) {
+      badge.textContent = `настроен (${data.bot_login})`;
+      badge.className = "token-status-badge ok";
+      meta.textContent = "Отправка сообщений из панели доходит до чата этим токеном.";
+    } else {
+      badge.textContent = "не настроен";
+      badge.className = "token-status-badge missing";
+      meta.textContent = "Отправка сообщений из панели не будет доходить до чата, пока токен не получен.";
+    }
+  } catch {
+    badge.textContent = "неизвестно";
+    badge.className = "token-status-badge missing";
+  }
+  btn.disabled = !canAdmin();
+  btn.title = canAdmin() ? "" : "Требуется роль ADMIN и выше";
+}
+
+el("btn-get-chat-token").addEventListener("click", () => {
+  el("modal-title").textContent = "Получить чат-токен бота?";
+  el("modal-body").innerHTML =
+    "На следующем экране войдите на Twitch <b>ПОД АККАУНТОМ БОТА</b> (не под своим личным) — " +
+    "именно этот аккаунт будет писать сообщения в чат от панели. В отличие от токена банов " +
+    "выше, права модератора здесь не обязательны — достаточно, чтобы бот мог писать в чат.<br><br>" +
+    "<b>Если вы только что входили в панель под другим Twitch-аккаунтом:</b> Twitch " +
+    "запомнил его в этом браузере и может подставить его автоматически, минуя выбор " +
+    'аккаунта. Сначала выйдите из Twitch — <a href="https://www.twitch.tv/logout" ' +
+    'target="_blank" rel="noopener">twitch.tv/logout</a> (откроется в новой вкладке), ' +
+    "затем возвращайтесь сюда и жмите «Продолжить».";
+  pendingConfirm = async () => {
+    window.location.href = "/auth/bot/chat_login";
   };
   el("modal-overlay").classList.add("open");
 });

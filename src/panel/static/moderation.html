@@ -274,20 +274,49 @@ body {
 .btn-ghost { background: var(--l2); color: var(--text-dim); border: 1px solid var(--border); }
 .btn-ghost:hover { color: var(--text); border-color: var(--border-strong); }
 .btn-accent { background: var(--accent); color: var(--accent-ink); box-shadow: var(--shadow-glow-accent); }
+.btn-trust { background: var(--success-soft); color: var(--success); border: 1px solid #3ecb8e40; }
+.btn-trust:hover { border-color: var(--success); }
+.btn-sm { padding: 5px 11px; font-size: 11.5px; }
 
-/* Лента вердиктов
-   flex-wrap — иначе чипы сигналов (3-4 штуки на активном чате) выдавливают
-   ник и причину за пределы строки: у обоих overflow:hidden, поэтому они
-   не обрезаются видимо, а просто пропадают из вёрстки целиком, оставляя
-   в строке только чипы и время (жалоба: "не понимаю к чему это относится",
-   #2611). Первая строка — кто и что решено, вторая — почему (чипы). */
-.verdict-row {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 10px 14px;
-  border-radius: var(--radius-sm); border-bottom: 1px solid var(--border-soft); font-size: 13px;
+/* Сворачиваемая секция — сейчас только "Зачистить пасту" на экране Live,
+   используется от случая к случаю и не должна постоянно теснить кластеры
+   и ленту вердиктов, за которыми следят непрерывно во время стрима. */
+.collapsible { margin-bottom: 20px; }
+.collapsible-head {
+  display: flex; align-items: center; gap: 10px; cursor: pointer; user-select: none;
+  padding: 4px 0;
+}
+.collapsible-head h2 { margin: 0; }
+.collapsible-chevron {
+  width: 13px; height: 13px; flex: none; color: var(--text-faint);
+  transition: transform .15s var(--ease), color .12s var(--ease);
+}
+.collapsible.open .collapsible-chevron { transform: rotate(90deg); color: var(--text-dim); }
+.collapsible-body { display: none; margin-top: 12px; }
+.collapsible.open .collapsible-body { display: block; animation: verdict-body-in .15s var(--ease); }
+
+/* Лента вердиктов — группировка по пользователю, не по сообщению
+   (#2611, четвёртый заход): один активный чат даёт несколько сообщений от
+   одного и того же зрителя подряд, и раньше каждое было отдельной строкой
+   с повторённым ником — на активном стриме лента прокручивалась быстрее,
+   чем можно было прочитать. Свёрнутая строка — ник, худший вердикт среди
+   его сообщений, превью последнего, счётчик, время; разворачивается по
+   клику до списка сообщений с сигналами каждого. */
+.verdict-group {
+  border-radius: var(--radius-sm); border-bottom: 1px solid var(--border-soft);
   transition: background .1s var(--ease);
 }
-.verdict-row:hover { background: var(--l2); }
-.verdict-row:last-child { border-bottom: none; }
+.verdict-group:last-child { border-bottom: none; }
+.verdict-group-head {
+  display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+  cursor: pointer; user-select: none; font-size: 13px;
+}
+.verdict-group-head:hover { background: var(--l2); }
+.verdict-chevron {
+  width: 13px; height: 13px; flex: none; color: var(--text-faint);
+  transition: transform .15s var(--ease), color .12s var(--ease);
+}
+.verdict-group.open .verdict-chevron { transform: rotate(90deg); color: var(--text-dim); }
 .verdict-login { font-weight: 600; flex: 0 0 auto; }
 .verdict-action {
   font-family: var(--mono); font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 6px;
@@ -296,13 +325,88 @@ body {
 .verdict-action.OBSERVE { background: var(--info-soft); color: var(--info); }
 .verdict-action.TIMEOUT { background: var(--warning-soft); color: var(--warning); }
 .verdict-action.BAN { background: var(--danger-soft); color: var(--danger); }
-.verdict-reason { color: var(--text-faint); font-size: 12px; flex: 1 1 100%; }
+/* Маркер принадлежности кластеру — точка, не текстовый чип вперемешку с
+   сигналами: на свёрнутой строке важен сам факт координации, детали
+   (сколько человек, какой кластер) — только при раскрытии. */
+.verdict-cluster-dot {
+  width: 6px; height: 6px; border-radius: 50%; background: var(--danger); flex: none;
+  box-shadow: 0 0 0 3px var(--danger-soft);
+}
+.verdict-preview {
+  color: var(--text-faint); font-size: 12.5px; flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .verdict-time { color: var(--text-faint); font-size: 11.5px; font-family: var(--mono); font-variant-numeric: tabular-nums; margin-left: auto; flex: 0 0 auto; }
-.verdict-signals-label { color: var(--text-faint); font-size: 11px; flex: 0 0 100%; margin-top: 2px; }
+.verdict-count {
+  font-family: var(--mono); font-size: 11px; color: var(--text-dim); background: var(--l2);
+  border: 1px solid var(--border); border-radius: var(--radius-pill); padding: 1px 8px;
+  flex: 0 0 auto; font-variant-numeric: tabular-nums;
+}
+/* Мини-кнопки прямо на свёрнутой строке — решение по зрителю без
+   разворачивания карточки, для активного чата, где решать нужно за
+   секунды. То же действие, что "Доверять пользователю"/сигнал-фидбек
+   внутри раскрытия, просто доступное на уровень выше. */
+.verdict-quick-actions { display: flex; gap: 4px; flex: 0 0 auto; }
+.quick-btn {
+  width: 22px; height: 22px; border-radius: var(--radius-sm); border: 1px solid var(--border);
+  background: var(--l2); display: flex; align-items: center; justify-content: center;
+  cursor: pointer; transition: all .12s var(--ease); flex: none; padding: 0;
+}
+.quick-btn svg { width: 12px; height: 12px; }
+.quick-btn.trust { color: var(--success); border-color: #3ecb8e40; }
+.quick-btn.trust:hover { background: var(--success-soft); border-color: var(--success); }
+.quick-btn.bad { color: var(--danger); border-color: #f0546b40; }
+.quick-btn.bad:hover { background: var(--danger-soft); border-color: var(--danger); }
+.quick-btn:disabled { opacity: .35; cursor: not-allowed; }
+
+.verdict-body { display: none; padding: 0 14px 12px 37px; }
+.verdict-group.open .verdict-body { display: block; animation: verdict-body-in .15s var(--ease); }
+@keyframes verdict-body-in { from { opacity: 0; transform: translateY(-2px); } to { opacity: 1; transform: none; } }
+
+.verdict-cluster-note {
+  display: flex; align-items: center; gap: 7px; margin-bottom: 10px; font-size: 12px; color: var(--text-dim);
+  background: var(--danger-soft); border: 1px solid #f0546b40; border-radius: var(--radius-sm);
+  padding: 7px 10px;
+}
+.verdict-cluster-note b { color: var(--danger); }
+
+.verdict-msg { padding: 9px 0; border-top: 1px solid var(--border-soft); }
+.verdict-msg:first-child { border-top: none; padding-top: 0; }
 /* Само сообщение, из-за которого бот насторожился — то, чего не хватало
    пользователю, чтобы понять причину пометки (#2611, второй заход). */
-.verdict-message { color: var(--text); font-size: 13px; flex: 1 1 100%; word-break: break-word; }
+.verdict-message { color: var(--text); font-size: 13px; word-break: break-word; margin-bottom: 4px; }
 .verdict-message-missing { color: var(--text-faint); font-style: italic; }
+.verdict-msg-time { color: var(--text-faint); font-size: 11px; font-family: var(--mono); font-variant-numeric: tabular-nums; margin-bottom: 6px; display: block; }
+.verdict-reason { color: var(--text-faint); font-size: 12px; margin-bottom: 6px; }
+
+.sig-list { display: flex; flex-direction: column; gap: 3px; }
+.sig-row { display: flex; align-items: center; gap: 10px; padding: 4px 7px; border-radius: var(--radius-sm); transition: background .12s var(--ease); }
+.sig-row:hover { background: var(--l2); }
+.sig-name { font-size: 12px; color: var(--text-dim); flex: 1 1 auto; min-width: 0; }
+.sig-evidence {
+  font-size: 11px; color: var(--text-faint); flex: 0 0 auto; max-width: 240px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sig-fb { display: flex; gap: 4px; flex: 0 0 auto; }
+/* Явные кнопки вместо левый/правый клик по чипу (#2611, пятый заход) —
+   правый клик (contextmenu) как жест "подтвердить, что бот" был невидим
+   без наведения и конфликтовал с браузерным контекстным меню; без него
+   feedback был однобоким — 124 клика "ошибка" за стрим обнулили вес
+   рабочих сигналов, а подтвердить настоящего бота было нечем. */
+.sig-btn {
+  width: 22px; height: 22px; border-radius: var(--radius-sm); border: 1px solid var(--border);
+  background: var(--l2); color: var(--text-faint); display: flex; align-items: center; justify-content: center;
+  cursor: pointer; transition: all .12s var(--ease); flex: none; padding: 0;
+}
+.sig-btn svg { width: 12px; height: 12px; }
+.sig-btn.fp:hover { background: var(--danger-soft); color: var(--danger); border-color: var(--danger); }
+.sig-btn.bot:hover { background: var(--success-soft); color: var(--success); border-color: var(--success); }
+.sig-btn:disabled { opacity: .4; cursor: not-allowed; }
+.sig-row.marked-fp .sig-name { color: var(--text-faint); text-decoration: line-through; }
+.sig-row.marked-fp .sig-btn.fp { background: var(--danger-soft); color: var(--danger); border-color: var(--danger); }
+.sig-row.marked-bot .sig-btn.bot { background: var(--success-soft); color: var(--success); border-color: var(--success); }
+
+.verdict-group-actions { display: flex; gap: 8px; margin-top: 10px; }
 
 /* Аудит */
 .audit-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
@@ -519,10 +623,6 @@ input::placeholder { color: var(--text-faint); }
   transition: transform .3s var(--ease);
 }
 
-/* Кнопка FP на сигнале */
-.signal-fp-chip { cursor: pointer; }
-.signal-fp-chip:hover { background: var(--danger-soft); color: var(--danger); border-color: var(--danger); }
-
 /* Settings */
 .token-status-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .token-status-badge {
@@ -722,27 +822,40 @@ input::placeholder { color: var(--text-faint); }
       </div>
 
       <div class="screen" id="screen-live">
-        <div class="section-head">
-          <h2>Зачистить пасту</h2>
-          <span class="channel-status-pill running" id="paste-wave-channel-badge">канал —</span>
-        </div>
-        <div class="card" style="margin-bottom:20px;">
-          <div class="note" style="margin-bottom:10px;">
-            Когда чат массово копирует один и тот же текст — вставьте его сюда, система найдёт всех,
-            кто написал похожее за последние 2 минуты, независимо от того, новый это аккаунт или
-            постоянный зритель. Решение всегда за вами: список найденных нужно подтвердить.
+        <!-- Свёрнуто по умолчанию (#2611-подобная жалоба: "Зачистить пасту"
+             занимала весь верх экрана Live постоянно, хотя используется от
+             случая к случаю — кластеры и лента вердиктов, за которыми
+             следят непрерывно во время стрима, оказывались ниже прокрутки).
+             Состояние — в localStorage, не только в памяти: модератор,
+             который её один раз открыл, не должен находить свёрнутой заново
+             при каждом визите. -->
+        <div class="collapsible" id="paste-wave-section">
+          <div class="collapsible-head" id="paste-wave-toggle">
+            <svg class="collapsible-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 6l6 6-6 6"/></svg>
+            <h2>Зачистить пасту</h2>
+            <span class="note" style="margin:0;">— найти всех, кто скопировал один текст</span>
+            <span class="channel-status-pill running" id="paste-wave-channel-badge" style="margin-left:auto;">канал —</span>
           </div>
-          <div style="display:flex;gap:10px;align-items:flex-start;">
-            <textarea id="paste-wave-sample" placeholder="Вставьте текст пасты сюда, или кликните сообщение справа…" style="flex:1;min-height:60px;background:var(--l2);border:1px solid var(--border-soft);border-radius:var(--radius-sm);color:var(--text);padding:8px 10px;font-family:var(--sans);font-size:13px;resize:vertical;"></textarea>
-            <button class="btn btn-accent" id="btn-find-paste-wave">Найти</button>
-          </div>
+          <div class="collapsible-body">
+            <div class="card" style="margin-bottom:20px;">
+              <div class="note" style="margin-bottom:10px;">
+                Когда чат массово копирует один и тот же текст — вставьте его сюда, система найдёт всех,
+                кто написал похожее за последние 2 минуты, независимо от того, новый это аккаунт или
+                постоянный зритель. Решение всегда за вами: список найденных нужно подтвердить.
+              </div>
+              <div style="display:flex;gap:10px;align-items:flex-start;">
+                <textarea id="paste-wave-sample" placeholder="Вставьте текст пасты сюда, или кликните сообщение справа…" style="flex:1;min-height:60px;background:var(--l2);border:1px solid var(--border-soft);border-radius:var(--radius-sm);color:var(--text);padding:8px 10px;font-family:var(--sans);font-size:13px;resize:vertical;"></textarea>
+                <button class="btn btn-accent" id="btn-find-paste-wave">Найти</button>
+              </div>
 
-          <div style="margin-top:14px;">
-            <div class="cluster-meta" style="margin-bottom:6px;">Последние сообщения чата — клик подставляет текст выше, без копирования:</div>
-            <div id="paste-wave-recent" style="max-height:160px;overflow-y:auto;border:1px solid var(--border-soft);border-radius:var(--radius-sm);"></div>
-          </div>
+              <div style="margin-top:14px;">
+                <div class="cluster-meta" style="margin-bottom:6px;">Последние сообщения чата — клик подставляет текст выше, без копирования:</div>
+                <div id="paste-wave-recent" style="max-height:160px;overflow-y:auto;border:1px solid var(--border-soft);border-radius:var(--radius-sm);"></div>
+              </div>
 
-          <div id="paste-wave-results" style="margin-top:14px;"></div>
+              <div id="paste-wave-results" style="margin-top:14px;"></div>
+            </div>
+          </div>
         </div>
 
         <div id="cluster-list" class="cluster-list"><div class="empty">Активных кластеров нет — атак не обнаружено</div></div>
@@ -907,6 +1020,21 @@ input::placeholder { color: var(--text-faint); }
             <div class="cluster-meta" id="token-status-meta" style="margin-top:6px;">Executor не сможет выполнять реальные действия, пока токен не получен.</div>
           </div>
           <button class="btn btn-accent" id="btn-get-bot-token">Получить токен бота</button>
+        </div>
+
+        <!-- Токен для IRC-чата (TWITCH_BOT_TOKEN) — отдельный от токена
+             модерации выше: тот про Helix баны/таймауты, этот про обычные
+             сообщения бота в чате (main.py::ChatBot, экран Chat в
+             panel/bots_api.py). Раньше выпускался вручную и не имел
+             refresh_token — истекал молча: бот продолжал читать чат на уже
+             установленном соединении, но отправка тихо переставала работать. -->
+        <div class="section-head"><h2>Токен чат-бота (отправка сообщений)</h2></div>
+        <div class="card token-status-row">
+          <div>
+            <span class="token-status-badge missing" id="chat-token-status-badge">не настроен</span>
+            <div class="cluster-meta" id="chat-token-status-meta" style="margin-top:6px;">Отправка сообщений из панели не будет доходить до чата, пока токен не получен.</div>
+          </div>
+          <button class="btn btn-accent" id="btn-get-chat-token">Получить чат-токен</button>
         </div>
 
         <div class="section-head"><h2>Уведомления в Discord</h2></div>
