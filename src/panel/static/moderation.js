@@ -138,6 +138,29 @@ el("btn-logout").addEventListener("click", async () => {
 });
 
 // fetch-обёртка: на 401 показывает экран логина вместо тихого падения.
+//
+// 403 (роль слишком низкая для этого конкретного экрана — например VIEWER
+// на /users) раньше проваливался в вызывающий код как есть: loadUsers()
+// делал resp.json() над телом {"detail": "..."}, не массивом, и пустое
+// "rows.length" рисовало обычное "Пользователей нет" — зритель видел
+// пустой список канала вместо честного объяснения, почему данных не видно
+// (2026-08-15, UX-аудит панели). Показываем баннер прямо в активном экране
+// и бросаем исключение — loadX() прерывается на catch, не рисует пустое
+// состояние поверх баннера.
+function showAccessDeniedBanner() {
+  const screen = document.querySelector(".screen.active");
+  if (!screen || screen.querySelector(".access-denied-banner")) return;
+  const banner = document.createElement("div");
+  banner.className = "access-denied-banner";
+  banner.textContent = "Недостаточно прав для этого экрана — нужна роль MODERATOR или выше.";
+  screen.prepend(banner);
+}
+
+// Отличает 403 от прочих сбоев (сеть, парсинг JSON) в catch-блоках loadX()
+// ниже — на 403 баннер уже показан здесь, локальный catch не должен поверх
+// него рисовать своё "пусто"/"ошибка загрузки".
+class AccessDeniedError extends Error {}
+
 async function apiFetch(url, options = {}) {
   const resp = await fetch(url, {
     ...options,
@@ -146,6 +169,10 @@ async function apiFetch(url, options = {}) {
   if (resp.status === 401) {
     showLoginScreen();
     throw new Error("Требуется вход");
+  }
+  if (resp.status === 403) {
+    showAccessDeniedBanner();
+    throw new AccessDeniedError("Недостаточно прав");
   }
   return resp;
 }
@@ -354,6 +381,24 @@ async function loadChannels() {
     return;
   }
 
+  // desired_state отдельно от overview.status: overview судит "активен ли
+  // канал" по наличию mod.<id>.db и живым кластерам (см. moderation_api.py),
+  // а Registry — единственный источник правды о том, должен ли
+  // ModerationHub вообще поднимать движок на этом канале (см.
+  // registry_api.py::start_channel). Канал может быть running, но без
+  // кластеров (offline по overview) — обе пилюли нужны, они про разное.
+  let registryByProfile = new Map();
+  try {
+    const regResp = await fetch("/api/registry/channels");
+    if (regResp.ok) {
+      const records = await regResp.json();
+      registryByProfile = new Map(records.map((r) => [r.broadcaster_id, r]));
+    }
+  } catch {
+    // Недоступность Registry не должна ронять всю сетку каналов — кнопки
+    // Start/Stop просто не отрисуются для затронутых карточек ниже.
+  }
+
   renderOverviewKpi(overview.kpi);
   renderOverviewAlerts(overview.alerts);
 
@@ -362,6 +407,7 @@ async function loadChannels() {
   for (const p of lastProfiles) {
     const label = p.channel || p.profile;
     const c = byProfile.get(p.profile);
+    const reg = registryByProfile.get(p.profile);
     const pill = STATUS_PILL[c?.status || "offline"];
     const card = document.createElement("div");
     card.className = "channel-card";
@@ -380,18 +426,29 @@ async function loadChannels() {
         <div class="channel-metric"><div class="v tabular">${c ? c.active_clusters : "—"}</div><div class="l">Активных кластеров</div></div>
         <div class="channel-metric"><div class="v tabular">${c ? c.new_clusters : "—"}</div><div class="l">Новых, 24ч</div></div>
       </div>
+      ${reg ? `
+      <div class="row channel-card-controls" style="margin-top:10px">
+        <button class="btn btn-ghost channel-start-btn" ${reg.desired_state === "running" ? "disabled" : ""}>Запустить</button>
+        <button class="btn btn-ghost channel-stop-btn" ${reg.desired_state === "stopped" ? "disabled" : ""}>Остановить</button>
+      </div>` : ""}
     `;
     card.addEventListener("click", () => selectChannel(p.profile));
+    if (reg) {
+      const startBtn = card.querySelector(".channel-start-btn");
+      const stopBtn = card.querySelector(".channel-stop-btn");
+      startBtn.addEventListener("click", (ev) => setChannelDesiredState(ev, p.profile, "start"));
+      stopBtn.addEventListener("click", (ev) => setChannelDesiredState(ev, p.profile, "stop"));
+    }
     grid.appendChild(card);
   }
-  const addCard = document.createElement("a");
+  const addCard = document.createElement("div");
   addCard.className = "channel-card channel-card-add";
-  addCard.href = "/bots";
-  addCard.style.textDecoration = "none";
+  addCard.style.cursor = "pointer";
   addCard.innerHTML = `
     <svg width="18" height="18" viewBox="0 0 16 16" fill="none"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
     <span style="font-size:12.5px;">Подключить канал</span>
   `;
+  addCard.addEventListener("click", openAddChannelModal);
   grid.appendChild(addCard);
 }
 
@@ -399,14 +456,16 @@ async function loadChannels() {
 
 const SCREEN_TITLES = {
   channels: "Каналы",
-  live: "Прямой эфир — активные кластеры",
+  live: "Боты / Спам — активные кластеры",
   users: "Пользователи — зрители канала",
   trusted: "Доверенные зрители",
   audit: "Аудит — журнал действий модераторов",
   patterns: "Библиотека паттернов",
   attack: "Режим атаки",
   content: "Словарный детектор",
-  stats: "Статистика и FP-rate",
+  stats: "Статистика по ботам",
+  "paste-wave": "Зачистить пасту — найти всех, кто скопировал один текст",
+  autoclip: "Автоклип — бот сам клипает яркие моменты",
   settings: "Настройки — конфигурация и токен бота",
 };
 
@@ -426,7 +485,8 @@ function switchScreen(name) {
   }
   if (name === "stats") loadStats();
   if (name === "settings") loadSettings();
-  if (name === "live") loadPasteWaveRecent();
+  if (name === "paste-wave") loadPasteWaveRecent();
+  if (name === "autoclip") loadAutoclipSettings();
   if (name === "content") {
     connectContentWs();
   } else {
@@ -438,6 +498,14 @@ function canAdmin() {
   return ["ADMIN", "OWNER"].includes(state.role);
 }
 
+function canOwner() {
+  return state.role === "OWNER";
+}
+
+function canModerator() {
+  return ["MODERATOR", "ADMIN", "OWNER"].includes(state.role);
+}
+
 // --- рендер: кластеры ----------------------------------------------------
 
 function riskClass(score) {
@@ -447,7 +515,43 @@ function riskClass(score) {
   return "low";
 }
 
+// Позиция курсора в экранных координатах — обновляется на каждое движение
+// мыши, читается в handleClusterHotkey через document.elementFromPoint().
+//
+// Раньше карточка "под курсором" отслеживалась через mouseenter/mouseleave
+// на самой карточке (hoveredClusterId), но renderClusters() на каждое
+// WebSocket-сообщение (несколько раз в минуту во время реальной атаки)
+// делает list.innerHTML = "" и создаёт карточки заново — если курсор не
+// шевелится физически, браузер НЕ переигрывает mouseenter на новом
+// DOM-узле под тем же экранным местом (mouseenter — событие движения
+// указателя, не событие появления элемента). hoveredClusterId залипал на
+// id кластера, которого уже нет в свежем списке — хоткей молча переставал
+// работать сразу после первого же обновления ленты, пока модератор
+// действительно не пошевелит мышью (2026-08-15, повторный UX-аудит после
+// первого прохода хоткеев). elementFromPoint читает актуальный DOM в
+// момент нажатия клавиши, а не кэширует момент наведения — обновление
+// списка под неподвижным курсором эту связь больше не рвёт.
+let lastPointerX = -1;
+let lastPointerY = -1;
+document.addEventListener("mousemove", (e) => {
+  lastPointerX = e.clientX;
+  lastPointerY = e.clientY;
+});
+
+function clusterIdUnderPointer() {
+  if (lastPointerX < 0) return null;
+  const el2 = document.elementFromPoint(lastPointerX, lastPointerY);
+  const card = el2 && el2.closest(".cluster-card");
+  return card ? card.dataset.clusterId : null;
+}
+
+// Список кластеров с последнего WebSocket-сообщения — хоткей ищет по нему
+// актуальный объект кластера по id, а не полагается на устаревшее замыкание
+// из renderClusters (список перерисовывается заново на каждое сообщение).
+let lastClusters = [];
+
 function renderClusters(clusters) {
+  lastClusters = clusters || [];
   const list = el("cluster-list");
   if (!clusters || clusters.length === 0) {
     list.innerHTML = '<div class="empty">Активных кластеров нет — атак не обнаружено</div>';
@@ -462,10 +566,14 @@ function renderClusters(clusters) {
     card.innerHTML = `
       <div class="cluster-head">
         <div class="cluster-title">
-          <span class="risk-badge ${cls}">${c.risk_score}</span>
+          <span class="risk-badge ${cls}" title="Риск атаки 0-100 — выше порога включает цвет карточки (зелёный/жёлтый/красный). Пороги для TIMEOUT/BAN настраиваются в Settings → Sensitivity, поэтому число не привязано к фиксированной границе.">${c.risk_score}</span>
           <span class="cluster-size">${c.size} участников</span>
         </div>
-        <div class="cluster-meta">окно прихода ${Math.round(c.arrival_window_sec)}с · схожесть ${(c.similarity_score * 100).toFixed(0)}% · уверенность ${(c.confidence * 100).toFixed(0)}%</div>
+        <div class="cluster-meta">
+          <span title="Сколько секунд прошло между первым и последним участником кластера — чем короче, тем меньше похоже на совпадение">окно прихода ${Math.round(c.arrival_window_sec)}с</span>
+          · <span title="Насколько похожи сообщения участников друг на друга (точный/почти-точный дубликат текста)">схожесть ${(c.similarity_score * 100).toFixed(0)}%</span>
+          · <span title="Насколько система уверена в самом выводе о кластере — независимо от risk_score. BAN требует высокую уверенность даже при высоком риске.">уверенность ${(c.confidence * 100).toFixed(0)}%</span>
+        </div>
       </div>
       <div class="signal-chips"></div>
       <div class="cluster-actions"></div>
@@ -483,12 +591,38 @@ function renderClusters(clusters) {
       chips.appendChild(more);
     }
     const actions = card.querySelector(".cluster-actions");
-    actions.appendChild(actionButton("BAN ALL", "btn-danger", () => confirmClusterAction(c, "BAN")));
-    actions.appendChild(actionButton("TIMEOUT ALL", "btn-warning", () => confirmClusterAction(c, "TIMEOUT")));
-    actions.appendChild(actionButton("IGNORE CLUSTER", "btn-ghost", () => decideCluster(c.id, "ignore")));
+    actions.appendChild(actionButton("BAN ALL", "btn-danger", () => confirmClusterAction(c, "BAN"), "B"));
+    actions.appendChild(actionButton("TIMEOUT ALL", "btn-warning", () => confirmClusterAction(c, "TIMEOUT"), "T"));
+    actions.appendChild(actionButton("IGNORE CLUSTER", "btn-ghost", () => confirmIgnoreCluster(c), "I"));
     list.appendChild(card);
   }
 }
+
+// B/T/I на кластере под курсором — открывают ту же confirm-модалку, что и
+// клик по кнопке (никакое действие не пропускает подтверждение через
+// хоткей). Не срабатывает при вводе текста (поиск, поля настроек) и не на
+// экранах, отличных от Live — иначе "T" в поле "Зачистить пасту" неожиданно
+// открыл бы модалку таймаута для последнего наведённого кластера.
+function handleClusterHotkey(e) {
+  if (!document.getElementById("screen-live").classList.contains("active")) return;
+  if (el("modal-overlay").classList.contains("open")) return;
+  const target = e.target;
+  if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) return;
+  const clusterId = clusterIdUnderPointer();
+  if (clusterId == null) return;
+  // dataset.clusterId — строка (все DOM dataset-атрибуты строковые),
+  // c.id — число из JSON API; String() на обеих сторонах, а не
+  // parseInt/Number на dataset, потому что c.id теоретически может быть
+  // не числом в будущем (сейчас всегда int, но сравнение не должно на это
+  // молча полагаться).
+  const cluster = lastClusters.find((c) => String(c.id) === clusterId);
+  if (!cluster) return;
+  const key = e.key.toLowerCase();
+  if (key === "b") { e.preventDefault(); confirmClusterAction(cluster, "BAN"); }
+  else if (key === "t") { e.preventDefault(); confirmClusterAction(cluster, "TIMEOUT"); }
+  else if (key === "i") { e.preventDefault(); confirmIgnoreCluster(cluster); }
+}
+document.addEventListener("keydown", handleClusterHotkey);
 
 function userChip(userId, login) {
   const chip = document.createElement("span");
@@ -499,12 +633,19 @@ function userChip(userId, login) {
   return chip;
 }
 
-function actionButton(label, cls, onClick) {
+// hotkey — необязательная буква для клавиатурного ускорения (см.
+// handleClusterHotkey ниже): подсказка рисуется прямо на кнопке, чтобы не
+// требовать от модератора помнить раскладку заранее (Recognition, не Recall).
+function actionButton(label, cls, onClick, hotkey) {
   const btn = document.createElement("button");
   btn.className = `btn ${cls}`;
-  btn.textContent = label;
   btn.disabled = !canAct();
   btn.title = canAct() ? "" : "Требуется роль MODERATOR и выше";
+  if (hotkey && canAct()) {
+    btn.innerHTML = `${escapeHtml(label)} <kbd class="btn-hotkey">${hotkey}</kbd>`;
+  } else {
+    btn.textContent = label;
+  }
   btn.addEventListener("click", onClick);
   return btn;
 }
@@ -849,6 +990,22 @@ async function decideCluster(clusterId, decision) {
   }
 }
 
+// IGNORE CLUSTER раньше вызывал decideCluster() напрямую, без подтверждения —
+// в отличие от BAN ALL/TIMEOUT ALL. Разница в риске небольшая (баны/таймауты
+// необратимы для зрителя, игнор необратим для сигнала атаки — проигнорированный
+// кластер пропадает из ленты), но клик мимо соседней TIMEOUT ALL в спешке
+// стоил слишком дёшево. Та же модалка confirm, что и у двух других кнопок —
+// не отдельный UI-паттерн (Consistency and Standards, security-аудит 2026-08-15).
+function confirmIgnoreCluster(cluster) {
+  el("modal-title").textContent = "IGNORE CLUSTER — подтвердите";
+  el("modal-body").textContent =
+    `Кластер #${cluster.id} (${cluster.size} участников, риск ${cluster.risk_score}/100) ` +
+    `пропадёт из активной ленты и не будет предложен повторно. Если это ложное ` +
+    `срабатывание — используйте отметку "доверенный" на конкретном зрителе вместо игнора.`;
+  pendingConfirm = () => decideCluster(cluster.id, "ignore");
+  el("modal-overlay").classList.add("open");
+}
+
 async function markUserSafe(userId, login) {
   if (!canAct()) {
     toast("Требуется роль MODERATOR и выше", "error");
@@ -870,20 +1027,6 @@ async function markUserSafe(userId, login) {
     return false;
   }
 }
-
-// "Зачистить пасту" свёрнута по умолчанию (#2611-подобная жалоба: блок
-// занимал весь верх экрана Live постоянно, хотя используется от случая к
-// случаю) — состояние в localStorage, не только в памяти вкладки, чтобы
-// решение не сбрасывалось при каждом заходе на экран.
-const PASTE_WAVE_OPEN_KEY = "mod.pasteWaveOpen";
-if (localStorage.getItem(PASTE_WAVE_OPEN_KEY) === "1") {
-  el("paste-wave-section").classList.add("open");
-}
-el("paste-wave-toggle").addEventListener("click", () => {
-  const section = el("paste-wave-section");
-  const isOpen = section.classList.toggle("open");
-  localStorage.setItem(PASTE_WAVE_OPEN_KEY, isOpen ? "1" : "0");
-});
 
 el("modal-cancel").addEventListener("click", () => {
   pendingConfirm = null;
@@ -913,7 +1056,7 @@ async function loadPasteWaveRecent() {
     if (!resp.ok) throw new Error(resp.statusText);
     const messages = await resp.json();
     if (messages.length === 0) {
-      container.innerHTML = '<div class="note" style="padding:8px 10px;">Сообщений пока нет</div>';
+      container.innerHTML = '<div class="empty-inline">Сообщений пока нет</div>';
       return;
     }
     // Клик на текст, а не отдельная кнопка — сообщение и так короткое, вся
@@ -929,7 +1072,8 @@ async function loadPasteWaveRecent() {
       )
       .join("");
   } catch (e) {
-    container.innerHTML = '<div class="note" style="padding:8px 10px;">Не удалось загрузить сообщения</div>';
+    if (e instanceof AccessDeniedError) return;
+    container.innerHTML = '<div class="empty-inline">Не удалось загрузить сообщения</div>';
   }
 }
 
@@ -971,17 +1115,17 @@ el("btn-find-paste-wave").addEventListener("click", async () => {
 function renderPasteWaveResults() {
   const results = el("paste-wave-results");
   if (lastPasteWaveMatches.length === 0) {
-    results.innerHTML = '<div class="note">Совпадений за последние 2 минуты не найдено.</div>';
+    results.innerHTML = '<div class="note" style="margin-top:14px;">Совпадений за последние 2 минуты не найдено.</div>';
     return;
   }
   const rows = lastPasteWaveMatches
     .map(
       (m) => `
-      <label style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border-soft);">
+      <label class="paste-wave-match-row">
         <input type="checkbox" class="paste-wave-check" data-user-id="${escapeHtml(m.user_id)}" checked>
-        <span style="font-weight:600;">${escapeHtml(m.login)}</span>
-        <span class="cluster-meta" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(m.text)}</span>
-        <span class="cluster-meta">${Math.round(m.similarity * 100)}%</span>
+        <span class="paste-wave-match-login">${escapeHtml(m.login)}</span>
+        <span class="paste-wave-match-text">${escapeHtml(m.text)}</span>
+        <span class="paste-wave-match-score">${Math.round(m.similarity * 100)}%</span>
       </label>`
     )
     .join("");
@@ -989,9 +1133,9 @@ function renderPasteWaveResults() {
     (opt) => `<button class="btn btn-ghost btn-small paste-wave-timeout" data-duration="${opt.seconds}">${opt.label}</button>`
   ).join("");
   results.innerHTML = `
-    <div class="note" style="margin-bottom:8px;">Найдено ${lastPasteWaveMatches.length} — снимите галочку, чтобы исключить из наказания.</div>
-    ${rows}
-    <div style="display:flex;align-items:center;gap:8px;margin-top:12px;">
+    <div class="note" style="margin-top:14px;">Найдено ${lastPasteWaveMatches.length} — снимите галочку, чтобы исключить из наказания.</div>
+    <div class="paste-wave-list" style="margin-top:8px;">${rows}</div>
+    <div class="paste-wave-actions">
       <span class="cluster-meta">Таймаут выбранным:</span>
       ${durationBtns}
     </div>
@@ -1076,7 +1220,8 @@ async function loadUsers() {
         </tr>`;
       })
       .join("");
-  } catch {
+  } catch (err) {
+    if (err instanceof AccessDeniedError) return;
     body.innerHTML = "";
     empty.style.display = "block";
   }
@@ -1117,7 +1262,8 @@ async function loadTrustedUsers() {
     body.querySelectorAll("[data-unmark]").forEach((btn) => {
       btn.addEventListener("click", () => unmarkTrusted(btn.dataset.unmark, btn.dataset.login));
     });
-  } catch {
+  } catch (err) {
+    if (err instanceof AccessDeniedError) return;
     body.innerHTML = "";
     empty.style.display = "block";
   }
@@ -1172,7 +1318,8 @@ async function loadAudit() {
         </tr>`
       )
       .join("");
-  } catch {
+  } catch (err) {
+    if (err instanceof AccessDeniedError) return;
     body.innerHTML = "";
     empty.style.display = "block";
   }
@@ -1225,6 +1372,7 @@ async function loadPatterns() {
       list.appendChild(row);
     }
   } catch (e) {
+    if (e instanceof AccessDeniedError) return;
     list.innerHTML = '<div class="empty">Не удалось загрузить паттерны</div>';
   }
 }
@@ -1534,7 +1682,7 @@ async function loadStats() {
       ["Реальных таймаутов", totals.actual_timeouts],
       ["Реальных банов", totals.actual_bans],
       ["Кластеров", totals.clusters],
-      ["False positives", totals.false_positives],
+      ["Ложных срабатываний", totals.false_positives],
     ];
     tiles.innerHTML = tileData
       .map(([label, value]) => `<div class="stat-tile"><div class="stat-value">${value}</div><div class="stat-label">${label}</div></div>`)
@@ -1579,6 +1727,7 @@ async function loadStats() {
         .join("");
     }
   } catch (e) {
+    if (e instanceof AccessDeniedError) return;
     fpBody.innerHTML = "";
     fpEmpty.style.display = "block";
   }
@@ -1754,6 +1903,322 @@ el("content-moderation-enabled").addEventListener("change", async (e) => {
   }
 });
 
+async function loadAutoclipSettings() {
+  await loadClipTokenStatus();
+  const checkbox = el("autoclip-enabled");
+  const status = el("autoclip-enabled-status");
+  try {
+    const resp = await apiFetch(`/api/moderation/autoclip_settings?profile=${encodeURIComponent(currentProfile())}`);
+    if (!resp.ok) {
+      const errBody = await resp.json().catch(() => ({}));
+      throw new Error(errBody.detail || resp.statusText);
+    }
+    const data = await resp.json();
+    // enabled === null — панель ещё не переключала этот канал явно, тогда
+    // работает дефолт из config/channels/<канал>.yml (bot/autoclip_config.py),
+    // который отсюда не виден — чекбокс отражает "как если бы выключено",
+    // но текст статуса не должен звучать как утверждение, что оно точно выключено.
+    checkbox.checked = data.enabled === true;
+    status.classList.toggle("on", data.enabled === true);
+    if (data.enabled === null) {
+      status.textContent = "Не настроено в панели — действует значение из config/channels/*.yml";
+    } else if (data.enabled) {
+      status.textContent = "Включён на этом канале";
+    } else {
+      status.textContent = "Выключен на этом канале";
+    }
+
+    // Пустое поле — тот же смысл, что null: значение не переопределено из
+    // панели, действует YAML. Не подставляем 0/пустую строку явно, чтобы
+    // случайный сабмит формы без изменений не записал "пустой" оверрайд.
+    el("autoclip-burst-window").value = data.burst_window_seconds ?? "";
+    el("autoclip-cooldown").value = data.cooldown_seconds ?? "";
+    el("autoclip-capture-delay").value = data.capture_delay_seconds ?? "";
+    el("autoclip-keyword-phrases").value = (data.keyword_phrases || []).join(", ");
+    el("autoclip-voice-phrases").value = (data.voice_phrases || []).join(", ");
+
+    applyBurstThresholdState(data);
+  } catch (e) {
+    toast(`Ошибка загрузки настроек автоклипа: ${e.message}`, "error");
+  }
+  checkbox.disabled = !canModerator();
+  el("btn-save-autoclip-thresholds").disabled = !canModerator();
+  el("btn-save-autoclip-burst-threshold").disabled = !canModerator();
+}
+
+// Порог всплеска — единственное поле с двумя взаимоисключающими способами
+// задания (mode-switch в HTML: "Вручную" / "Автоматически"). Один активный
+// таб виден за раз; какой именно — решает наличие сохранённого
+// burst_auto_scale_enabled, а не отдельный чекбокс.
+function setAutoclipBurstMode(mode) {
+  const isAuto = mode === "auto";
+  el("autoclip-mode-manual").classList.toggle("active", !isAuto);
+  el("autoclip-mode-manual").setAttribute("aria-selected", String(!isAuto));
+  el("autoclip-mode-auto").classList.toggle("active", isAuto);
+  el("autoclip-mode-auto").setAttribute("aria-selected", String(isAuto));
+  el("autoclip-mode-panel-manual").hidden = isAuto;
+  el("autoclip-mode-panel-auto").hidden = !isAuto;
+}
+
+el("autoclip-mode-manual").addEventListener("click", () => setAutoclipBurstMode("manual"));
+el("autoclip-mode-auto").addEventListener("click", () => setAutoclipBurstMode("auto"));
+
+// Разведена по смыслу с loadAutoclipSettings, но не отдельным HTTP-запросом
+// — GET /autoclip_settings уже отдаёт все поля auto_scale/last_viewer_count
+// в одном ответе (AutoclipSettings.to_dict()), просто раскладываем их по
+// нужным полям и выбираем активный таб.
+function applyBurstThresholdState(data) {
+  const autoScaleEnabled = data.burst_auto_scale_enabled === true;
+  setAutoclipBurstMode(autoScaleEnabled ? "auto" : "manual");
+
+  const threshold = data.burst_unique_authors_threshold;
+  el("autoclip-burst-threshold").value = threshold ?? "";
+  el("autoclip-manual-preview").textContent = threshold ?? "—";
+  highlightMatchingAutoclipPreset(threshold);
+  // Обратной формулы "порог -> число зрителей" нет (несколько чисел
+  // зрителей могут давать один и тот же порог), поэтому при загрузке
+  // сохранённого значения поле ввода зрителей просто пустое — оно для
+  // одноразового пересчёта, не для отображения текущего состояния.
+  el("autoclip-viewer-count-input").value = "";
+
+  el("autoclip-auto-scale-percent").value =
+    data.burst_auto_scale_percent != null ? data.burst_auto_scale_percent * 100 : "";
+  el("autoclip-auto-scale-min").value = data.burst_auto_scale_min ?? "";
+  el("autoclip-auto-scale-max").value = data.burst_auto_scale_max ?? "";
+
+  const currentValueEl = el("autoclip-auto-scale-current");
+  const currentDetailEl = el("autoclip-auto-scale-current-detail");
+  if (autoScaleEnabled && data.last_viewer_count != null) {
+    const when = new Date(data.last_viewer_count_at * 1000).toLocaleTimeString("ru-RU");
+    currentValueEl.textContent = String(threshold ?? "?");
+    currentValueEl.classList.remove("pending");
+    currentDetailEl.textContent = `авторов, при ${data.last_viewer_count} зрителях (данные на ${when})`;
+  } else if (autoScaleEnabled) {
+    currentValueEl.textContent = "—";
+    currentValueEl.classList.add("pending");
+    currentDetailEl.textContent = "канал ещё не опрошен или сейчас оффлайн — используется последнее известное значение";
+  } else {
+    currentValueEl.textContent = "—";
+    currentValueEl.classList.add("pending");
+    currentDetailEl.textContent = "появится после первого опроса Twitch, если канал в эфире";
+  }
+}
+
+el("autoclip-enabled").addEventListener("change", async (e) => {
+  const enabled = e.target.checked;
+  try {
+    const resp = await apiFetch("/api/moderation/autoclip_settings", {
+      method: "POST",
+      body: JSON.stringify({ profile: currentProfile(), enabled }),
+    });
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      throw new Error(body.detail || resp.statusText);
+    }
+    toast(enabled ? "Автоклип включён на этом канале" : "Автоклип выключен на этом канале", "success");
+    await loadAutoclipSettings();
+  } catch (err) {
+    e.target.checked = !enabled;
+    toast(`Ошибка: ${err.message}`, "error");
+  }
+});
+
+// Пустое строковое поле -> null (не переопределять, брать из YAML);
+// непустое число -> Number, непустой список фраз -> массив строк без
+// пустых элементов (сервер и так отклонит пустую фразу, но чистим на
+// клиенте заранее, чтобы не путать пользователя ошибкой валидации на
+// ровном месте — типичный случай "клип, " с висящей запятой).
+function parseOptionalNumber(value) {
+  const trimmed = value.trim();
+  return trimmed === "" ? null : Number(trimmed);
+}
+
+function parseOptionalPhraseList(value) {
+  const trimmed = value.trim();
+  if (trimmed === "") return null;
+  return trimmed.split(",").map((p) => p.trim()).filter((p) => p.length > 0);
+}
+
+el("btn-save-autoclip-thresholds").addEventListener("click", async () => {
+  const statusEl = el("autoclip-thresholds-status");
+  const payload = {
+    profile: currentProfile(),
+    burst_window_seconds: parseOptionalNumber(el("autoclip-burst-window").value),
+    cooldown_seconds: parseOptionalNumber(el("autoclip-cooldown").value),
+    capture_delay_seconds: parseOptionalNumber(el("autoclip-capture-delay").value),
+    keyword_phrases: parseOptionalPhraseList(el("autoclip-keyword-phrases").value),
+    voice_phrases: parseOptionalPhraseList(el("autoclip-voice-phrases").value),
+  };
+  try {
+    const resp = await apiFetch("/api/moderation/autoclip_settings/thresholds", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      throw new Error(body.detail || resp.statusText);
+    }
+    statusEl.textContent = "Сохранено";
+    statusEl.style.color = "var(--success)";
+    toast("Настройки сохранены", "success");
+    await loadAutoclipSettings();
+  } catch (err) {
+    statusEl.textContent = "";
+    toast(`Ошибка: ${err.message}`, "error");
+  }
+});
+
+// Один "Сохранить" для порога всплеска — что именно уходит на сервер,
+// решает активный таб (mode-switch), а не два независимых обработчика на
+// два независимых поля. Переключение таба само по себе НИЧЕГО не
+// сохраняет: сначала выбрать способ, заполнить поля, потом явно сохранить.
+el("btn-save-autoclip-burst-threshold").addEventListener("click", async () => {
+  const statusEl = el("autoclip-burst-threshold-save-status");
+  const isAuto = el("autoclip-mode-auto").classList.contains("active");
+
+  try {
+    if (isAuto) {
+      const percentPct = parseOptionalNumber(el("autoclip-auto-scale-percent").value);
+      if (percentPct == null) {
+        throw new Error("Укажите долю зрителей (%)");
+      }
+      const resp = await apiFetch("/api/moderation/autoclip_settings/auto_scale", {
+        method: "POST",
+        body: JSON.stringify({
+          profile: currentProfile(),
+          enabled: true,
+          percent: percentPct / 100,
+          minimum: parseOptionalNumber(el("autoclip-auto-scale-min").value),
+          maximum: parseOptionalNumber(el("autoclip-auto-scale-max").value),
+        }),
+      });
+      if (!resp.ok) {
+        const body = await resp.json().catch(() => ({}));
+        throw new Error(body.detail || resp.statusText);
+      }
+    } else {
+      // Переключение на "Вручную" одновременно выключает авто-режим
+      // (одно и то же поле не может управляться формулой и вводом
+      // одновременно) и записывает введённое число.
+      const disableResp = await apiFetch("/api/moderation/autoclip_settings/auto_scale", {
+        method: "POST",
+        body: JSON.stringify({ profile: currentProfile(), enabled: false }),
+      });
+      if (!disableResp.ok) {
+        const body = await disableResp.json().catch(() => ({}));
+        throw new Error(body.detail || disableResp.statusText);
+      }
+      const resp = await apiFetch("/api/moderation/autoclip_settings/thresholds", {
+        method: "POST",
+        body: JSON.stringify({
+          profile: currentProfile(),
+          burst_unique_authors_threshold: parseOptionalNumber(el("autoclip-burst-threshold").value),
+        }),
+      });
+      if (!resp.ok) {
+        const body = await resp.json().catch(() => ({}));
+        throw new Error(body.detail || resp.statusText);
+      }
+    }
+    statusEl.textContent = "Сохранено";
+    statusEl.style.color = "var(--success)";
+    toast("Порог всплеска сохранён", "success");
+    await loadAutoclipSettings();
+  } catch (err) {
+    statusEl.textContent = "";
+    toast(`Ошибка: ${err.message}`, "error");
+  }
+});
+
+// Пресеты по числу ОДНОВРЕМЕННЫХ зрителей в чате — только заполняют поля,
+// не сохраняют сами: пользователь видит, что подставилось, и жмёт
+// "Сохранить пороги" осознанно, как после ручного ввода. Дефолт кода
+// (12 авторов / 20 сек / 300 сек кулдаун, см. bot/autoclip_config.py) —
+// это и есть пресет "средний канал", остальные — отклонения от него: чем
+// больше в чате людей одновременно, тем выше порог и короче окно, чтобы
+// отсекать фоновый шум большого чата, а не ловить каждую мелкую волну.
+const AUTOCLIP_PRESETS = {
+  small: { key: "small", burstThreshold: 4, burstWindow: 25, cooldown: 240 },
+  medium: { key: "medium", burstThreshold: 12, burstWindow: 20, cooldown: 300 },
+  large: { key: "large", burstThreshold: 30, burstWindow: 15, cooldown: 360 },
+  mega: { key: "mega", burstThreshold: 80, burstWindow: 12, cooldown: 420 },
+};
+
+// Подсвечивает пресет, чьё число авторов совпадает с текущим порогом —
+// чисто визуальная обратная связь "вот откуда взялось это число", не
+// хранится отдельно от самого значения поля (нет своего state).
+function highlightMatchingAutoclipPreset(threshold) {
+  for (const key of Object.keys(AUTOCLIP_PRESETS)) {
+    const match = threshold != null && AUTOCLIP_PRESETS[key].burstThreshold === Number(threshold);
+    el(`btn-autoclip-preset-${key}`).classList.toggle("active", match);
+  }
+}
+
+function applyAutoclipPreset(preset) {
+  // Пресет — это способ задать порог ВРУЧНУЮ, переключаем таб явно, даже
+  // если до этого был выбран "Автоматически" (иначе подставленное число
+  // ушло бы в невидимое поле и молча ничего бы не сохранило).
+  setAutoclipBurstMode("manual");
+  el("autoclip-burst-threshold").value = preset.burstThreshold;
+  el("autoclip-burst-window").value = preset.burstWindow;
+  el("autoclip-cooldown").value = preset.cooldown;
+  el("autoclip-manual-preview").textContent = preset.burstThreshold;
+  el("autoclip-viewer-count-input").value = "";
+  highlightMatchingAutoclipPreset(preset.burstThreshold);
+  el("autoclip-burst-threshold-save-status").textContent = "Заполнено из пресета — не забудьте сохранить";
+  el("autoclip-burst-threshold-save-status").style.color = "var(--text-faint)";
+  el("autoclip-thresholds-status").textContent = "Заполнено из пресета — не забудьте сохранить";
+  el("autoclip-thresholds-status").style.color = "var(--text-faint)";
+}
+
+el("btn-autoclip-preset-small").addEventListener("click", () => applyAutoclipPreset(AUTOCLIP_PRESETS.small));
+el("btn-autoclip-preset-medium").addEventListener("click", () => applyAutoclipPreset(AUTOCLIP_PRESETS.medium));
+el("btn-autoclip-preset-large").addEventListener("click", () => applyAutoclipPreset(AUTOCLIP_PRESETS.large));
+el("btn-autoclip-preset-mega").addEventListener("click", () => applyAutoclipPreset(AUTOCLIP_PRESETS.mega));
+
+// "Своё число зрителей" — не порог напрямую: пользователь думает в
+// терминах "сколько людей ОДНОВРЕМЕННО в чате", не в терминах порога
+// авторов за окно (тот же принцип, что и у пресетов). Порог между
+// точками пресетов интерполируем линейно по числу зрителей — те же 4
+// точки (4/50, 12/300, 30/1000), что уже нарисованы на кнопках, без
+// отдельной, ничем не связанной с ними формулы. Ниже первой и выше
+// последней точки — зажимаем на крайних пресетах.
+const AUTOCLIP_PRESET_POINTS = [
+  { viewers: 50, threshold: AUTOCLIP_PRESETS.small.burstThreshold },
+  { viewers: 300, threshold: AUTOCLIP_PRESETS.medium.burstThreshold },
+  { viewers: 1000, threshold: AUTOCLIP_PRESETS.large.burstThreshold },
+  { viewers: 2000, threshold: AUTOCLIP_PRESETS.mega.burstThreshold },
+];
+
+function thresholdForViewerCount(viewerCount) {
+  const points = AUTOCLIP_PRESET_POINTS;
+  if (viewerCount <= points[0].viewers) return points[0].threshold;
+  if (viewerCount >= points[points.length - 1].viewers) return points[points.length - 1].threshold;
+  for (let i = 1; i < points.length; i++) {
+    if (viewerCount <= points[i].viewers) {
+      const prev = points[i - 1];
+      const next = points[i];
+      const ratio = (viewerCount - prev.viewers) / (next.viewers - prev.viewers);
+      return Math.round(prev.threshold + ratio * (next.threshold - prev.threshold));
+    }
+  }
+  return points[points.length - 1].threshold;
+}
+
+el("autoclip-viewer-count-input").addEventListener("input", (e) => {
+  const trimmed = e.target.value.trim();
+  if (trimmed === "" || Number(trimmed) <= 0) {
+    el("autoclip-burst-threshold").value = "";
+    el("autoclip-manual-preview").textContent = "—";
+    highlightMatchingAutoclipPreset(null);
+    return;
+  }
+  const threshold = thresholdForViewerCount(Number(trimmed));
+  el("autoclip-burst-threshold").value = threshold;
+  el("autoclip-manual-preview").textContent = threshold;
+  highlightMatchingAutoclipPreset(threshold);
+});
+
 async function loadContentRules() {
   const body = el("content-rules-body");
   const empty = el("content-rules-empty");
@@ -1786,6 +2251,12 @@ async function loadContentRules() {
         .join("");
     }
   } catch (e) {
+    if (e instanceof AccessDeniedError) {
+      el("content-rule-category").disabled = !canEdit;
+      el("content-rule-phrase").disabled = !canEdit;
+      el("btn-add-content-rule").disabled = !canEdit;
+      return;
+    }
     body.innerHTML = "";
     empty.style.display = "block";
     toast(`Ошибка загрузки правил: ${e.message}`, "error");
@@ -1875,6 +2346,73 @@ async function loadBotTokenStatus() {
   btn.title = canAdmin() ? "" : "Требуется роль ADMIN и выше";
 }
 
+// Запуск/остановка движка модерации на ОДНОМ канале — desired_state в
+// Registry, не сам процесс main.py (тот общий на все каналы, см. кнопки
+// "Запустить"/"Остановить" чат-бота внизу сайдбара). stopPropagation
+// обязателен: карточка целиком уже вешает onclick -> selectChannel, без
+// него клик по кнопке ещё и переключал бы текущий канал.
+async function setChannelDesiredState(ev, broadcasterId, action) {
+  ev.stopPropagation();
+  const btn = ev.currentTarget;
+  btn.disabled = true;
+  try {
+    const resp = await apiFetch(`/api/registry/channels/${encodeURIComponent(broadcasterId)}/${action}`, {
+      method: "POST",
+    });
+    if (!resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+      alert(`Не удалось изменить состояние канала: ${data.detail || resp.status}`);
+    }
+  } finally {
+    await loadChannels();
+  }
+}
+
+// Подключение нового канала в Channel Registry — POST /api/channels
+// (panel/bots_api.py) резолвит login -> broadcaster_id через Helix. Раньше
+// карточка "Подключить канал" на этом экране просто вела на /bots, где
+// формы для этого эндпоинта не было вовсе — кнопка не работала.
+function openAddChannelModal() {
+  if (!canOwner()) {
+    el("modal-title").textContent = "Подключить канал";
+    el("modal-body").textContent = "Добавление канала в Channel Registry требует роль OWNER.";
+    pendingConfirm = null;
+    el("modal-overlay").classList.add("open");
+    return;
+  }
+  el("modal-title").textContent = "Подключить канал";
+  el("modal-body").innerHTML = "";
+  const p = document.createElement("p");
+  p.textContent =
+    "Ник канала на Twitch (как в twitch.tv/<ник>). Бот должен уже быть модератором " +
+    "этого канала — иначе баны/автоклип не будут работать.";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.placeholder = "ник канала";
+  input.className = "add-channel-input";
+  input.style.cssText = "width:100%;margin-top:10px;";
+  el("modal-body").appendChild(p);
+  el("modal-body").appendChild(input);
+  setTimeout(() => input.focus(), 0);
+
+  pendingConfirm = async () => {
+    const login = input.value.trim().toLowerCase();
+    if (!login) return;
+    const resp = await apiFetch("/api/channels", {
+      method: "POST",
+      body: JSON.stringify({ login }),
+    });
+    const data = await resp.json();
+    if (data.error) {
+      alert(`Не удалось подключить канал: ${data.error}`);
+      return;
+    }
+    await loadProfiles();
+    await loadChannels();
+  };
+  el("modal-overlay").classList.add("open");
+}
+
 el("btn-get-bot-token").addEventListener("click", () => {
   el("modal-title").textContent = "Получить токен бота?";
   // innerHTML — единственное место в файле (везде остальном textContent,
@@ -1932,6 +2470,52 @@ el("btn-get-chat-token").addEventListener("click", () => {
     "затем возвращайтесь сюда и жмите «Продолжить».";
   pendingConfirm = async () => {
     window.location.href = "/auth/bot/chat_login";
+  };
+  el("modal-overlay").classList.add("open");
+});
+
+// Токен клиппинга — per-channel (mod.<broadcaster_id>.db), поэтому статус и
+// запрос всегда несут currentProfile(): один и тот же общий .env-токен
+// раньше молча не работал на каналах, для которых не был выпущен (Twitch
+// принимает клип только от токена вещателя/модератора/редактора именно
+// того канала, для которого создаётся клип).
+async function loadClipTokenStatus() {
+  const badge = el("clip-token-status-badge");
+  const meta = el("clip-token-status-meta");
+  const btn = el("btn-get-clip-token");
+  try {
+    const resp = await fetch(`/auth/clip/status?profile=${encodeURIComponent(currentProfile())}`);
+    const data = await resp.json();
+    if (data.configured) {
+      badge.textContent = `настроен (${data.user_login})`;
+      badge.className = "token-status-badge ok";
+      meta.textContent = "Автоклип может создавать клипы этим токеном на этом канале.";
+    } else {
+      badge.textContent = "не настроен на этом канале";
+      badge.className = "token-status-badge missing";
+      meta.textContent = "Автоклип не сможет создавать клипы на этом канале, пока токен не получен.";
+    }
+  } catch {
+    badge.textContent = "неизвестно";
+    badge.className = "token-status-badge missing";
+  }
+  btn.disabled = !canAdmin();
+  btn.title = canAdmin() ? "" : "Требуется роль ADMIN и выше";
+}
+
+el("btn-get-clip-token").addEventListener("click", () => {
+  el("modal-title").textContent = "Получить токен для клиппинга?";
+  el("modal-body").innerHTML =
+    "На следующем экране войдите на Twitch под аккаунтом, который должен создавать клипы " +
+    "именно на этом канале. Этот аккаунт должен быть вещателем, модератором или редактором " +
+    "канала — иначе создание клипов будет возвращать ошибку.<br><br>" +
+    "<b>Если вы только что входили в панель под другим Twitch-аккаунтом:</b> Twitch " +
+    "запомнил его в этом браузере и может подставить его автоматически, минуя выбор " +
+    'аккаунта. Сначала выйдите из Twitch — <a href="https://www.twitch.tv/logout" ' +
+    'target="_blank" rel="noopener">twitch.tv/logout</a> (откроется в новой вкладке), ' +
+    "затем возвращайтесь сюда и жмите «Продолжить».";
+  pendingConfirm = async () => {
+    window.location.href = `/auth/clip/login?profile=${encodeURIComponent(currentProfile())}`;
   };
   el("modal-overlay").classList.add("open");
 });

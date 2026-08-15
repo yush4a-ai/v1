@@ -23,18 +23,26 @@ class TestPasteWaveEndpoint:
         resp = app_client.get(f"/api/moderation/paste_wave?sample_text={PASTE}")
         assert resp.status_code == 401
 
-    async def test_rejects_empty_sample(self, app_client: TestClient) -> None:
+    # MODERATOR, не VIEWER: сообщения других пользователей — личные данные,
+    # не публичная информация (2026-08-15, сужение VIEWER-доступа по итогам
+    # UX-аудита панели).
+    async def test_viewer_forbidden(self, app_client: TestClient) -> None:
         login_as(app_client, "VIEWER")
+        resp = app_client.get(f"/api/moderation/paste_wave?sample_text={PASTE}")
+        assert resp.status_code == 403
+
+    async def test_rejects_empty_sample(self, app_client: TestClient) -> None:
+        login_as(app_client, "MODERATOR")
         resp = app_client.get("/api/moderation/paste_wave?sample_text=")
         assert resp.status_code == 400
 
-    async def test_viewer_can_search(
+    async def test_moderator_can_search(
         self, app_client: TestClient, store: ModerationStore
     ) -> None:
         event = ChatEvent(user_id="1", login="viewer1", text=PASTE, timestamp=time.time())
         await store.save_message(event, fingerprint(PASTE))
 
-        login_as(app_client, "VIEWER")
+        login_as(app_client, "MODERATOR")
         resp = app_client.get(f"/api/moderation/paste_wave?sample_text={PASTE}")
 
         assert resp.status_code == 200
@@ -43,7 +51,7 @@ class TestPasteWaveEndpoint:
         assert body[0]["login"] == "viewer1"
 
     async def test_empty_when_no_matches(self, app_client: TestClient) -> None:
-        login_as(app_client, "VIEWER")
+        login_as(app_client, "MODERATOR")
         resp = app_client.get(f"/api/moderation/paste_wave?sample_text={PASTE}")
         assert resp.status_code == 200
         assert resp.json() == []
@@ -58,19 +66,24 @@ class TestRecentMessagesEndpoint:
         resp = app_client.get("/api/moderation/recent_messages")
         assert resp.status_code == 401
 
-    async def test_empty_by_default(self, app_client: TestClient) -> None:
+    async def test_viewer_forbidden(self, app_client: TestClient) -> None:
         login_as(app_client, "VIEWER")
+        resp = app_client.get("/api/moderation/recent_messages")
+        assert resp.status_code == 403
+
+    async def test_empty_by_default(self, app_client: TestClient) -> None:
+        login_as(app_client, "MODERATOR")
         resp = app_client.get("/api/moderation/recent_messages")
         assert resp.status_code == 200
         assert resp.json() == []
 
-    async def test_viewer_can_read(
+    async def test_moderator_can_read(
         self, app_client: TestClient, store: ModerationStore
     ) -> None:
         event = ChatEvent(user_id="1", login="viewer1", text=PASTE, timestamp=time.time())
         await store.save_message(event, fingerprint(PASTE))
 
-        login_as(app_client, "VIEWER")
+        login_as(app_client, "MODERATOR")
         resp = app_client.get("/api/moderation/recent_messages")
 
         assert resp.status_code == 200

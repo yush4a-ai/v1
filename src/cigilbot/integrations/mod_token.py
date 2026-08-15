@@ -11,8 +11,14 @@ executor.py начнёт получать 401 посреди стрима без
 (/auth/bot/login), результат (access+refresh) кладётся в .env. Этот модуль
 дальше живёт в процессе БОТА (main.py, не панели): читает .env при старте,
 обновляет токен по истечении, и каждый раз, когда обновляет, записывает
-новую пару обратно в .env — иначе рестарт бота между refresh-циклами
-подхватил бы уже отозванный Twitch access_token.
+новую пару обратно в .env через paths.write_env_values() — иначе рестарт
+бота между refresh-циклами подхватил бы уже отозванный Twitch access_token.
+
+Запись идёт через paths.write_env_values() (не через свою копию, как
+раньше) — тот же .env одновременно пишут panel/auth.py (OAuth-логин
+оператора) и panel/bots_api.py (настройки профилей); без общего файлового
+лока внутри write_env_values() конкурентная запись из двух процессов
+могла тихо откатить обновление друг друга (bug-аудит 2026-08-15, HIGH #4).
 """
 
 from __future__ import annotations
@@ -24,9 +30,10 @@ from pathlib import Path
 
 import httpx
 
-log = logging.getLogger("moderation.mod_token")
+import paths
+from cigilbot.integrations.oauth_refresh import OAuthRefreshError, refresh_access_token
 
-TWITCH_TOKEN_URL = "https://id.twitch.tv/oauth2/token"
+log = logging.getLogger("moderation.mod_token")
 
 # Twitch не сообщает точный expires_in для refresh-ответа так же надёжно,
 # как хотелось бы полагаться — обновляем заранее, а не впритык к границе,
@@ -69,30 +76,6 @@ def _read_env_file(env_file: Path) -> dict[str, str]:
         key, _, value = stripped.partition("=")
         values[key.strip()] = value
     return values
-
-
-def _write_env_values(env_file: Path, updates: dict[str, str]) -> None:
-    """Точечная запись без потери остального файла — тот же приём, что
-    panel/bots_api.py::write_env_values() и panel/auth.py::_write_env_values(),
-    продублирован ещё раз намеренно: этот модуль живёт в процессе бота и не
-    должен импортировать panel.* (та сторона наоборот может импортировать
-    cigilbot.*, обратная зависимость создала бы цикл при желании)."""
-    if not env_file.exists():
-        env_file.write_text("", encoding="utf-8")
-    lines = env_file.read_text(encoding="utf-8").splitlines()
-    seen: set[str] = set()
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key = stripped.split("=", 1)[0].strip()
-        if key in updates:
-            lines[i] = f"{key}={updates[key]}"
-            seen.add(key)
-    for key, value in updates.items():
-        if key not in seen:
-            lines.append(f"{key}={value}")
-    env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 class ModTokenManager:
@@ -158,39 +141,29 @@ class ModTokenManager:
         return self._access_token
 
     async def _refresh(self) -> None:
-        resp = await self._http.post(
-            TWITCH_TOKEN_URL,
-            data={
-                "client_id": self._client_id,
-                "client_secret": self._client_secret,
-                "grant_type": "refresh_token",
-                "refresh_token": self._refresh_token,
-            },
-        )
-        if resp.status_code != 200:
-            raise ModTokenError(
-                f"Не удалось обновить токен модератора: {resp.status_code} {resp.text[:300]} — "
-                "возможно токен отозван, получите новый в панели"
+        try:
+            access_token, refresh_token, expires_in = await refresh_access_token(
+                self._http,
+                client_id=self._client_id,
+                client_secret=self._client_secret,
+                refresh_token=self._refresh_token,
+                error_context="токен модератора",
             )
-        body = resp.json()
-        access_token = body.get("access_token")
-        refresh_token = body.get("refresh_token")
-        expires_in = body.get("expires_in", 0)
-        if not access_token or not refresh_token:
-            raise ModTokenError("Twitch не вернул access_token/refresh_token при обновлении")
+        except OAuthRefreshError as exc:
+            raise ModTokenError(str(exc)) from exc
 
-        self._access_token = str(access_token)
-        self._refresh_token = str(refresh_token)
-        self._expires_at = time.time() + float(expires_in)
+        self._access_token = access_token
+        self._refresh_token = refresh_token
+        self._expires_at = time.time() + expires_in
 
-        _write_env_values(
+        paths.write_env_values(
             self._env_file,
             {
                 "TWITCH_MOD_ACCESS_TOKEN": self._access_token,
                 "TWITCH_MOD_REFRESH_TOKEN": self._refresh_token,
             },
         )
-        log.info("Токен модератора обновлён, истекает через %.0f сек", float(expires_in))
+        log.info("Токен модератора обновлён, истекает через %.0f сек", expires_in)
 
 
 def load_mod_token_manager(

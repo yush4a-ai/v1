@@ -14,15 +14,22 @@ from tests.panel.conftest import login_as
 
 
 class TestContentRulesEndpoints:
-    """Тот же уровень доступа, что Pattern Library: меняет ADMIN+, читают
-    все аутентифицированные."""
+    """Тот же уровень доступа, что Pattern Library: меняет ADMIN+, читает
+    MODERATOR+ — список запрещённых слов/фраз тривиально обходится, если
+    знаешь список, поэтому не публичная информация (2026-08-15, сужение
+    VIEWER-доступа по итогам UX-аудита панели)."""
 
     async def test_list_requires_session(self, app_client: TestClient) -> None:
         resp = app_client.get("/api/moderation/content_rules")
         assert resp.status_code == 401
 
-    async def test_empty_by_default(self, app_client: TestClient) -> None:
+    async def test_list_viewer_forbidden(self, app_client: TestClient) -> None:
         login_as(app_client, "VIEWER")
+        resp = app_client.get("/api/moderation/content_rules")
+        assert resp.status_code == 403
+
+    async def test_empty_by_default(self, app_client: TestClient) -> None:
+        login_as(app_client, "MODERATOR")
         resp = app_client.get("/api/moderation/content_rules")
         assert resp.status_code == 200
         assert resp.json() == []
@@ -168,17 +175,25 @@ class TestContentSettingsEndpoint:
 
 
 class TestContentEventsEndpoint:
+    # MODERATOR, не VIEWER: конкретные логины и категория нарушения
+    # (расизм/угрозы/реклама) — личные данные, не публичная лента
+    # (2026-08-15, сужение VIEWER-доступа по итогам UX-аудита панели).
     async def test_requires_session(self, app_client: TestClient) -> None:
         resp = app_client.get("/api/moderation/content_events")
         assert resp.status_code == 401
 
-    async def test_empty_by_default(self, app_client: TestClient) -> None:
+    async def test_viewer_forbidden(self, app_client: TestClient) -> None:
         login_as(app_client, "VIEWER")
+        resp = app_client.get("/api/moderation/content_events")
+        assert resp.status_code == 403
+
+    async def test_empty_by_default(self, app_client: TestClient) -> None:
+        login_as(app_client, "MODERATOR")
         resp = app_client.get("/api/moderation/content_events")
         assert resp.status_code == 200
         assert resp.json() == []
 
-    async def test_viewer_can_read(
+    async def test_moderator_can_read(
         self, app_client: TestClient, store: ModerationStore
     ) -> None:
         from cigilbot.domain.types import ContentCategory
@@ -189,7 +204,7 @@ class TestContentEventsEndpoint:
             blocked_by="content_moderation_disabled", enforced=False,
         )
 
-        login_as(app_client, "VIEWER")
+        login_as(app_client, "MODERATOR")
         resp = app_client.get("/api/moderation/content_events")
 
         assert resp.status_code == 200

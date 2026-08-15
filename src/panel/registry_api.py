@@ -27,6 +27,7 @@ PANEL_TWITCH_CLIENT_ID/SECRET (см. panel/paths.py::ENV_FILE). Плюс
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import os
 from pathlib import Path
@@ -249,7 +250,17 @@ async def bot_status(
 ) -> dict[str, object]:
     if _in_bot_process(request):
         return {"running": True, "pid": os.getpid(), "in_process": True}
-    return {"running": bot_process_control.is_running(), "pid": bot_process_control.get_pid()}
+    # asyncio.to_thread — is_running()/get_pid() зовут subprocess.run(tasklist)
+    # синхронно; без этого блокирующий вызов держит event loop панели, пока
+    # не вернётся внешний процесс (bug-аудит 2026-08-15, MEDIUM #9). В
+    # panel/bots_api.py та же функциональность объявлена обычным def, и
+    # FastAPI сам уводит её в threadpool — здесь роут async, поэтому уводим
+    # явно.
+    running, pid = await asyncio.gather(
+        asyncio.to_thread(bot_process_control.is_running),
+        asyncio.to_thread(bot_process_control.get_pid),
+    )
+    return {"running": running, "pid": pid}
 
 
 @router.post("/bot/start")
@@ -264,7 +275,10 @@ async def bot_start(
             detail="Бот уже запущен — панель работает внутри его процесса (run.py)",
         )
     try:
-        pid = bot_process_control.start_bot()
+        # start_bot() держит _pid_lock() (до 10 сек busy-wait) и делает
+        # subprocess.Popen синхронно — тот же риск заблокировать event loop
+        # панели на время ожидания лока (bug-аудит 2026-08-15, MEDIUM #9).
+        pid = await asyncio.to_thread(bot_process_control.start_bot)
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     return {"running": True, "pid": pid}
@@ -282,5 +296,5 @@ async def bot_stop(
             detail="Панель работает внутри процесса бота (run.py) — остановите его целиком "
                    "в терминале, иначе она остановит сама себя",
         )
-    bot_process_control.stop_bot()
+    await asyncio.to_thread(bot_process_control.stop_bot)
     return {"running": False, "pid": None}

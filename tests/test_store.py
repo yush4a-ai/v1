@@ -308,6 +308,61 @@ class TestGetRecentVerdicts:
         assert by_login["user1"] == ["exact_duplicate"]
         assert by_login["user2"] == ["user_message_burst"]
 
+    async def test_excludes_trusted_users(
+        self, store: ModerationStore, event_factory: EventFactory
+    ) -> None:
+        # Пометка "Доверять" должна убирать пользователя из ленты
+        # подозрительных сразу и навсегда, не только на текущую сессию
+        # панели (см. тот же фильтр, что и unmark — исторические вердикты
+        # в БД не удаляются, но лента их больше не показывает).
+        await store.upsert_user(event_factory(user_id="1", login="trusted_viewer"))
+        v_trusted = Verdict(
+            user_id="1", login="trusted_viewer", risk_score=60, confidence=0.6,
+            signals=(make_signal("synchronized_arrival"),), recommended_action=Action.OBSERVE,
+            reason="was flagged before trust", timestamp=time.time(),
+        )
+        v_other = Verdict(
+            user_id="2", login="still_suspicious", risk_score=60, confidence=0.6,
+            signals=(make_signal("synchronized_arrival"),), recommended_action=Action.OBSERVE,
+            reason="still flagged", timestamp=time.time(),
+        )
+        await store.save_verdict(v_trusted)
+        await store.save_verdict(v_other)
+
+        await store.mark_trusted("1", added_by="mod1", reason="regular viewer")
+
+        rows = await store.get_recent_verdicts(min_risk_level=30)
+        logins = {r["login"] for r in rows}
+        assert logins == {"still_suspicious"}
+
+    async def test_excludes_verdicts_confirmed_as_bot(self, store: ModerationStore) -> None:
+        # Мини-кнопка "подтвердить — это бот" в ленте (moderation.js::
+        # confirmGroupAsBot) отмечает сигналы через record_feedback, но
+        # раньше вердикт не убирался из БД — после F5 он снова всплывал в
+        # ленте, хотя модератор уже его разобрал (жалоба: "куча ботов
+        # захламляет панель, крестик не убирает их насовсем").
+        v_confirmed = Verdict(
+            user_id="1", login="confirmed_bot", risk_score=60, confidence=0.6,
+            signals=(make_signal("synchronized_arrival"),), recommended_action=Action.OBSERVE,
+            reason="confirmed by moderator", timestamp=time.time(),
+        )
+        v_other = Verdict(
+            user_id="2", login="still_suspicious", risk_score=60, confidence=0.6,
+            signals=(make_signal("synchronized_arrival"),), recommended_action=Action.OBSERVE,
+            reason="still flagged", timestamp=time.time(),
+        )
+        confirmed_id = await store.save_verdict(v_confirmed)
+        await store.save_verdict(v_other)
+
+        await store.record_feedback(
+            signal_name="synchronized_arrival", moderator="mod1", decision="CONFIRMED_BOT",
+            verdict_id=confirmed_id, user_id="1",
+        )
+
+        rows = await store.get_recent_verdicts(min_risk_level=30)
+        logins = {r["login"] for r in rows}
+        assert logins == {"still_suspicious"}
+
 
 class TestSaveCluster:
     async def test_round_trips_cluster_and_members(self, store: ModerationStore) -> None:

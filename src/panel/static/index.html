@@ -209,6 +209,11 @@ button {
   font-family: inherit; font-size: 13.5px; font-weight: 550; cursor: pointer;
   border-radius: var(--radius-sm); border: none; padding: 9px 16px;
   transition: all .15s var(--ease); background: var(--l3); color: var(--text);
+  /* Минимум 32px по высоте — тот же порог, что panel/static/moderation.html
+     (см. комментарий там: security-аудит 2026-08-15, P2 тач-таргеты). Этот
+     файл раньше не получил тот фикс вместе с moderation.html — тот же
+     класс проблемы, применён здесь тем же способом. */
+  min-height: 32px;
 }
 button:hover { filter: brightness(1.12); }
 button:active { transform: scale(.97); }
@@ -219,7 +224,7 @@ button.danger { background: #f2555a18; color: var(--danger); }
 button.danger:hover { background: #f2555a28; }
 button.ghost { background: transparent; border: 1px solid var(--border); color: var(--text-dim); }
 button.ghost:hover { border-color: var(--accent); color: var(--text); background: var(--accent-soft); }
-button.sm { padding: 6px 12px; font-size: 12.5px; }
+button.sm { padding: 6px 12px; font-size: 12.5px; min-height: 32px; }
 button.icon-btn { padding: 8px; display: inline-flex; }
 
 input[type=text], input[type=number], textarea, select {
@@ -373,8 +378,17 @@ tr:last-child td { border-bottom: none; }
       <div class="brand-name">Твич-боты</div>
     </div>
 
-    <div class="nav-label">Боты</div>
-    <div class="bot-list" id="botList"></div>
+    <!-- Основной бот (is_flagship, профиль MAIN_PROFILE — cigilbot) —
+         отдельный блок над LLM-ботами: у него модерация плюс свой чат-LLM
+         одновременно, он не относится к категории "простой чат-компаньон"
+         ни при каком is_moderation_only (см. get_profile_status в
+         panel/bots_api.py). Блок скрывается целиком, если флагманского
+         профиля нет (see renderBotLists) — не показываем пустой заголовок. -->
+    <div class="nav-label" id="botListFlagshipLabel" style="display:none;">Основной бот</div>
+    <div class="bot-list" id="botListFlagship"></div>
+
+    <div class="nav-label">LLM-боты</div>
+    <div class="bot-list" id="botListLlm"></div>
     <div class="tab-add" id="btnAddBot">+ Новый бот</div>
 
     <div class="sidebar-sections" id="sectionNav">
@@ -443,15 +457,15 @@ tr:last-child td { border-bottom: none; }
     <h3>Новый бот</h3>
     <div class="modal-sub">Отдельный Twitch-аккаунт и характер — работает независимо от остальных</div>
     <div class="field">
-      <label class="field-label">Внутреннее имя (латиница, без пробелов)</label>
+      <label class="field-label" for="newProfileId">Внутреннее имя (латиница, без пробелов)</label>
       <input type="text" id="newProfileId" placeholder="ari">
     </div>
     <div class="field">
-      <label class="field-label">Ник Twitch-аккаунта бота</label>
+      <label class="field-label" for="newBotNick">Ник Twitch-аккаунта бота</label>
       <input type="text" id="newBotNick" placeholder="sladkaya_ari">
     </div>
     <div class="field">
-      <label class="field-label">Access Token (с twitchtokengenerator.com)</label>
+      <label class="field-label" for="newBotToken">Access Token (с twitchtokengenerator.com)</label>
       <input type="text" id="newBotToken" placeholder="oauth:... или просто токен">
     </div>
     <div class="toast" id="newBotMsg"></div>
@@ -522,7 +536,7 @@ tr:last-child td { border-bottom: none; }
         <span class="card-title">Канал</span>
       </div>
       <div class="row">
-        <input type="text" class="channelInput" placeholder="ник канала">
+        <input type="text" class="channelInput" placeholder="ник канала" aria-label="Ник канала">
         <button class="primary btnSwitch">Переключиться</button>
       </div>
       <div class="row channelChips" style="margin-top:12px"></div>
@@ -538,12 +552,12 @@ tr:last-child td { border-bottom: none; }
       </div>
       <div class="grid2">
         <div class="field">
-          <label class="field-label">Как называть стримера</label>
-          <input type="text" class="streamerNameInput" placeholder="например, Крыся">
+          <label class="field-label" for="streamerNameInput">Как называть стримера</label>
+          <input type="text" id="streamerNameInput" class="streamerNameInput" placeholder="например, Крыся">
         </div>
         <div class="field">
-          <label class="field-label">Контекст (пол, город, тематика и т.п.)</label>
-          <input type="text" class="streamerContextInput" placeholder="например, девушка, стримит IRL из Питера">
+          <label class="field-label" for="streamerContextInput">Контекст (пол, город, тематика и т.п.)</label>
+          <input type="text" id="streamerContextInput" class="streamerContextInput" placeholder="например, девушка, стримит IRL из Питера">
         </div>
       </div>
       <div class="row" style="margin-top:14px">
@@ -587,7 +601,7 @@ tr:last-child td { border-bottom: none; }
            каналах одновременно (run.py, Registry-модель). -->
       <div class="row" style="margin-bottom:6px;">
         <select class="chatSendChannel" style="min-width:160px;"></select>
-        <input type="text" class="chatSendText" placeholder="Сообщение от имени бота…" maxlength="500" style="flex:1;">
+        <input type="text" class="chatSendText" placeholder="Сообщение от имени бота…" maxlength="500" style="flex:1;" aria-label="Сообщение от имени бота">
         <button class="primary chatSendBtn">Отправить</button>
       </div>
       <div class="toast chatSendMsg" style="margin-bottom:14px;"></div>
@@ -612,12 +626,12 @@ tr:last-child td { border-bottom: none; }
       <div class="card-head"><span class="card-title">Голос</span></div>
       <div class="grid2">
         <div class="field">
-          <label class="field-label">Порог тишины (VAD)</label>
-          <input type="number" class="voiceThreshold" min="100" max="5000" step="50">
+          <label class="field-label" for="voiceThreshold">Порог тишины (VAD)</label>
+          <input type="number" id="voiceThreshold" class="voiceThreshold" min="100" max="5000" step="50">
         </div>
         <div class="field">
-          <label class="field-label">Кулдаун свободных реплик, сек</label>
-          <input type="number" class="voiceCooldown" min="0" max="300" step="5">
+          <label class="field-label" for="voiceCooldown">Кулдаун свободных реплик, сек</label>
+          <input type="number" id="voiceCooldown" class="voiceCooldown" min="0" max="300" step="5">
         </div>
       </div>
       <div style="margin-top:14px">
@@ -647,10 +661,10 @@ tr:last-child td { border-bottom: none; }
         <select class="promptSelect"><option value="">— сохранённые промты —</option></select>
         <button class="ghost sm btnLoadPrompt">Загрузить</button>
         <span style="flex:1"></span>
-        <input type="text" class="promptSaveName" placeholder="имя для сохранения" style="max-width:220px">
+        <input type="text" class="promptSaveName" placeholder="имя для сохранения" style="max-width:220px" aria-label="Имя для сохранения промта">
         <button class="ghost sm btnSavePrompt">Сохранить как</button>
       </div>
-      <textarea class="promptText" placeholder="Текст характера бота..."></textarea>
+      <textarea class="promptText" placeholder="Текст характера бота..." aria-label="Текст характера бота"></textarea>
       <div class="row" style="margin-top:14px">
         <button class="primary btnApplyPrompt">Применить и перезапустить</button>
         <button class="ghost btnShowHistory">История версий</button>
@@ -669,7 +683,7 @@ tr:last-child td { border-bottom: none; }
         Проверь эффект правки на реальном вызове DeepSeek — ответ не публикуется в Twitch-чат.
       </div>
       <div class="row">
-        <input type="text" class="previewInput" placeholder="например: шинра, как дела?">
+        <input type="text" class="previewInput" placeholder="например: шинра, как дела?" aria-label="Текст сообщения для предпросмотра ответа">
         <button class="primary btnPreview">Проверить</button>
       </div>
       <div class="panel-nested previewResult" style="margin-top:12px; display:none"></div>
@@ -809,16 +823,27 @@ function initials(s) {
 
 async function init() {
   const profiles = await api('/api/profiles');
-  const botList = $('botList');
+  const botListFlagship = $('botListFlagship');
+  const botListLlm = $('botListLlm');
   const pages = $('pages');
-  botList.innerHTML = '';
+  botListFlagship.innerHTML = '';
+  botListLlm.innerHTML = '';
   pages.innerHTML = '';
 
   $('emptyApp').style.display = profiles.length ? 'none' : 'flex';
 
+  // is_flagship (см. panel/bots_api.py::get_profile_status) — максимум
+  // один профиль сразу, MAIN_PROFILE. Разложены по разным контейнерам
+  // сайдбара, а не помечены классом внутри одного списка: пользователь
+  // 2026-08-15 — "не хочу, чтобы он находился в одной категории" с
+  // будущими LLM-персонажами (sh1nraqq и т.п.), нужно визуальное
+  // разделение, не просто пометка.
+  const hasFlagship = profiles.some((p) => p.is_flagship);
+  $('botListFlagshipLabel').style.display = hasFlagship ? 'block' : 'none';
+
   for (const p of profiles) {
     state.profiles[p.profile] = p;
-    botList.appendChild(buildBotItem(p));
+    (p.is_flagship ? botListFlagship : botListLlm).appendChild(buildBotItem(p));
     pages.appendChild(buildPage(p));
   }
 
@@ -881,14 +906,20 @@ function wirePage(root, profile) {
 
   q('.btnStart').onclick = async () => {
     q('.btnStart').disabled = true;
-    await api('/api/start?profile=' + encodeURIComponent(profile), { method: 'POST' });
+    await api('/api/start', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ profile })
+    });
     q('.btnStart').disabled = false;
     refreshProfile(profile);
   };
 
   q('.btnStop').onclick = async () => {
     q('.btnStop').disabled = true;
-    await api('/api/stop?profile=' + encodeURIComponent(profile), { method: 'POST' });
+    await api('/api/stop', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ profile })
+    });
     q('.btnStop').disabled = false;
     refreshProfile(profile);
   };
@@ -897,9 +928,15 @@ function wirePage(root, profile) {
     const btn = q('.btnRestart');
     const original = btn.textContent;
     btn.disabled = true; btn.textContent = 'Останавливаю...';
-    await api('/api/stop?profile=' + encodeURIComponent(profile), { method: 'POST' });
+    await api('/api/stop', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ profile })
+    });
     btn.textContent = 'Запускаю...';
-    await api('/api/start?profile=' + encodeURIComponent(profile), { method: 'POST' });
+    await api('/api/start', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ profile })
+    });
     btn.textContent = original; btn.disabled = false;
     refreshProfile(profile);
   };
@@ -909,7 +946,10 @@ function wirePage(root, profile) {
     const msg = q('.channelMsg');
     if (!channel) { msg.textContent = 'Введи имя канала'; msg.className = 'toast channelMsg err'; return; }
     msg.textContent = 'Переключаю...'; msg.className = 'toast channelMsg';
-    const r = await api(`/api/switch_channel?profile=${encodeURIComponent(profile)}&channel=${encodeURIComponent(channel)}`, { method: 'POST' });
+    const r = await api('/api/switch_channel', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ profile, channel })
+    });
     if (r.error) { msg.textContent = r.error; msg.className = 'toast channelMsg err'; }
     else {
       msg.textContent = 'Готово: канал ' + channel; msg.className = 'toast channelMsg';
@@ -1255,15 +1295,18 @@ function renderFeedItem(item) {
 async function refreshFeed(root, profile) {
   const items = await api('/api/chat_feed?profile=' + encodeURIComponent(profile));
 
+  // Новые сообщения сверху — не нужно скроллить вниз, чтобы увидеть
+  // последнее. API отдаёт items в хронологическом порядке (старые первые),
+  // здесь разворачиваем на отображение, порядок в БД не трогаем.
   const feed = root.querySelector('.feed');
-  const wasAtBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 40;
+  const wasAtTop = feed.scrollTop < 40;
   feed.innerHTML = '';
   if (!items.length) {
     feed.innerHTML = '<div class="empty-state">Пока нет сообщений</div>';
   } else {
-    for (const item of items) feed.appendChild(renderFeedItem(item));
+    for (let i = items.length - 1; i >= 0; i--) feed.appendChild(renderFeedItem(items[i]));
   }
-  if (wasAtBottom) feed.scrollTop = feed.scrollHeight;
+  if (wasAtTop) feed.scrollTop = 0;
 
   const mini = root.querySelector('.miniFeed');
   mini.innerHTML = '';
@@ -1271,8 +1314,8 @@ async function refreshFeed(root, profile) {
   if (!last6.length) {
     mini.innerHTML = '<div class="mini-feed-empty">Пока нет сообщений</div>';
   } else {
-    for (const item of last6) mini.appendChild(renderFeedItem(item));
-    mini.scrollTop = mini.scrollHeight;
+    for (let i = last6.length - 1; i >= 0; i--) mini.appendChild(renderFeedItem(last6[i]));
+    mini.scrollTop = 0;
   }
 }
 
@@ -1289,7 +1332,7 @@ async function refreshViewers(root, profile) {
         <td>${escapeHtml(v.username)}</td>
         <td>${v.message_count}</td>
         <td>${fmtDate(v.last_seen)}</td>
-        <td><input type="text" value="${escapeHtml(v.note || '')}" data-user="${escapeHtml(v.username)}"></td>
+        <td><input type="text" value="${escapeHtml(v.note || '')}" data-user="${escapeHtml(v.username)}" aria-label="Заметка о зрителе ${escapeHtml(v.username)}"></td>
         <td><button class="ghost sm" data-save="${escapeHtml(v.username)}">Сохранить</button></td>
       `;
       body.appendChild(tr);

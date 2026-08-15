@@ -68,7 +68,17 @@ def _pid_lock() -> Iterator[None]:
             break
         except FileExistsError:
             with contextlib.suppress(OSError):
-                if time.monotonic() - LOCK_FILE.stat().st_mtime > _LOCK_STALE_SECONDS:
+                # time.time(), не time.monotonic(): st_mtime — это время по
+                # эпохе (как time.time()), а monotonic() отсчитывается от
+                # произвольной точки, не связанной с эпохой вообще — их
+                # разность не несёт смысла "сколько секунд назад" и почти
+                # всегда даёт огромное отрицательное число, из-за чего
+                # протухший лок НИКОГДА не считался устаревшим по этой
+                # проверке (единственной защитой оставался _LOCK_TIMEOUT_
+                # SECONDS — ожидание с TimeoutError, не автоматическая
+                # расчистка). Найдено тестом test_stale_lock_is_reclaimed
+                # (test-coverage-аудит 2026-08-15, MEDIUM #13).
+                if time.time() - LOCK_FILE.stat().st_mtime > _LOCK_STALE_SECONDS:
                     LOCK_FILE.unlink(missing_ok=True)
                     continue
             if time.monotonic() >= deadline:

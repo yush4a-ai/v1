@@ -72,6 +72,20 @@ class HelixUser:
 
 
 @dataclass(frozen=True, slots=True)
+class HelixStream:
+    """Live-статус канала — для авто-подстройки порога всплеска автоклипа
+    под текущее число зрителей (bot/autoclip.py). Twitch не отдаёт отдельное
+    булево поле "в эфире ли канал": пустой data[] в ответе /streams И ЕСТЬ
+    сигнал "оффлайн" — get_streams() сам разворачивает это в HelixStream
+    с is_live=False, а не пустой список/None, чтобы вызывающему коду не
+    приходилось помнить это соглашение Twitch каждый раз заново."""
+
+    broadcaster_id: str
+    is_live: bool
+    viewer_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class ActionResult:
     """Результат одного действия над одним пользователем.
 
@@ -82,6 +96,19 @@ class ActionResult:
 
     user_id: str
     success: bool
+    error: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ClipResult:
+    """Результат создания клипа — отдельно от ActionResult: edit_url это
+    клип-специфичные данные, которых нет у бана/таймаута/удаления
+    сообщения, тащить их через ActionResult.error было бы слоевым хаком."""
+
+    broadcaster_id: str
+    success: bool
+    clip_id: str = ""
+    edit_url: str = ""
     error: str = ""
 
 
@@ -236,6 +263,33 @@ class HelixClient:
 
         return results
 
+    async def get_streams(self, *, broadcaster_ids: list[str]) -> list[HelixStream]:
+        """Live-статус и число зрителей батчем по MAX_USERS_PER_REQUEST
+        (тот же лимит Twitch, что у /users). Не требует scope, работает по
+        App Access Token. Каналы, не входящие в ответ Twitch (offline),
+        возвращаются явно как HelixStream(is_live=False) — вызывающий код
+        не должен сам восстанавливать "молчание = оффлайн" по недостающим id."""
+        if not broadcaster_ids:
+            return []
+
+        token = await self._get_app_token()
+        live: dict[str, int] = {}
+
+        for offset in range(0, len(broadcaster_ids), MAX_USERS_PER_REQUEST):
+            batch = broadcaster_ids[offset : offset + MAX_USERS_PER_REQUEST]
+            params = [("user_id", v) for v in batch]
+            resp = await self._request("GET", "/streams", token=token, params=params)
+            if resp.status_code != 200:
+                raise HelixError(resp.status_code, "get_streams не удался", resp.text)
+
+            for row in resp.json().get("data", []):
+                live[row["user_id"]] = int(row["viewer_count"])
+
+        return [
+            HelixStream(broadcaster_id=bid, is_live=bid in live, viewer_count=live.get(bid, 0))
+            for bid in broadcaster_ids
+        ]
+
     async def ban_user(
         self, *, broadcaster_id: str, moderator_id: str, user_id: str, reason: str, user_token: str
     ) -> ActionResult:
@@ -293,4 +347,31 @@ class HelixClient:
             return ActionResult(user_id=message_id or "", success=True)
         return ActionResult(
             user_id=message_id or "", success=False, error=f"{resp.status_code}: {resp.text[:300]}"
+        )
+
+    async def create_clip(self, *, broadcaster_id: str, user_token: str) -> ClipResult:
+        """POST /helix/clips — 202 Accepted означает, что Twitch поставил
+        нарезку в очередь (сама нарезка асинхронна на их стороне, готовый
+        клип появляется не мгновенно). Требует User Access Token со scope
+        clips:edit, принадлежащий вещателю, модератору или редактору канала
+        — не App Access Token и не токен модератора банов (другой scope)."""
+        try:
+            resp = await self._request(
+                "POST", "/clips", token=user_token,
+                params=[("broadcaster_id", broadcaster_id)],
+            )
+        except HelixError as exc:
+            return ClipResult(broadcaster_id=broadcaster_id, success=False, error=str(exc))
+
+        if resp.status_code == 202:
+            data = resp.json().get("data") or [{}]
+            row = data[0]
+            return ClipResult(
+                broadcaster_id=broadcaster_id,
+                success=True,
+                clip_id=row.get("id", ""),
+                edit_url=row.get("edit_url", ""),
+            )
+        return ClipResult(
+            broadcaster_id=broadcaster_id, success=False, error=f"{resp.status_code}: {resp.text[:300]}"
         )

@@ -17,6 +17,8 @@ from fastapi.testclient import TestClient
 from starlette.middleware.sessions import SessionMiddleware
 
 import panel.auth as auth
+import paths
+from cigilbot.storage.registry_store import RegistryStore
 from cigilbot.storage.store import ModerationStore
 from paths import PanelRoots
 
@@ -116,6 +118,16 @@ class TestResolveRole:
 
 @pytest.fixture
 def auth_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[FastAPI, Path]:
+    # panel.rate_limit.limiter — модульный singleton (см. её докстринг: один
+    # объект на всё приложение, не по одному на роутер), и его in-memory
+    # storage переживает между тестами в рамках одного pytest-процесса.
+    # Без сброса тесты, идущие позже в файле, начинают падать с "ratelimit
+    # exceeded" на /auth/login (10/minute) не из-за своей логики, а из-за
+    # накопленных попыток входа от предыдущих тестов этого же файла.
+    from panel.rate_limit import limiter as _rate_limiter
+
+    _rate_limiter.reset()
+
     (tmp_path / ".env").write_text(
         "PANEL_TWITCH_CLIENT_ID=cid\n"
         "PANEL_TWITCH_CLIENT_SECRET=csecret\n"
@@ -557,3 +569,440 @@ class TestBotTokenStatus:
         resp = client.get("/auth/bot/status")
 
         assert resp.json() == {"configured": True, "bot_login": "mybot"}
+
+
+# Chat-токен (TWITCH_BOT_TOKEN/TWITCH_BOT_REFRESH_TOKEN, chat:read/chat:edit)
+# — третий из трёх независимых OAuth-флоу в этом файле, до этой правки не
+# имел ни одного теста (test-coverage-аудит 2026-08-15, HIGH #7): state-
+# валидация и запись токена в .env для этой ветки не были защищены
+# регрессионным тестом, при том что рассинхронизация именно этого файла —
+# задокументированный класс инцидента ("баны начинают падать с 401").
+class TestBotChatTokenLogin:
+    def test_requires_authenticated_session(self, auth_app: tuple[FastAPI, Path]) -> None:
+        app, _db = auth_app
+        client = TestClient(app)
+        resp = client.get("/auth/bot/chat_login", follow_redirects=False)
+        assert resp.status_code == 401
+
+    def test_viewer_forbidden(
+        self, auth_app: tuple[FastAPI, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        app, _db = auth_app
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/oauth2/token":
+                form = dict(x.split("=") for x in request.content.decode().split("&"))
+                token = "user-tok" if form.get("grant_type") == "authorization_code" else "app-tok"
+                return httpx.Response(200, json={"access_token": token})
+            if request.url.path == "/helix/users":
+                if request.headers["Authorization"] == "Bearer user-tok":
+                    return httpx.Response(200, json={"data": [{"login": "viewer1", "id": "3"}]})
+                return httpx.Response(200, json={"data": [{"login": "streamer", "id": "1"}]})
+            if request.url.path == "/helix/moderation/channels":
+                return httpx.Response(200, json={"data": []})
+            raise AssertionError(f"unexpected request {request.url}")
+
+        monkeypatch.setattr(auth, "_test_transport", httpx.MockTransport(handler))
+        client = TestClient(app)
+        login_resp = client.get("/auth/login", follow_redirects=False)
+        state = login_resp.headers["location"].split("state=")[1].split("&")[0]
+        client.get(f"/auth/callback?code=abc&state={state}", follow_redirects=False)
+
+        resp = client.get("/auth/bot/chat_login", follow_redirects=False)
+        assert resp.status_code == 403
+
+    def test_owner_redirects_to_twitch_with_chat_scopes(
+        self, auth_app: tuple[FastAPI, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        app, _db = auth_app
+        client = TestClient(app)
+        _login_as_owner(client, monkeypatch)
+
+        resp = client.get("/auth/bot/chat_login", follow_redirects=False)
+
+        assert resp.status_code in (302, 307)
+        location = resp.headers["location"]
+        assert "id.twitch.tv/oauth2/authorize" in location
+        assert "chat%3Aread" in location
+        assert "chat%3Aedit" in location
+        assert "auth%2Fbot%2Fcallback" in location
+
+
+class TestBotChatTokenCallback:
+    def test_unknown_state_rejected(
+        self, auth_app: tuple[FastAPI, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        app, _db = auth_app
+        client = TestClient(app)
+        _login_as_owner(client, monkeypatch)
+
+        resp = client.get("/auth/bot/callback?code=x&state=not-a-real-state")
+        assert resp.status_code == 400
+
+    def test_full_flow_writes_env_without_moderator_check(
+        self, auth_app: tuple[FastAPI, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """purpose="chat" в _process_bot_callback пропускает вызов
+        _fetch_moderated_channel_ids целиком (chat:edit не требует прав
+        модератора — только валидный токен) — mock не регистрирует
+        /helix/moderation/channels вовсе, чтобы AssertionError сам поймал
+        регрессию, если этот путь начнёт его дёргать."""
+        app, _db = auth_app
+        client = TestClient(app)
+        _login_as_owner(client, monkeypatch)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/oauth2/token":
+                form = dict(x.split("=") for x in request.content.decode().split("&"))
+                if form.get("grant_type") == "authorization_code":
+                    return httpx.Response(
+                        200, json={"access_token": "chat-access", "refresh_token": "chat-refresh"}
+                    )
+                return httpx.Response(200, json={"access_token": "app-token"})
+            if request.url.path == "/helix/users":
+                if request.headers["Authorization"] == "Bearer chat-access":
+                    return httpx.Response(200, json={"data": [{"login": "mybot", "id": "99"}]})
+                return httpx.Response(200, json={"data": [{"login": "streamer", "id": "1"}]})
+            raise AssertionError(f"unexpected request {request.url}")
+
+        monkeypatch.setattr(auth, "_test_transport", httpx.MockTransport(handler))
+
+        login_resp = client.get("/auth/bot/chat_login", follow_redirects=False)
+        state = login_resp.headers["location"].split("state=")[1].split("&")[0]
+
+        resp = client.get(f"/auth/bot/callback.json?code=abc&state={state}")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["purpose"] == "chat"
+        assert body["bot_login"] == "mybot"
+        assert body["is_moderator"] is True
+        assert body["warning"] is None
+
+        env_text = (app.state.panel_roots.repo / ".env").read_text(encoding="utf-8")
+        assert "TWITCH_BOT_TOKEN=chat-access" in env_text
+        assert "TWITCH_BOT_REFRESH_TOKEN=chat-refresh" in env_text
+        assert "TWITCH_BOT_NICK=mybot" in env_text
+        # Chat-flow не пишет TWITCH_MOD_* — разные ключи, разное назначение.
+        assert "TWITCH_MOD_ACCESS_TOKEN=chat-access" not in env_text
+
+    def test_html_callback_renders_chat_title_on_success(
+        self, auth_app: tuple[FastAPI, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        app, _db = auth_app
+        client = TestClient(app)
+        _login_as_owner(client, monkeypatch)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/oauth2/token":
+                form = dict(x.split("=") for x in request.content.decode().split("&"))
+                if form.get("grant_type") == "authorization_code":
+                    return httpx.Response(
+                        200, json={"access_token": "chat-access", "refresh_token": "chat-refresh"}
+                    )
+                return httpx.Response(200, json={"access_token": "app-token"})
+            if request.url.path == "/helix/users":
+                if request.headers["Authorization"] == "Bearer chat-access":
+                    return httpx.Response(200, json={"data": [{"login": "mybot", "id": "99"}]})
+                return httpx.Response(200, json={"data": [{"login": "streamer", "id": "1"}]})
+            raise AssertionError(f"unexpected request {request.url}")
+
+        monkeypatch.setattr(auth, "_test_transport", httpx.MockTransport(handler))
+
+        login_resp = client.get("/auth/bot/chat_login", follow_redirects=False)
+        state = login_resp.headers["location"].split("state=")[1].split("&")[0]
+
+        resp = client.get(f"/auth/bot/callback?code=abc&state={state}")
+
+        assert resp.status_code == 200
+        assert "text/html" in resp.headers["content-type"]
+        assert "Чат-токен бота получен" in resp.text
+        assert "mybot" in resp.text
+
+
+class TestBotChatTokenStatus:
+    def test_not_configured_by_default(self, auth_app: tuple[FastAPI, Path]) -> None:
+        app, _db = auth_app
+        client = TestClient(app)
+        resp = client.get("/auth/bot/chat_status")
+        assert resp.json() == {"configured": False, "bot_login": ""}
+
+    def test_configured_after_env_written(self, auth_app: tuple[FastAPI, Path]) -> None:
+        app, _db = auth_app
+        (app.state.panel_roots.repo / ".env").write_text(
+            (app.state.panel_roots.repo / ".env").read_text(encoding="utf-8")
+            + "TWITCH_BOT_TOKEN=x\nTWITCH_BOT_REFRESH_TOKEN=y\nTWITCH_BOT_NICK=mybot\n",
+            encoding="utf-8",
+        )
+        client = TestClient(app)
+
+        resp = client.get("/auth/bot/chat_status")
+
+        assert resp.json() == {"configured": True, "bot_login": "mybot"}
+
+    def test_independent_of_mod_token_status(self, auth_app: tuple[FastAPI, Path]) -> None:
+        """chat_status и status (mod-токен) читают разные ключи одного
+        .env — настроенность одного не должна влиять на другой."""
+        app, _db = auth_app
+        (app.state.panel_roots.repo / ".env").write_text(
+            (app.state.panel_roots.repo / ".env").read_text(encoding="utf-8")
+            + "TWITCH_MOD_ACCESS_TOKEN=x\nTWITCH_MOD_REFRESH_TOKEN=y\nTWITCH_MOD_BOT_LOGIN=modbot\n",
+            encoding="utf-8",
+        )
+        client = TestClient(app)
+
+        resp = client.get("/auth/bot/chat_status")
+
+        assert resp.json() == {"configured": False, "bot_login": ""}
+
+
+async def _register_clip_channel(
+    app: FastAPI, *, broadcaster_id: str = "1", login: str = "streamer"
+) -> None:
+    """Заводит канал в Channel Registry — /auth/clip/login и callback
+    (per-channel, см. миграцию 020) проверяют, что broadcaster_id из
+    profile/state реально существует в реестре, прежде чем выпускать
+    state или писать токен."""
+    registry = RegistryStore(str(app.state.panel_roots.registry_db))
+    await registry.connect()
+    await registry.upsert_channel(broadcaster_id=broadcaster_id, login=login)
+    await registry.close()
+
+
+class TestClipTokenLogin:
+    def test_requires_authenticated_session(self, auth_app: tuple[FastAPI, Path]) -> None:
+        app, _db = auth_app
+        client = TestClient(app)
+        resp = client.get("/auth/clip/login?profile=1", follow_redirects=False)
+        assert resp.status_code == 401
+
+    def test_viewer_forbidden(
+        self, auth_app: tuple[FastAPI, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        app, _db = auth_app
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/oauth2/token":
+                form = dict(x.split("=") for x in request.content.decode().split("&"))
+                token = "user-tok" if form.get("grant_type") == "authorization_code" else "app-tok"
+                return httpx.Response(200, json={"access_token": token})
+            if request.url.path == "/helix/users":
+                if request.headers["Authorization"] == "Bearer user-tok":
+                    return httpx.Response(200, json={"data": [{"login": "viewer1", "id": "3"}]})
+                return httpx.Response(200, json={"data": [{"login": "streamer", "id": "1"}]})
+            if request.url.path == "/helix/moderation/channels":
+                return httpx.Response(200, json={"data": []})
+            raise AssertionError(f"unexpected request {request.url}")
+
+        monkeypatch.setattr(auth, "_test_transport", httpx.MockTransport(handler))
+        client = TestClient(app)
+        login_resp = client.get("/auth/login", follow_redirects=False)
+        state = login_resp.headers["location"].split("state=")[1].split("&")[0]
+        client.get(f"/auth/callback?code=abc&state={state}", follow_redirects=False)
+
+        resp = client.get("/auth/clip/login?profile=1", follow_redirects=False)
+        assert resp.status_code == 403
+
+    async def test_unknown_channel_rejected(
+        self, auth_app: tuple[FastAPI, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """profile, отсутствующий в Channel Registry — 404, не тихая
+        запись куда попало."""
+        app, _db = auth_app
+        client = TestClient(app)
+        _login_as_owner(client, monkeypatch)
+
+        resp = client.get("/auth/clip/login?profile=999", follow_redirects=False)
+
+        assert resp.status_code == 404
+
+    async def test_owner_redirects_to_twitch_with_clip_scope(
+        self, auth_app: tuple[FastAPI, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        app, _db = auth_app
+        await _register_clip_channel(app)
+        client = TestClient(app)
+        _login_as_owner(client, monkeypatch)
+
+        resp = client.get("/auth/clip/login?profile=1", follow_redirects=False)
+
+        assert resp.status_code in (302, 307)
+        location = resp.headers["location"]
+        assert "id.twitch.tv/oauth2/authorize" in location
+        assert "clips%3Aedit" in location
+        assert "auth%2Fclip%2Fcallback" in location
+
+
+class TestClipTokenCallback:
+    def test_unknown_state_rejected(
+        self, auth_app: tuple[FastAPI, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        app, _db = auth_app
+        client = TestClient(app)
+        _login_as_owner(client, monkeypatch)
+
+        resp = client.get("/auth/clip/callback?code=x&state=not-a-real-state")
+        assert resp.status_code == 400
+
+    async def test_full_flow_writes_token_when_broadcaster(
+        self, auth_app: tuple[FastAPI, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        app, _db = auth_app
+        monkeypatch.setattr(paths, "MOD_VAR", app.state.panel_roots.var)
+        await _register_clip_channel(app)
+        client = TestClient(app)
+        _login_as_owner(client, monkeypatch)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/oauth2/token":
+                form = dict(x.split("=") for x in request.content.decode().split("&"))
+                if form.get("grant_type") == "authorization_code":
+                    return httpx.Response(
+                        200, json={"access_token": "clip-access", "refresh_token": "clip-refresh"}
+                    )
+                return httpx.Response(200, json={"access_token": "app-token"})
+            if request.url.path == "/helix/users":
+                return httpx.Response(200, json={"data": [{"login": "streamer", "id": "1"}]})
+            raise AssertionError(f"unexpected request {request.url}")
+
+        monkeypatch.setattr(auth, "_test_transport", httpx.MockTransport(handler))
+
+        login_resp = client.get("/auth/clip/login?profile=1", follow_redirects=False)
+        state = login_resp.headers["location"].split("state=")[1].split("&")[0]
+
+        resp = client.get(f"/auth/clip/callback.json?code=abc&state={state}")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["user_login"] == "streamer"
+        assert body["is_broadcaster"] is True
+        assert body["warning"] is None
+
+        store = ModerationStore(str(paths.mod_db("1")))
+        await store.connect()
+        token = await store.get_clip_token()
+        await store.close()
+        assert token is not None
+        assert token.access_token == "clip-access"
+        assert token.refresh_token == "clip-refresh"
+        assert token.user_login == "streamer"
+
+    async def test_warns_when_account_not_broadcaster(
+        self, auth_app: tuple[FastAPI, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        app, _db = auth_app
+        monkeypatch.setattr(paths, "MOD_VAR", app.state.panel_roots.var)
+        await _register_clip_channel(app)
+        client = TestClient(app)
+        _login_as_owner(client, monkeypatch)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/oauth2/token":
+                form = dict(x.split("=") for x in request.content.decode().split("&"))
+                if form.get("grant_type") == "authorization_code":
+                    return httpx.Response(
+                        200, json={"access_token": "clip-access", "refresh_token": "clip-refresh"}
+                    )
+                return httpx.Response(200, json={"access_token": "app-token"})
+            if request.url.path == "/helix/users":
+                return httpx.Response(200, json={"data": [{"login": "mybot", "id": "99"}]})
+            raise AssertionError(f"unexpected request {request.url}")
+
+        monkeypatch.setattr(auth, "_test_transport", httpx.MockTransport(handler))
+
+        login_resp = client.get("/auth/clip/login?profile=1", follow_redirects=False)
+        state = login_resp.headers["location"].split("state=")[1].split("&")[0]
+
+        resp = client.get(f"/auth/clip/callback.json?code=abc&state={state}")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["is_broadcaster"] is False
+        assert body["warning"] is not None
+        assert "mybot" in body["warning"]
+
+    async def test_html_callback_renders_page_on_success(
+        self, auth_app: tuple[FastAPI, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        app, _db = auth_app
+        monkeypatch.setattr(paths, "MOD_VAR", app.state.panel_roots.var)
+        await _register_clip_channel(app)
+        client = TestClient(app)
+        _login_as_owner(client, monkeypatch)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/oauth2/token":
+                form = dict(x.split("=") for x in request.content.decode().split("&"))
+                if form.get("grant_type") == "authorization_code":
+                    return httpx.Response(
+                        200, json={"access_token": "clip-access", "refresh_token": "clip-refresh"}
+                    )
+                return httpx.Response(200, json={"access_token": "app-token"})
+            if request.url.path == "/helix/users":
+                return httpx.Response(200, json={"data": [{"login": "streamer", "id": "1"}]})
+            raise AssertionError(f"unexpected request {request.url}")
+
+        monkeypatch.setattr(auth, "_test_transport", httpx.MockTransport(handler))
+
+        login_resp = client.get("/auth/clip/login?profile=1", follow_redirects=False)
+        state = login_resp.headers["location"].split("state=")[1].split("&")[0]
+
+        resp = client.get(f"/auth/clip/callback?code=abc&state={state}")
+
+        assert resp.status_code == 200
+        assert "text/html" in resp.headers["content-type"]
+        assert "streamer" in resp.text
+
+    def test_html_callback_renders_error_page_on_bad_state(
+        self, auth_app: tuple[FastAPI, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        app, _db = auth_app
+        client = TestClient(app)
+        _login_as_owner(client, monkeypatch)
+
+        resp = client.get("/auth/clip/callback?code=abc&state=not-a-real-state")
+
+        assert resp.status_code == 400
+        assert "text/html" in resp.headers["content-type"]
+
+
+class TestClipTokenStatus:
+    def test_not_configured_by_default(
+        self, auth_app: tuple[FastAPI, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        app, _db = auth_app
+        monkeypatch.setattr(paths, "MOD_VAR", app.state.panel_roots.var)
+        client = TestClient(app)
+        _login_as_owner(client, monkeypatch)
+        resp = client.get("/auth/clip/status?profile=1")
+        assert resp.json() == {"configured": False, "user_login": ""}
+
+    async def test_configured_after_token_written(
+        self, auth_app: tuple[FastAPI, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        app, _db = auth_app
+        monkeypatch.setattr(paths, "MOD_VAR", app.state.panel_roots.var)
+        store = ModerationStore(str(paths.mod_db("1")))
+        await store.connect()
+        await store.set_clip_token(
+            access_token="x", refresh_token="y", user_login="streamer", user_id="1"
+        )
+        await store.close()
+        client = TestClient(app)
+        _login_as_owner(client, monkeypatch)
+
+        resp = client.get("/auth/clip/status?profile=1")
+
+        assert resp.json() == {"configured": True, "user_login": "streamer"}
+
+    def test_different_channel_sees_no_token(
+        self, auth_app: tuple[FastAPI, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """profile без своей строки в mod_clip_token — "не настроен",
+        даже если у другого канала есть токен (per-channel изоляция)."""
+        app, _db = auth_app
+        monkeypatch.setattr(paths, "MOD_VAR", app.state.panel_roots.var)
+        client = TestClient(app)
+        _login_as_owner(client, monkeypatch)
+        resp = client.get("/auth/clip/status?profile=2")
+        assert resp.json() == {"configured": False, "user_login": ""}

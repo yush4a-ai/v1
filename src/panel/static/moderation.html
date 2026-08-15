@@ -190,6 +190,16 @@ body {
    класс .empty только ради приглушённого цвета текста. */
 .note { color: var(--text-dim); font-size: 12.5px; line-height: 1.6; }
 
+/* Показывается apiFetch() (см. showAccessDeniedBanner в moderation.js) на
+   403 — роль VIEWER не проходит порог MODERATOR для этого экрана. Тон
+   warning, не danger: это не ошибка, а честное "здесь не для тебя",
+   отличимое от .empty (нет данных вообще) и от красных error-тостов
+   (что-то реально сломалось). */
+.access-denied-banner {
+  background: var(--warning-soft); color: var(--warning); border: 1px solid #e0a73e40;
+  border-radius: var(--radius-sm); padding: 12px 16px; font-size: 13px; margin-bottom: 14px;
+}
+
 .toggle-switch { position: relative; display: inline-block; width: 40px; height: 22px; flex-shrink: 0; }
 .toggle-switch input { opacity: 0; width: 0; height: 0; }
 .toggle-slider {
@@ -212,6 +222,10 @@ body {
 }
 .section-head:first-child { margin-top: 0; }
 .section-head h2 { font-size: 13px; font-weight: 700; margin: 0; letter-spacing: -.005em; }
+/* Кнопки в шапке секции (mode-switch и т.п.) не сидят на текстовой
+   baseline — центрируем именно эту пару, не меняя дефолт для остальных
+   .section-head, у которых справа обычный текст/бейдж. */
+.section-head:has(.mode-switch) { align-items: center; }
 .section-count {
   font-family: var(--mono); font-size: 11.5px; color: var(--text-faint);
   background: var(--l2); border: 1px solid var(--border); border-radius: var(--radius-pill);
@@ -264,6 +278,11 @@ body {
 .btn {
   border: none; border-radius: var(--radius-sm); padding: 7px 14px; font-size: 12.5px; font-weight: 600;
   cursor: pointer; transition: filter .15s var(--ease), transform .1s var(--ease);
+  /* Минимум 32px по высоте — ниже этого порога тач-таргеты и точный клик
+     мышью под давлением времени (экран Live во время атаки) становятся
+     ощутимо труднее; padding сам по себе давал только ~28px на .btn и
+     ~22px на .btn-sm/.btn-small (security-аудит 2026-08-15, P2). */
+  min-height: 32px;
 }
 .btn:hover { filter: brightness(1.12); }
 .btn:active { transform: translateY(1px); }
@@ -277,6 +296,16 @@ body {
 .btn-trust { background: var(--success-soft); color: var(--success); border: 1px solid #3ecb8e40; }
 .btn-trust:hover { border-color: var(--success); }
 .btn-sm { padding: 5px 11px; font-size: 11.5px; }
+
+/* Подсказка хоткея на кнопках кластера (B/T/I) — наведи на карточку,
+   нажми букву, минуя прицеливание в саму кнопку (security-аудит 2026-08-15,
+   P0 "ноль хоткеев на экране Live"). Полупрозрачная плашка поверх цвета
+   кнопки, а не отдельный badge — не должна перетягивать внимание с самого
+   текста действия. */
+.btn-hotkey {
+  margin-left: 6px; padding: 0 4px; border-radius: 3px; font-size: 10px; font-weight: 700;
+  font-family: var(--mono); background: rgba(0,0,0,.22); border: 1px solid rgba(0,0,0,.18);
+}
 
 /* Сворачиваемая секция — сейчас только "Зачистить пасту" на экране Live,
    используется от случая к случаю и не должна постоянно теснить кластеры
@@ -348,11 +377,16 @@ body {
    внутри раскрытия, просто доступное на уровень выше. */
 .verdict-quick-actions { display: flex; gap: 4px; flex: 0 0 auto; }
 .quick-btn {
-  width: 22px; height: 22px; border-radius: var(--radius-sm); border: 1px solid var(--border);
+  /* 28px, не 32px — плотная свёрнутая строка ленты (см. комментарий у
+     .verdict-quick-actions выше) держит много строк на экране разом;
+     полный 32px-таргет здесь заметно разрежает вертикальный ритм ради
+     второстепенного quick-action. 22px было слишком мелко для уверенного
+     клика мышью (security-аудит 2026-08-15, P2), 28px — компромисс. */
+  width: 28px; height: 28px; border-radius: var(--radius-sm); border: 1px solid var(--border);
   background: var(--l2); display: flex; align-items: center; justify-content: center;
   cursor: pointer; transition: all .12s var(--ease); flex: none; padding: 0;
 }
-.quick-btn svg { width: 12px; height: 12px; }
+.quick-btn svg { width: 14px; height: 14px; }
 .quick-btn.trust { color: var(--success); border-color: #3ecb8e40; }
 .quick-btn.trust:hover { background: var(--success-soft); border-color: var(--success); }
 .quick-btn.bad { color: var(--danger); border-color: #f0546b40; }
@@ -394,11 +428,16 @@ body {
    feedback был однобоким — 124 клика "ошибка" за стрим обнулили вес
    рабочих сигналов, а подтвердить настоящего бота было нечем. */
 .sig-btn {
-  width: 22px; height: 22px; border-radius: var(--radius-sm); border: 1px solid var(--border);
+  /* 28px, тот же компромисс, что .quick-btn выше (см. комментарий там) —
+     плотная строка сигнала внутри развёрнутой карточки вердикта, где
+     может быть несколько сигналов подряд. Раньше это осталось на 22px при
+     первом проходе фиксов тач-таргетов (тот же класс проблемы, что
+     .quick-btn, но не был упомянут — исправлено при повторном UX-аудите). */
+  width: 28px; height: 28px; border-radius: var(--radius-sm); border: 1px solid var(--border);
   background: var(--l2); color: var(--text-faint); display: flex; align-items: center; justify-content: center;
   cursor: pointer; transition: all .12s var(--ease); flex: none; padding: 0;
 }
-.sig-btn svg { width: 12px; height: 12px; }
+.sig-btn svg { width: 14px; height: 14px; }
 .sig-btn.fp:hover { background: var(--danger-soft); color: var(--danger); border-color: var(--danger); }
 .sig-btn.bot:hover { background: var(--success-soft); color: var(--success); border-color: var(--success); }
 .sig-btn:disabled { opacity: .4; cursor: not-allowed; }
@@ -477,7 +516,7 @@ body {
 .user-info { flex: 1; min-width: 0; }
 .user-login { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .user-role { font-size: 11px; color: var(--text-faint); }
-.btn-small { padding: 4px 8px; font-size: 11px; }
+.btn-small { padding: 4px 8px; font-size: 11px; min-height: 32px; }
 .bot-pulse { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--text-faint); }
 .bot-pulse.on { background: var(--success); box-shadow: 0 0 0 3px var(--success-soft); }
 
@@ -499,10 +538,35 @@ body {
   border-radius: var(--radius-sm); padding: 6px 8px; font-size: 12.5px; font-variant-numeric: tabular-nums;
 }
 
-/* Инпуты по всей панели — единая фокус-рамка вместо браузерного дефолта */
+/* Инпуты по всей панели — единая фокус-рамка вместо браузерного дефолта.
+   Фон/цвет/бордер тоже задаём здесь как базовый дефолт: раньше каждое
+   поле стилизовалось только через контейнер (.settings-quick-form input,
+   .form-row input[type="number"] и т.п.), и поле без такого контейнера
+   молча оставалось на белом браузерном дефолте — конкретно так осталось
+   не одетым поле "Или своё число" в автоклипе. Локальные классы всё
+   равно побеждают через связку с классом контейнера (выше специфичность),
+   так что это чистый fallback, не переопределение. */
 input, select, textarea { font-family: inherit; }
+input, select, textarea {
+  background: var(--l2); border: 1px solid var(--border); color: var(--text);
+  border-radius: var(--radius-sm); padding: 7px 10px; font-size: 12.5px;
+}
 input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
 input::placeholder { color: var(--text-faint); }
+/* Автозаполнение браузера красит фон поля в белый/жёлтый мимо всех наших
+   стилей (Chrome/Edge применяют его как user-agent stylesheet поверх
+   background). Единственный надёжный способ перекрыть — box-shadow того
+   же цвета, что и наш фон поля, залитый в форму инпута изнутри; сам
+   background останется наш, а не системный. */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus {
+  -webkit-text-fill-color: var(--text);
+  -webkit-box-shadow: 0 0 0 1000px var(--l2) inset;
+  box-shadow: 0 0 0 1000px var(--l2) inset;
+  caret-color: var(--text);
+  transition: background-color 9999s ease-in-out 0s;
+}
 
 /* Patterns */
 .pattern-list { display: flex; flex-direction: column; gap: 8px; }
@@ -565,6 +629,40 @@ input::placeholder { color: var(--text-faint); }
 .paste-wave-recent-row:hover { background: var(--l2); }
 .paste-wave-recent-login { font-weight: 600; flex: none; }
 .paste-wave-recent-text { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+
+/* Зачистить пасту — экран в "Модерация контента" (был сворачиваемой
+   секцией на Live, см. историю; теперь самостоятельный экран, сворачивать
+   больше незачем). Textarea и списки — те же токены, что остальная
+   панель, вместо инлайн-стилей, которые здесь раньше дублировали то, что
+   .settings-quick-form/.card уже умеют. */
+.paste-wave-input {
+  width: 100%; min-height: 64px; background: var(--l2); border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm); color: var(--text); padding: 9px 12px;
+  font-family: var(--sans); font-size: 13px; resize: vertical;
+}
+.paste-wave-list {
+  max-height: 180px; overflow-y: auto; border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm); background: var(--l1);
+}
+.paste-wave-list .empty-inline { padding: 10px 12px; color: var(--text-faint); font-size: 12.5px; }
+.paste-wave-match-row {
+  display: flex; align-items: center; gap: 10px; padding: 7px 10px;
+  border-bottom: 1px solid var(--border-soft); font-size: 12.5px;
+}
+.paste-wave-match-row:last-child { border-bottom: none; }
+.paste-wave-match-login { font-weight: 600; flex: none; }
+.paste-wave-match-text {
+  flex: 1; min-width: 0; color: var(--text-dim); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.paste-wave-match-score {
+  flex: none; font-family: var(--mono); font-variant-numeric: tabular-nums;
+  color: var(--text-faint); font-size: 11.5px;
+}
+.paste-wave-actions {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 14px;
+  padding-top: 14px; border-top: 1px solid var(--border-soft);
+}
 
 /* Строка, по которой уже нажали кнопку в панели (пользователь 2026-08-13:
    "можем как-то помечать сообщения... может цвет более тусклым делать") —
@@ -636,6 +734,86 @@ input::placeholder { color: var(--text-faint); }
   width: 100%; background: var(--l2); border: 1px solid var(--border); color: var(--text);
   border-radius: var(--radius-sm); padding: 7px 10px; font-size: 12.5px;
 }
+
+/* Сегментированный переключатель режима — для взаимоисключающих способов
+   задать одно и то же значение (сейчас: порог всплеска автоклипа —
+   авто по числу зрителей ИЛИ вручную), а не toggle+две карточки подряд. */
+.mode-switch {
+  display: inline-flex; background: var(--l2); border: 1px solid var(--border);
+  border-radius: var(--radius-pill); padding: 3px; gap: 2px;
+}
+.mode-switch button {
+  appearance: none; border: none; background: transparent; color: var(--text-dim);
+  font: inherit; font-size: 12.5px; font-weight: 600; padding: 7px 16px;
+  border-radius: var(--radius-pill); cursor: pointer; transition: background .15s var(--ease), color .15s var(--ease);
+}
+.mode-switch button:hover { color: var(--text); }
+.mode-switch button.active { background: var(--accent); color: var(--accent-ink); }
+.mode-switch button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.mode-panel[hidden] { display: none; }
+
+/* Автоклип — результат вычисления порога всплеска — то единственное
+   число, ради которого оператор открывает эту секцию. Даём ему вес
+   .stat-tile/.big-state (большой tabular-nums), а параметры формулы,
+   которые к нему привели, оставляем мелкими подписанными полями сбоку —
+   формула не должна конкурировать по весу со своим результатом. */
+.threshold-result {
+  display: flex; align-items: center; gap: 16px;
+  background: var(--l2); border: 1px solid var(--border-soft); border-radius: var(--radius-md);
+  padding: 14px 18px; margin-bottom: 16px;
+}
+.threshold-result .value {
+  font-family: var(--mono); font-size: 30px; font-weight: 800; letter-spacing: -.01em;
+  font-variant-numeric: tabular-nums; color: var(--accent-text); line-height: 1;
+}
+.threshold-result .value.pending { color: var(--text-faint); font-size: 22px; font-weight: 600; }
+.threshold-result .meta { min-width: 0; }
+.threshold-result .meta .label {
+  font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+  color: var(--text-faint); margin-bottom: 3px;
+}
+.threshold-result .meta .detail { font-size: 12px; color: var(--text-dim); }
+
+/* Формула авто-режима: три коротких поля в один ряд, каждое узкое —
+   это ввод параметров, не основной контент секции, поэтому не растягиваем
+   на всю ширину .settings-quick-form (та задумана для полноразмерных
+   настроек, а не для x/min/max тройки). */
+.formula-row { display: flex; gap: 10px; flex-wrap: wrap; }
+.formula-field { width: 108px; }
+.formula-field label {
+  display: block; font-size: 10.5px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .03em; color: var(--text-faint); margin-bottom: 5px;
+}
+.formula-field input {
+  width: 100%; background: var(--l2); border: 1px solid var(--border); color: var(--text);
+  border-radius: var(--radius-sm); padding: 7px 10px; font-size: 12.5px; font-variant-numeric: tabular-nums;
+}
+
+/* Пресеты порога — сегментированная группа кнопок, а не btn-ghost вразброс:
+   должно быть видно, какой диапазон выбран сейчас, иначе кнопки читаются
+   как одноразовые действия, а не как состояние. */
+.preset-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.preset-btn {
+  appearance: none; cursor: pointer; font: inherit; text-align: left;
+  background: var(--l2); border: 1px solid var(--border); color: var(--text-dim);
+  border-radius: var(--radius-sm); padding: 8px 13px; font-size: 12px; font-weight: 600;
+  transition: border-color .15s var(--ease), color .15s var(--ease), background .15s var(--ease);
+}
+.preset-btn:hover { border-color: var(--border-strong); color: var(--text); }
+.preset-btn.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-text); }
+.preset-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.preset-btn .n { display: block; font-family: var(--mono); font-size: 14px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.preset-btn .r { display: block; font-size: 10.5px; color: var(--text-faint); margin-top: 1px; font-weight: 500; }
+.preset-btn.active .r { color: var(--accent-text); opacity: .8; }
+
+/* Статус-бейдж включён/выключен — то же visual language, что
+   .token-status-badge, вместо серой строки .cluster-meta, которая
+   визуально ничем не отличалась от прочих подписей на странице. */
+.state-badge {
+  font-size: 11.5px; font-weight: 700; padding: 3px 10px; border-radius: var(--radius-pill);
+  background: var(--l2); color: var(--text-faint); border: 1px solid var(--border);
+}
+.state-badge.on { background: var(--success-soft); color: var(--success); border-color: transparent; }
 .yaml-editor {
   width: 100%; min-height: 420px; background: var(--l0); border: 1px solid var(--border);
   border-radius: var(--radius-sm); color: var(--text); font-family: var(--mono); font-size: 12.5px;
@@ -706,20 +884,34 @@ input::placeholder { color: var(--text-faint); }
       Каналы
     </div>
 
-    <div class="nav-label">Прямой эфир</div>
+    <div class="nav-label">Боты / Спам</div>
     <div class="nav-item" data-screen="live" role="button" tabindex="0">
       <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="3" fill="currentColor"/><path d="M3.5 3.5a7 7 0 0 0 0 9M12.5 3.5a7 7 0 0 1 0 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
       Кластеры и лента
+    </div>
+    <div class="nav-item" data-screen="patterns" role="button" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><rect x="1.5" y="1.5" width="5.5" height="5.5" rx="1.2" stroke="currentColor" stroke-width="1.5"/><rect x="9" y="9" width="5.5" height="5.5" rx="1.2" stroke="currentColor" stroke-width="1.5"/><path d="M9 4.3h2.7A2.3 2.3 0 0 1 14 6.6V9M7 11.7H4.3A2.3 2.3 0 0 1 2 9.4V7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      Паттерны
+    </div>
+    <div class="nav-item" data-screen="attack" role="button" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><path d="M8 1.5 14.5 13h-13L8 1.5Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M8 6.2v3M8 11h.01" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      Атака / Розыгрыш
+    </div>
+    <div class="nav-item" data-screen="stats" role="button" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><path d="M2 13.5h12M4 13.5V8M8 13.5V3.5M12 13.5V6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Статистика по ботам
+    </div>
+
+    <div class="nav-label">Инструменты</div>
+    <div class="nav-item" data-screen="autoclip" role="button" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><rect x="1.5" y="3.5" width="13" height="9" rx="1.5" stroke="currentColor" stroke-width="1.4"/><path d="M6.5 6.2v3.6l3.2-1.8-3.2-1.8Z" fill="currentColor"/></svg>
+      Автоклип
     </div>
 
     <div class="nav-label">Аналитика</div>
     <div class="nav-item" data-screen="audit" role="button" tabindex="0">
       <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><rect x="3" y="1.5" width="10" height="13" rx="1.5" stroke="currentColor" stroke-width="1.5"/><path d="M5.5 5.5h5M5.5 8h5M5.5 10.5h3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
       Аудит
-    </div>
-    <div class="nav-item" data-screen="stats" role="button" tabindex="0">
-      <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><path d="M2 13.5h12M4 13.5V8M8 13.5V3.5M12 13.5V6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      Статистика
     </div>
 
     <div class="nav-label">Пользователи</div>
@@ -732,18 +924,14 @@ input::placeholder { color: var(--text-faint); }
       Доверенные зрители
     </div>
 
-    <div class="nav-label">Автоматизация</div>
-    <div class="nav-item" data-screen="patterns" role="button" tabindex="0">
-      <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><rect x="1.5" y="1.5" width="5.5" height="5.5" rx="1.2" stroke="currentColor" stroke-width="1.5"/><rect x="9" y="9" width="5.5" height="5.5" rx="1.2" stroke="currentColor" stroke-width="1.5"/><path d="M9 4.3h2.7A2.3 2.3 0 0 1 14 6.6V9M7 11.7H4.3A2.3 2.3 0 0 1 2 9.4V7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
-      Паттерны
-    </div>
-    <div class="nav-item" data-screen="attack" role="button" tabindex="0">
-      <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><path d="M8 1.5 14.5 13h-13L8 1.5Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M8 6.2v3M8 11h.01" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
-      Атака / Розыгрыш
-    </div>
+    <div class="nav-label">Модерация контента</div>
     <div class="nav-item" data-screen="content" role="button" tabindex="0">
       <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><rect x="2" y="2.5" width="12" height="11" rx="1.5" stroke="currentColor" stroke-width="1.5"/><path d="M5 6.5h6M5 9h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
       Словарный детектор
+    </div>
+    <div class="nav-item" data-screen="paste-wave" role="button" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16" fill="none"><path d="M2 14 8.5 7.5M9.5 6.5l-1-1 2-2c.6-.6 2-1 3-.5.2.1.2.4 0 .5L11.5 5l1 1-2 2c-.6.6-2 1-3 .5-.2-.1-.2-.4 0-.5l2-2Z" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Зачистить пасту
     </div>
 
     <div class="nav-label">Настройки</div>
@@ -822,51 +1010,217 @@ input::placeholder { color: var(--text-faint); }
       </div>
 
       <div class="screen" id="screen-live">
-        <!-- Свёрнуто по умолчанию (#2611-подобная жалоба: "Зачистить пасту"
-             занимала весь верх экрана Live постоянно, хотя используется от
-             случая к случаю — кластеры и лента вердиктов, за которыми
-             следят непрерывно во время стрима, оказывались ниже прокрутки).
-             Состояние — в localStorage, не только в памяти: модератор,
-             который её один раз открыл, не должен находить свёрнутой заново
-             при каждом визите. -->
-        <div class="collapsible" id="paste-wave-section">
-          <div class="collapsible-head" id="paste-wave-toggle">
-            <svg class="collapsible-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 6l6 6-6 6"/></svg>
-            <h2>Зачистить пасту</h2>
-            <span class="note" style="margin:0;">— найти всех, кто скопировал один текст</span>
-            <span class="channel-status-pill running" id="paste-wave-channel-badge" style="margin-left:auto;">канал —</span>
-          </div>
-          <div class="collapsible-body">
-            <div class="card" style="margin-bottom:20px;">
-              <div class="note" style="margin-bottom:10px;">
-                Когда чат массово копирует один и тот же текст — вставьте его сюда, система найдёт всех,
-                кто написал похожее за последние 2 минуты, независимо от того, новый это аккаунт или
-                постоянный зритель. Решение всегда за вами: список найденных нужно подтвердить.
-              </div>
-              <div style="display:flex;gap:10px;align-items:flex-start;">
-                <textarea id="paste-wave-sample" placeholder="Вставьте текст пасты сюда, или кликните сообщение справа…" style="flex:1;min-height:60px;background:var(--l2);border:1px solid var(--border-soft);border-radius:var(--radius-sm);color:var(--text);padding:8px 10px;font-family:var(--sans);font-size:13px;resize:vertical;"></textarea>
-                <button class="btn btn-accent" id="btn-find-paste-wave">Найти</button>
-              </div>
-
-              <div style="margin-top:14px;">
-                <div class="cluster-meta" style="margin-bottom:6px;">Последние сообщения чата — клик подставляет текст выше, без копирования:</div>
-                <div id="paste-wave-recent" style="max-height:160px;overflow-y:auto;border:1px solid var(--border-soft);border-radius:var(--radius-sm);"></div>
-              </div>
-
-              <div id="paste-wave-results" style="margin-top:14px;"></div>
-            </div>
-          </div>
-        </div>
-
         <div id="cluster-list" class="cluster-list"><div class="empty">Активных кластеров нет — атак не обнаружено</div></div>
 
         <div class="section-head"><h2>Лента подозрительных сообщений</h2></div>
         <div class="card" id="verdict-feed"><div class="empty">Пока тихо — подозрительных сообщений не было</div></div>
       </div>
 
+      <div class="screen" id="screen-paste-wave">
+        <div class="section-head">
+          <h2>Зачистить пасту</h2>
+          <span class="channel-status-pill running" id="paste-wave-channel-badge">канал —</span>
+        </div>
+        <div class="card">
+          <div class="note" style="margin-bottom:14px;">
+            Когда чат массово копирует один и тот же текст — вставьте его сюда, система найдёт всех,
+            кто написал похожее за последние 2 минуты, независимо от того, новый это аккаунт или
+            постоянный зритель. Решение всегда за вами: список найденных нужно подтвердить.
+          </div>
+
+          <label for="paste-wave-sample">Текст пасты</label>
+          <div style="display:flex;gap:10px;align-items:flex-start;margin-top:5px;">
+            <textarea class="paste-wave-input" id="paste-wave-sample" placeholder="Вставьте текст пасты сюда, или кликните сообщение ниже…"></textarea>
+            <button class="btn btn-accent" id="btn-find-paste-wave">Найти</button>
+          </div>
+
+          <div style="margin-top:18px;">
+            <div class="cluster-meta" style="margin-bottom:6px;">Последние сообщения чата — клик подставляет текст выше, без копирования:</div>
+            <div class="paste-wave-list" id="paste-wave-recent"></div>
+          </div>
+
+          <div id="paste-wave-results"></div>
+        </div>
+      </div>
+
+      <!-- Живые вкл/выкл + пороги автоклипа (bot/autoclip.py) для ВЫБРАННОГО
+           канала (profile-select вверху экрана) — пишет в
+           mod_autoclip_settings (mod.<broadcaster_id>.db), AutoclipHub
+           перечитывает раз в 10 сек без рестарта бота. Поверх YAML
+           (config/channels/<канал>.yml) — тот остаётся дефолтом, эта панель
+           побеждает его, пока не сброшена (пустое поле). Отдельный экран,
+           не collapsible внутри «Инструменты»: у него уже есть свой пункт
+           в сайдбаре, второй уровень скрытия был бы лишним. -->
+      <div class="screen" id="screen-autoclip">
+        <!-- Токен для клиппинга — per-channel (mod.<broadcaster_id>.db,
+             см. миграцию 020): Twitch Helix принимает клип только от
+             токена, принадлежащего вещателю/модератору/редактору ИМЕННО
+             этого канала, поэтому статус и кнопка получения токена живут
+             здесь, на экране с уже выбранным конкретным каналом
+             (currentProfile()), а не на общем экране Settings — там токен
+             раньше выглядел настроенным глобально, хотя реально работал
+             только для одного канала (инцидент: paverpapa не получал
+             клипов, потому что общий .env-токен был выпущен от dobriy_yura). -->
+        <div class="section-head"><h2>Токен для клиппинга</h2></div>
+        <div class="card token-status-row" style="margin-bottom:24px;">
+          <div>
+            <span class="token-status-badge missing" id="clip-token-status-badge">не настроен на этом канале</span>
+            <div class="cluster-meta" id="clip-token-status-meta" style="margin-top:6px;">Автоклип не сможет создавать клипы на этом канале, пока токен не получен.</div>
+          </div>
+          <button class="btn btn-accent" id="btn-get-clip-token">Получить токен для клиппинга</button>
+        </div>
+
+        <div class="section-head"><h2>Автоклип</h2></div>
+        <div class="card" style="margin-bottom:24px;">
+          <div class="note">
+            Бот сам вырезает клипы в яркие моменты стрима — по всплеску реакции в чате, по ключевой
+            фразе зрителя или по голосовой команде самого стримера.
+          </div>
+          <div style="display:flex;align-items:center;gap:12px;margin-top:16px;">
+            <label class="toggle-switch">
+              <input type="checkbox" id="autoclip-enabled">
+              <span class="toggle-slider"></span>
+            </label>
+            <span id="autoclip-enabled-status" class="state-badge">Выключен на этом канале</span>
+          </div>
+          <div class="note" style="margin-top:12px;">
+            Включает/выключает автоклип на выбранном вверху канале без перезапуска бота.
+            Требует настроенный токен для клиппинга (экран «Канал и токен») и роль MODERATOR+.
+          </div>
+        </div>
+
+        <!-- Порог всплеска — единственное значение с двумя взаимоисключающими
+             способами задать его: авто (процент от текущего числа зрителей,
+             AutoclipHub._poll_viewer_counts опрашивает Twitch раз в 90 сек)
+             или вручную фиксированным числом. Один заголовок, один
+             переключатель режима (mode-switch), а не toggle+две карточки —
+             показывает "выберите ОДИН из двух способов", а не "два
+             независимых включаемых блока". -->
+        <div class="section-head">
+          <h2>Порог всплеска</h2>
+          <div class="mode-switch" role="tablist" aria-label="Способ задания порога всплеска">
+            <button type="button" role="tab" id="autoclip-mode-manual" aria-selected="true">Вручную</button>
+            <button type="button" role="tab" id="autoclip-mode-auto" aria-selected="false">Автоматически</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="note" style="margin-bottom:16px;">
+            Сколько РАЗНЫХ зрителей должны написать в чат за короткое время, чтобы это считалось
+            «хайпом» и запустило клип. Один флудящий человек не считается.
+          </div>
+
+          <div class="mode-panel" id="autoclip-mode-panel-manual">
+            <div class="threshold-result">
+              <div class="value" id="autoclip-manual-preview">12</div>
+              <div class="meta">
+                <div class="label">Порог всплеска</div>
+                <div class="detail">авторов за окно всплеска</div>
+              </div>
+            </div>
+            <div class="cluster-meta" style="margin-bottom:8px;">
+              Не уверены, какое число ставить? Ориентируйтесь на то, сколько зрителей ОДНОВРЕМЕННО
+              сидит у вас в чате (не общее число подписчиков):
+            </div>
+            <div class="preset-row">
+              <button class="preset-btn" id="btn-autoclip-preset-small" type="button"><span class="n">4</span><span class="r">до 50 зрителей</span></button>
+              <button class="preset-btn" id="btn-autoclip-preset-medium" type="button"><span class="n">12</span><span class="r">50–300 зрителей</span></button>
+              <button class="preset-btn" id="btn-autoclip-preset-large" type="button"><span class="n">30</span><span class="r">300–1000 зрителей</span></button>
+              <button class="preset-btn" id="btn-autoclip-preset-mega" type="button"><span class="n">80</span><span class="r">1000+ зрителей</span></button>
+            </div>
+            <div style="margin-top:16px;max-width:220px;">
+              <label for="autoclip-viewer-count-input">Или своё число зрителей</label>
+              <input type="number" id="autoclip-viewer-count-input" min="1" step="1" placeholder="150">
+              <div class="note" style="margin-top:4px;">Сколько зрителей ОДНОВРЕМЕННО в чате — порог выше посчитается сам, между пресетами.</div>
+            </div>
+            <input type="hidden" id="autoclip-burst-threshold">
+          </div>
+
+          <div class="mode-panel" id="autoclip-mode-panel-auto" hidden>
+            <div class="threshold-result">
+              <div class="value pending" id="autoclip-auto-scale-current">—</div>
+              <div class="meta">
+                <div class="label">Сейчас действует</div>
+                <div class="detail" id="autoclip-auto-scale-current-detail">появится после первого опроса Twitch, если канал в эфире</div>
+              </div>
+            </div>
+            <div class="note" style="margin-bottom:14px;">
+              Порог пересчитывается сам каждые 1–2 минуты как доля текущего числа зрителей —
+              не нужно вручную менять его при резком росте или падении аудитории (рейд, вирусный
+              момент). Пока стрим оффлайн, используется последнее известное значение.
+            </div>
+            <div class="formula-row">
+              <div class="formula-field">
+                <label for="autoclip-auto-scale-percent">Доля, %</label>
+                <input type="number" id="autoclip-auto-scale-percent" min="0.1" max="100" step="0.1" placeholder="4">
+              </div>
+              <div class="formula-field">
+                <label for="autoclip-auto-scale-min">Минимум</label>
+                <input type="number" id="autoclip-auto-scale-min" min="1" step="1" placeholder="4">
+              </div>
+              <div class="formula-field">
+                <label for="autoclip-auto-scale-max">Максимум</label>
+                <input type="number" id="autoclip-auto-scale-max" min="1" step="1" placeholder="200">
+              </div>
+            </div>
+          </div>
+
+          <div style="display:flex;align-items:center;gap:10px;margin-top:20px;padding-top:16px;border-top:1px solid var(--border-soft);">
+            <button class="btn btn-accent" id="btn-save-autoclip-burst-threshold">Сохранить</button>
+            <span id="autoclip-burst-threshold-save-status" class="cluster-meta"></span>
+          </div>
+        </div>
+
+        <!-- Остальные пороги не зависят от способа задания порога всплеска
+             выше — своя секция, читается как следующий шаг настройки, не
+             альтернатива предыдущему. -->
+        <div class="section-head"><h2>Остальные условия срабатывания</h2></div>
+        <div class="card">
+          <!-- Живые настройки (mod_autoclip_settings), без перезапуска
+               бота. Пустое поле = "не переопределять", используется
+               значение из config/channels/<канал>.yml — плейсхолдер
+               показывает именно это значение, не общий текст. -->
+          <div class="settings-quick-form">
+            <div>
+              <label for="autoclip-burst-window">Окно всплеска (сек)</label>
+              <input type="number" id="autoclip-burst-window" min="1" step="1" placeholder="20">
+              <div class="note" style="margin-top:4px;">За сколько секунд должны набраться авторы из порога выше, чтобы момент посчитался всплеском.</div>
+            </div>
+            <div>
+              <label for="autoclip-cooldown">Кулдаун между клипами (сек)</label>
+              <input type="number" id="autoclip-cooldown" min="0" step="1" placeholder="300">
+              <div class="note" style="margin-top:4px;">Минимальный перерыв между двумя клипами на этом канале — общий для всплеска и ключевых фраз.</div>
+            </div>
+            <div>
+              <label for="autoclip-capture-delay">Задержка перед клипом (сек)</label>
+              <input type="number" id="autoclip-capture-delay" min="0" step="1" placeholder="0">
+              <div class="note" style="margin-top:4px;">Twitch сам решает, что попадёт в клип, до и после момента запроса. Задержка сдвигает запрос позже, чтобы в кадр попало то, что было ДО реакции ("клип!"), а не только сама реакция.</div>
+            </div>
+          </div>
+          <div class="settings-quick-form" style="grid-template-columns:1fr 1fr;margin-top:22px;">
+            <div>
+              <label for="autoclip-keyword-phrases">Ключевые фразы в чате (через запятую)</label>
+              <input id="autoclip-keyword-phrases" placeholder="клип это, клип, clip it, clip that">
+              <div class="note" style="margin-top:4px;">Если зритель напишет любую из этих фраз в чат — бот сделает клип сразу, без учёта окна всплеска.</div>
+            </div>
+            <div>
+              <label for="autoclip-voice-phrases">Голосовые фразы стримера (через запятую)</label>
+              <input id="autoclip-voice-phrases" placeholder="клип это, заклипай, clip it, clip that">
+              <div class="note" style="margin-top:4px;">Стример произносит фразу голосом (нужен включённый голосовой ввод бота) — клип создаётся сразу, даже во время кулдауна.</div>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;margin-top:14px;">
+            <button class="btn btn-accent" id="btn-save-autoclip-thresholds">Сохранить</button>
+            <span id="autoclip-thresholds-status" class="cluster-meta"></span>
+          </div>
+          <div class="note" style="margin-top:10px;">
+            Пустое поле — используется значение из config/channels/&lt;канал&gt;.yml (показано серым как подсказка), а не 0/выключено.
+          </div>
+        </div>
+      </div>
+
       <div class="screen" id="screen-users">
         <div class="users-toolbar">
-          <input id="users-search" placeholder="Поиск по нику…">
+          <input id="users-search" placeholder="Поиск по нику…" aria-label="Поиск по нику">
           <button class="btn btn-ghost" id="btn-users-search">Найти</button>
         </div>
         <div class="card">
@@ -918,14 +1272,14 @@ input::placeholder { color: var(--text-faint); }
         <div class="card" id="new-pattern-card" style="margin-top:18px;">
           <div class="card-title">Новый паттерн</div>
           <div class="new-pattern-form">
-            <div><label>Имя</label><input id="np-name" placeholder="raid_bots_ru"></div>
-            <div><label>Вес (порядок выбора)</label><input id="np-weight" type="number" value="1" step="0.1"></div>
-            <div class="full"><label>Описание</label><input id="np-description" placeholder="Короткое описание паттерна"></div>
-            <div class="full"><label>Требуемые сигналы (через запятую)</label><input id="np-signals" placeholder="exact_duplicate, synchronized_arrival"></div>
-            <div><label>Мин. семейств</label><input id="np-min-families" type="number" value="0"></div>
-            <div><label>Мин. risk_score</label><input id="np-min-risk" type="number" value="0"></div>
-            <div><label>Мин. confidence (0-1)</label><input id="np-min-confidence" type="number" value="0" step="0.05"></div>
-            <div><label>Мин. размер кластера</label><input id="np-min-cluster" type="number" value="0"></div>
+            <div><label for="np-name">Имя</label><input id="np-name" placeholder="raid_bots_ru"></div>
+            <div><label for="np-weight">Вес (порядок выбора)</label><input id="np-weight" type="number" value="1" step="0.1"></div>
+            <div class="full"><label for="np-description">Описание</label><input id="np-description" placeholder="Короткое описание паттерна"></div>
+            <div class="full"><label for="np-signals">Требуемые сигналы (через запятую)</label><input id="np-signals" placeholder="exact_duplicate, synchronized_arrival"></div>
+            <div><label for="np-min-families">Мин. семейств</label><input id="np-min-families" type="number" value="0"></div>
+            <div><label for="np-min-risk">Мин. risk_score</label><input id="np-min-risk" type="number" value="0"></div>
+            <div><label for="np-min-confidence">Мин. confidence (0-1)</label><input id="np-min-confidence" type="number" value="0" step="0.05"></div>
+            <div><label for="np-min-cluster">Мин. размер кластера</label><input id="np-min-cluster" type="number" value="0"></div>
           </div>
           <button class="btn btn-accent" id="btn-create-pattern" style="margin-top:14px;">Создать паттерн</button>
         </div>
@@ -939,7 +1293,7 @@ input::placeholder { color: var(--text-faint); }
           </div>
           <div style="display:flex;align-items:center;gap:10px;">
             <div class="form-row" id="attack-duration-row">
-              <label>Длительность (сек)</label>
+              <label for="attack-duration">Длительность (сек)</label>
               <input type="number" id="attack-duration" value="1800" min="1">
             </div>
             <button class="btn btn-danger" id="btn-attack-activate">Включить Attack Mode</button>
@@ -962,7 +1316,7 @@ input::placeholder { color: var(--text-faint); }
           </div>
           <div style="display:flex;align-items:center;gap:10px;">
             <div class="form-row" id="giveaway-duration-row">
-              <label>Длительность (сек)</label>
+              <label for="giveaway-duration">Длительность (сек)</label>
               <input type="number" id="giveaway-duration" value="900" min="1">
             </div>
             <button class="btn btn-accent" id="btn-giveaway-activate">Включить Giveaway Mode</button>
@@ -1000,11 +1354,11 @@ input::placeholder { color: var(--text-faint); }
 
       <div class="screen" id="screen-stats">
         <div class="stats-grid" id="stats-tiles"></div>
-        <div class="section-head"><h2>FP-rate по сигналам</h2></div>
+        <div class="section-head"><h2>Ложные срабатывания по сигналам</h2></div>
         <div class="card">
           <table class="fp-table">
             <thead>
-              <tr><th>Сигнал</th><th>Всего фидбека</th><th>False positive</th><th>FP-rate</th></tr>
+              <tr><th>Сигнал</th><th>Всего фидбека</th><th>Ложных срабатываний</th><th>Доля ложных</th></tr>
             </thead>
             <tbody id="fp-stats-body"></tbody>
           </table>
@@ -1041,7 +1395,7 @@ input::placeholder { color: var(--text-faint); }
         <div class="card">
           <div class="settings-quick-form" style="grid-template-columns:1fr auto;align-items:end;">
             <div class="full" style="grid-column:1/-1;">
-              <label>Webhook URL</label>
+              <label for="discord-webhook-url">Webhook URL</label>
               <input id="discord-webhook-url" placeholder="https://discord.com/api/webhooks/…">
             </div>
           </div>
@@ -1055,7 +1409,7 @@ input::placeholder { color: var(--text-faint); }
           </div>
 
           <div id="discord-alert-threshold-row" style="display:none;margin-top:16px;padding-top:16px;border-top:1px solid var(--border-soft);">
-            <label>Отправлять алерт при уверенности от <span id="discord-alert-threshold-value">90%</span></label>
+            <label for="discord-alert-threshold">Отправлять алерт при уверенности от <span id="discord-alert-threshold-value">90%</span></label>
             <div style="display:flex;align-items:center;gap:12px;margin-top:8px;">
               <input type="range" id="discord-alert-threshold" min="0" max="100" step="5" value="90" style="flex:1;">
               <button class="btn btn-ghost btn-small" id="btn-save-alert-threshold">Сохранить</button>
@@ -1084,7 +1438,7 @@ input::placeholder { color: var(--text-faint); }
           <div style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border-soft);">
             <div class="settings-quick-form" style="grid-template-columns:auto 1fr auto;align-items:end;">
               <div>
-                <label>Категория</label>
+                <label for="content-rule-category">Категория</label>
                 <select id="content-rule-category">
                   <option value="racism">Расизм/оскорбления</option>
                   <option value="threats">Угрозы насилия</option>
@@ -1092,7 +1446,7 @@ input::placeholder { color: var(--text-faint); }
                 </select>
               </div>
               <div>
-                <label>Слово или фраза</label>
+                <label for="content-rule-phrase">Слово или фраза</label>
                 <input id="content-rule-phrase" placeholder="что искать в чате">
               </div>
               <button class="btn btn-accent" id="btn-add-content-rule">Добавить</button>
@@ -1112,7 +1466,7 @@ input::placeholder { color: var(--text-faint); }
         <div class="card">
           <div class="settings-quick-form">
             <div>
-              <label>Режим чувствительности</label>
+              <label for="cfg-mode">Режим чувствительности</label>
               <select id="cfg-mode">
                 <option value="SAFE">SAFE</option>
                 <option value="BALANCED">BALANCED</option>
@@ -1120,16 +1474,16 @@ input::placeholder { color: var(--text-faint); }
                 <option value="ATTACK">ATTACK</option>
               </select>
             </div>
-            <div><label>risk: OBSERVE от</label><input id="cfg-risk-observe" type="number" min="0" max="100"></div>
-            <div><label>risk: TIMEOUT от</label><input id="cfg-risk-timeout" type="number" min="0" max="100"></div>
-            <div><label>risk: BAN от</label><input id="cfg-risk-ban" type="number" min="0" max="100"></div>
+            <div><label for="cfg-risk-observe">risk: OBSERVE от</label><input id="cfg-risk-observe" type="number" min="0" max="100"></div>
+            <div><label for="cfg-risk-timeout">risk: TIMEOUT от</label><input id="cfg-risk-timeout" type="number" min="0" max="100"></div>
+            <div><label for="cfg-risk-ban">risk: BAN от</label><input id="cfg-risk-ban" type="number" min="0" max="100"></div>
           </div>
           <div class="note" id="settings-not-loaded" style="display:none;">config/moderation.yml ещё не создан на сервере.</div>
         </div>
 
         <div class="section-head"><h2>config/moderation.yml (полный YAML)</h2></div>
         <div class="card">
-          <textarea class="yaml-editor" id="cfg-yaml-editor" spellcheck="false"></textarea>
+          <textarea class="yaml-editor" id="cfg-yaml-editor" spellcheck="false" aria-label="config/moderation.yml, полный YAML"></textarea>
           <div class="config-error-banner" id="cfg-parse-error"></div>
           <div class="restart-notice" id="cfg-restart-notice">Сохранено. Изменения применятся после перезапуска бота.</div>
           <div style="display:flex;gap:8px;margin-top:12px;">

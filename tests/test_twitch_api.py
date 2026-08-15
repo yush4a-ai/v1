@@ -237,6 +237,131 @@ class TestDeleteChatMessages:
         assert result.success is False
 
 
+class TestCreateClip:
+    async def test_success_202(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.method == "POST"
+            assert request.url.path == "/helix/clips"
+            assert request.url.params["broadcaster_id"] == "1"
+            return httpx.Response(
+                202,
+                json={"data": [{"id": "clip123", "edit_url": "https://clips.twitch.tv/clip123/edit"}]},
+            )
+
+        client = make_client(handler)
+        result = await client.create_clip(broadcaster_id="1", user_token="usertok")
+        await client.close()
+
+        assert result.success is True
+        assert result.clip_id == "clip123"
+        assert result.edit_url == "https://clips.twitch.tv/clip123/edit"
+
+    async def test_non_202_returns_failure_not_exception(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(403, text="Missing scope: clips:edit")
+
+        client = make_client(handler)
+        result = await client.create_clip(broadcaster_id="1", user_token="usertok")
+        await client.close()
+
+        assert result.success is False
+        assert "403" in result.error
+
+    async def test_exhausted_retries_returns_failure_not_raise(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, text="internal error")
+
+        client = make_client(handler)
+        result = await client.create_clip(broadcaster_id="1", user_token="usertok")
+        await client.close()
+
+        assert result.success is False
+        assert result.broadcaster_id == "1"
+
+
+class TestGetStreams:
+    async def test_empty_request_returns_empty_without_network_call(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("не должно быть сетевых вызовов на пустой запрос")
+
+        client = make_client(handler)
+        result = await client.get_streams(broadcaster_ids=[])
+        assert result == []
+        await client.close()
+
+    async def test_live_channel_returns_viewer_count(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "oauth2/token" in str(request.url):
+                return token_handler(request)
+            assert request.url.params.get_list("user_id") == ["1"]
+            return httpx.Response(200, json={"data": [{"user_id": "1", "viewer_count": 342}]})
+
+        client = make_client(handler)
+        streams = await client.get_streams(broadcaster_ids=["1"])
+        await client.close()
+
+        assert len(streams) == 1
+        assert streams[0].is_live is True
+        assert streams[0].viewer_count == 342
+
+    async def test_offline_channel_returns_is_live_false(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "oauth2/token" in str(request.url):
+                return token_handler(request)
+            return httpx.Response(200, json={"data": []})
+
+        client = make_client(handler)
+        streams = await client.get_streams(broadcaster_ids=["1"])
+        await client.close()
+
+        assert len(streams) == 1
+        assert streams[0].broadcaster_id == "1"
+        assert streams[0].is_live is False
+        assert streams[0].viewer_count == 0
+
+    async def test_mixed_live_and_offline_preserves_order(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "oauth2/token" in str(request.url):
+                return token_handler(request)
+            return httpx.Response(200, json={"data": [{"user_id": "2", "viewer_count": 10}]})
+
+        client = make_client(handler)
+        streams = await client.get_streams(broadcaster_ids=["1", "2", "3"])
+        await client.close()
+
+        assert [s.broadcaster_id for s in streams] == ["1", "2", "3"]
+        assert [s.is_live for s in streams] == [False, True, False]
+        assert streams[1].viewer_count == 10
+
+    async def test_batches_over_100_channels(self) -> None:
+        received_batches: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "oauth2/token" in str(request.url):
+                return token_handler(request)
+            n = len(request.url.params.get_list("user_id"))
+            received_batches.append(n)
+            return httpx.Response(200, json={"data": []})
+
+        client = make_client(handler)
+        ids = [str(i) for i in range(250)]
+        await client.get_streams(broadcaster_ids=ids)
+        await client.close()
+
+        assert received_batches == [MAX_USERS_PER_REQUEST, MAX_USERS_PER_REQUEST, 50]
+
+    async def test_error_response_raises_helix_error(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "oauth2/token" in str(request.url):
+                return token_handler(request)
+            return httpx.Response(400, text="bad request")
+
+        client = make_client(handler)
+        with pytest.raises(HelixError):
+            await client.get_streams(broadcaster_ids=["1"])
+        await client.close()
+
+
 class TestRetryAndRateLimit:
     async def test_retries_on_5xx_then_succeeds(self) -> None:
         attempts = {"n": 0}

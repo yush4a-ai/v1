@@ -299,7 +299,12 @@ def load_channel_profile(
         return ChannelProfile(channel=channel)
 
     raw = _load_yaml_dict(path)
-    _check_keys(raw, {"channel_profile"}, str(path))
+    # "autoclip" — секция того же файла, читаемая отдельно
+    # bot.autoclip_config.load_autoclip_channel_config (см. её докстринг);
+    # здесь она разрешена, но не парсится — иначе типо в имени ключа
+    # автоклипа никогда бы не поймал ConfigError, а любая правка автоклипа
+    # ломала бы load_channel_profile через _check_keys неизвестных ключей.
+    _check_keys(raw, {"channel_profile", "autoclip"}, str(path))
     profile_raw = raw.get("channel_profile", {})
     _check_keys(
         profile_raw,

@@ -66,12 +66,26 @@ class Database:
         self._conn: aiosqlite.Connection | None = None
 
     async def connect(self) -> None:
+        # Идемпотентно: event_ready (main.py) срабатывает у twitchio на
+        # КАЖДЫЙ успешный (пере)коннект IRC, не только при старте процесса
+        # — без этой проверки повторный вызов на реконнекте открывал новое
+        # соединение, оставляя старое утечкой (bug-аудит 2026-08-15,
+        # CRITICAL #3).
+        if self._conn is not None:
+            return
         self._conn = await aiosqlite.connect(self._path)
         # WAL заводился ради mod_inbox — второй процесс держал своё
         # соединение к этому же файлу. Такого процесса больше нет, но режим
         # оставлен: панель по-прежнему читает bot.db параллельно с ботом
         # (экран Viewers/Chat feed), и это ровно тот же сценарий.
         await self._conn.execute("PRAGMA journal_mode=WAL")
+        # Без busy_timeout конкурентный писатель (панель пишет заметку о
+        # зрителе/шлёт сообщение в чат, пока бот пишет свою запись) получает
+        # немедленный sqlite3.OperationalError: database is locked вместо
+        # короткого ожидания — тот же риск, что уже закрыт в
+        # registry_store.py/fingerprints_store.py (bug-аудит 2026-08-15,
+        # HIGH #6).
+        await self._conn.execute("PRAGMA busy_timeout=5000")
         await self._conn.executescript(SCHEMA)
         await self._conn.commit()
 

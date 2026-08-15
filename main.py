@@ -8,6 +8,7 @@ import time
 from twitchio.ext import commands
 
 import paths
+from bot.autoclip import AutoclipHub
 from bot.brain import Brain
 from bot.config import load_config
 from bot.database import Database
@@ -170,9 +171,13 @@ class MessageQueue:
         self._get_channel = channel_getter
         self._queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
         self._last_sent_at = 0.0
+        self._task: asyncio.Task | None = None
 
     def start(self) -> None:
-        asyncio.create_task(self._run())
+        # Ссылка сохраняется, а не только создаётся — без неё задача
+        # держится только слабой ссылкой event loop'а (asyncio.create_task
+        # не гарантирует сильную ссылку нигде в пользовательском коде).
+        self._task = asyncio.create_task(self._run())
 
     async def send(self, channel_name: str, text: str) -> None:
         await self._queue.put((channel_name, text))
@@ -227,6 +232,16 @@ moderation_hub = ModerationHub(
     moderation_enabled=cfg.moderation_enabled,
 )
 
+# Автоклип (bot/autoclip.py) — независимый подписчик того же потока
+# сообщений чата, что и moderation_hub выше: своя очередь, свой Helix-клиент,
+# свой токен (clips:edit, не moderator:manage:*). Реконсилируется с тем же
+# Channel Registry, но НЕ пишет process_status/pid туда — единственный
+# писатель этих полей остаётся moderation_hub.
+autoclip_hub = AutoclipHub(
+    registry_db_path=paths.REGISTRY_DB,
+    autoclip_enabled=cfg.autoclip_enabled,
+)
+
 
 async def load_initial_channels() -> list[str]:
     """Список каналов из Channel Registry (registry.db) — источник правды
@@ -256,6 +271,7 @@ async def load_initial_channels() -> list[str]:
 class ChatBot(commands.Bot):
     def __init__(self, initial_channels: list[str]):
         self.channels_list = initial_channels
+        self._started = False
         super().__init__(
             token=cfg.bot_token,
             nick=cfg.bot_nick,
@@ -277,6 +293,22 @@ class ChatBot(commands.Bot):
 
     async def event_ready(self):
         await db.connect()
+        log.info("Бот подключился как %s к каналам: %s", self.nick, ", ".join(self.channels_list))
+
+        if self._started:
+            # twitchio вызывает event_ready на КАЖДЫЙ успешный (пере)коннект
+            # IRC, не только при старте процесса (websocket.py::_keep_alive
+            # переподключается сама и заново диспатчит "ready") — без этой
+            # проверки moderation_hub.start()/autoclip_hub.start() ниже
+            # запускались бы повторно на каждый реконнект, создавая второй
+            # набор задач/SQLite-соединений на те же каналы поверх старых,
+            # никогда не отменяемых (bug-аудит 2026-08-15, CRITICAL #3 —
+            # при включённом исполнении действий это путь к дублированным
+            # банам одного пользователя).
+            log.info("Повторный event_ready (реконнект IRC) — хабы уже запущены, пропускаю")
+            return
+        self._started = True
+
         if cfg.moderation_enabled:
             # Здесь, а не при импорте модуля: hub создаёт asyncio-задачи, а
             # event_loop к этому моменту уже крутится. Отдельного процесса
@@ -287,7 +319,12 @@ class ChatBot(commands.Bot):
                 "Модерация включена, каналов под наблюдением: %s",
                 ", ".join(moderation_hub.active_channels) or "нет активных в Registry",
             )
-        log.info("Бот подключился как %s к каналам: %s", self.nick, ", ".join(self.channels_list))
+        if cfg.autoclip_enabled:
+            await autoclip_hub.start()
+            log.info(
+                "Автоклип включён, каналов под наблюдением: %s",
+                ", ".join(autoclip_hub.active_channels) or "нет активных",
+            )
 
         self._last_free_reply_at = 0.0
         self._outbox = MessageQueue(self.get_channel)
@@ -295,9 +332,9 @@ class ChatBot(commands.Bot):
         self._dedup = DuplicateFilter()
 
         if cfg.voice_enabled:
-            asyncio.create_task(self._poll_voice_queue())
+            self._voice_task = asyncio.create_task(self._poll_voice_queue())
 
-        asyncio.create_task(self._poll_panel_outbox())
+        self._panel_outbox_task = asyncio.create_task(self._poll_panel_outbox())
 
     async def _poll_voice_queue(self) -> None:
         log.info("Слежу за голосовыми сообщениями (файл %s)", voice_queue.path)
@@ -330,12 +367,35 @@ class ChatBot(commands.Bot):
         Склейка сохраняет и имя, и сам вопрос. Всё, что старше этих фраз,
         выбрасываем — отвечать надо на живой разговор, а не догонять его.
         """
+        if cfg.autoclip_enabled:
+            # По КАЖДОЙ отдельной фразе, не по склеенному recent ниже:
+            # команда клипа короткая и самостоятельная ("клип это"), а
+            # склейка последних VOICE_BATCH_MERGE фраз рассчитана на
+            # разговорные реплики стримеру — прогонять через неё команду
+            # значило бы либо задерживать триггер, либо примешивать к нему
+            # случайную соседнюю речь.
+            for line in lines:
+                self._check_voice_clip_command(line)
+
         recent = lines[-VOICE_BATCH_MERGE:]
         dropped = len(lines) - len(recent)
         if dropped:
             log.info("Пропускаю %d устаревших фраз", dropped)
 
         await self._on_voice_transcript(" ".join(recent))
+
+    def _check_voice_clip_command(self, text: str) -> None:
+        """Голосовая команда клипа — независимая проверка поверх тех же
+        строк, что уже вычитал _poll_voice_queue (voice_queue.pop_all()
+        удаляет их из файла один раз, повторно не прочитать). Не влияет на
+        обычный разговорный путь (_on_voice_transcript) — только смотрит на
+        тот же текст параллельно."""
+        try:
+            autoclip_hub.submit_voice_command(
+                channel=cfg.voice_stream_channel, text=text, timestamp=time.time(),
+            )
+        except Exception:
+            log.exception("Не удалось передать голосовую команду клипа автоклипу")
 
     async def _on_voice_transcript(self, text: str) -> None:
         if brain is None:
@@ -413,6 +473,9 @@ class ChatBot(commands.Bot):
         if cfg.moderation_enabled:
             self._submit_moderation(message, username, content)
 
+        if cfg.autoclip_enabled:
+            self._submit_autoclip(message, username, content)
+
         await self.handle_commands(message)
 
         if self._is_addressed_to_bot(content):
@@ -470,6 +533,30 @@ class ChatBot(commands.Bot):
             )
         except Exception:
             log.exception("Не удалось передать сообщение движку модерации")
+
+    def _submit_autoclip(self, message, username: str, content: str) -> None:
+        """Отдаёт сообщение автоклипу — независимый подписчик того же
+        потока чата, что и _submit_moderation выше. НЕ корутина, ничего не
+        ждёт: autoclip_hub.submit_chat_message() дёшево оценивает триггеры
+        синхронно и кладёт событие в очередь только при срабатывании
+        (см. bot/autoclip.py).
+
+        Сбой здесь никогда не должен ронять обработку сообщения ботом —
+        автоклип лишь наблюдает, а не является частью основного пути."""
+        author = message.author
+        user_id = author.id if author else None
+        if not user_id:
+            return
+
+        try:
+            autoclip_hub.submit_chat_message(
+                channel=message.channel.name if message.channel else "",
+                author_id=user_id,
+                text=content,
+                timestamp=time.time(),
+            )
+        except Exception:
+            log.exception("Не удалось передать сообщение автоклипу")
 
     def _is_addressed_to_bot(self, content: str) -> bool:
         if content.startswith("!"):

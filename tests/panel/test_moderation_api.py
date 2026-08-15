@@ -15,7 +15,9 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from cigilbot.domain.types import (
     Action,
@@ -89,8 +91,10 @@ class TestReadEndpointsRequireLogin:
 
 
 class TestClustersEndpoint:
+    # MODERATOR, не VIEWER: ники подозреваемых и risk_score — не публичная
+    # информация (2026-08-15, сужение VIEWER-доступа по итогам UX-аудита).
     async def test_empty_by_default(self, app_client: TestClient) -> None:
-        login_as(app_client, "VIEWER")
+        login_as(app_client, "MODERATOR")
         resp = app_client.get("/api/moderation/clusters")
         assert resp.status_code == 200
         assert resp.json() == []
@@ -99,7 +103,7 @@ class TestClustersEndpoint:
         self, app_client: TestClient, store: ModerationStore
     ) -> None:
         await store.save_cluster(make_cluster())
-        login_as(app_client, "VIEWER")
+        login_as(app_client, "MODERATOR")
 
         resp = app_client.get("/api/moderation/clusters")
 
@@ -114,7 +118,7 @@ class TestClustersEndpoint:
     ) -> None:
         cluster_id = await store.save_cluster(make_cluster())
         await store.set_cluster_status(cluster_id, "actioned")
-        login_as(app_client, "VIEWER")
+        login_as(app_client, "MODERATOR")
 
         resp = app_client.get("/api/moderation/clusters")
 
@@ -123,16 +127,33 @@ class TestClustersEndpoint:
     async def test_unknown_instance_db_404(
         self, app_client: TestClient, tmp_root: Path
     ) -> None:
-        # profile "other" -> mod.other.db, который никто не создавал (в
-        # отличие от profile "main"/DEFAULT_TEST_BROADCASTER_ID — БД которого
-        # создаёт фикстура db_path). Регистрация в Registry не нужна для
-        # этого теста — _db_path строит путь по broadcaster_id напрямую,
-        # без обращения к Registry (см. panel/moderation_api.py::_db_path).
-        login_as(app_client, "VIEWER")
+        # profile "other" -> mod.other.db, который никто не создавал.
+        # Канал "other" ОБЯЗАН быть в Registry (в отличие от старой версии
+        # этого теста): role_for_profile возвращает VIEWER для любого
+        # broadcaster_id, не найденного в Registry, независимо от роли в
+        # сессии — незарегистрированный канал не отличить от "прав нет" на
+        # уровне HTTP-статуса, поэтому без регистрации тест ловил бы 403
+        # раньше, чем добирался до реальной 404 по отсутствующему файлу.
+        registry = RegistryStore(str(tmp_root / "registry.db"))
+        await registry.connect()
+        await registry.upsert_channel(broadcaster_id="other", login="other_channel")
+        await registry.close()
+
+        # ADMIN, не MODERATOR: login_as проставляет MODERATOR только на
+        # DEFAULT_TEST_CHANNEL (по-канальная роль из Twitch) — канал "other"
+        # в этот словарь не попадает. ADMIN — глобальный оверрайд, который
+        # role_for_profile применяет к любому известному Registry каналу
+        # одинаково.
+        login_as(app_client, "ADMIN")
 
         resp = app_client.get("/api/moderation/clusters?profile=other")
 
         assert resp.status_code == 404
+
+    async def test_viewer_forbidden(self, app_client: TestClient) -> None:
+        login_as(app_client, "VIEWER")
+        resp = app_client.get("/api/moderation/clusters")
+        assert resp.status_code == 403
 
 
 def make_event(**overrides: object) -> ChatEvent:
@@ -148,8 +169,13 @@ class TestUsersEndpoint:
         resp = app_client.get("/api/moderation/users")
         assert resp.status_code == 401
 
-    async def test_empty_by_default(self, app_client: TestClient) -> None:
+    async def test_viewer_forbidden(self, app_client: TestClient) -> None:
         login_as(app_client, "VIEWER")
+        resp = app_client.get("/api/moderation/users")
+        assert resp.status_code == 403
+
+    async def test_empty_by_default(self, app_client: TestClient) -> None:
+        login_as(app_client, "MODERATOR")
         resp = app_client.get("/api/moderation/users")
         assert resp.status_code == 200
         assert resp.json() == []
@@ -158,7 +184,7 @@ class TestUsersEndpoint:
         self, app_client: TestClient, store: ModerationStore
     ) -> None:
         await store.upsert_user(make_event(user_id="1", login="viewer1"))
-        login_as(app_client, "VIEWER")
+        login_as(app_client, "MODERATOR")
 
         resp = app_client.get("/api/moderation/users")
 
@@ -173,7 +199,7 @@ class TestUsersEndpoint:
     ) -> None:
         await store.upsert_user(make_event(user_id="1", login="alice"))
         await store.upsert_user(make_event(user_id="2", login="bob"))
-        login_as(app_client, "VIEWER")
+        login_as(app_client, "MODERATOR")
 
         resp = app_client.get("/api/moderation/users?search=ali")
 
@@ -188,7 +214,7 @@ class TestVerdictsEndpoint:
     ) -> None:
         await store.save_verdict(make_verdict(risk_score=10))
         await store.save_verdict(make_verdict(risk_score=50))
-        login_as(app_client, "VIEWER")
+        login_as(app_client, "MODERATOR")
 
         resp = app_client.get("/api/moderation/verdicts?min_risk=30")
 
@@ -204,7 +230,7 @@ class TestVerdictsEndpoint:
             weight=25, value=1.0, evidence="test",
         )
         await store.save_verdict(make_verdict(risk_score=60, signals=(signal,)))
-        login_as(app_client, "VIEWER")
+        login_as(app_client, "MODERATOR")
 
         resp = app_client.get("/api/moderation/verdicts?min_risk=30")
 
@@ -563,7 +589,7 @@ class TestAuditEndpoint:
             details={"succeeded": ["1", "2", "3"], "failed": []},
             cluster_id=1,
         )
-        login_as(app_client, "VIEWER")
+        login_as(app_client, "MODERATOR")
 
         resp = app_client.get("/api/moderation/audit")
 
@@ -574,6 +600,11 @@ class TestAuditEndpoint:
         assert data[0]["actor_role"] == "MODERATOR"
         assert data[0]["succeeded"] == 3
         assert data[0]["details"]["succeeded"] == ["1", "2", "3"]
+
+    async def test_viewer_forbidden(self, app_client: TestClient) -> None:
+        login_as(app_client, "VIEWER")
+        resp = app_client.get("/api/moderation/audit")
+        assert resp.status_code == 403
 
 
 class TestTrustedUsersEndpoints:
@@ -643,7 +674,7 @@ class TestTrustedUsersEndpoints:
     ) -> None:
         await store.upsert_user(make_event(user_id="1", login="viewer1"))
         await store.mark_trusted("1", added_by="mod1", reason="regular")
-        login_as(app_client, "VIEWER")
+        login_as(app_client, "MODERATOR")
 
         resp = app_client.get("/api/moderation/trusted")
 
@@ -652,6 +683,11 @@ class TestTrustedUsersEndpoints:
         assert len(data) == 1
         assert data[0]["user_id"] == "1"
         assert data[0]["login"] == "viewer1"
+
+    async def test_list_trusted_viewer_forbidden(self, app_client: TestClient) -> None:
+        login_as(app_client, "VIEWER")
+        resp = app_client.get("/api/moderation/trusted")
+        assert resp.status_code == 403
 
 
 class TestPatternsEndpoints:
@@ -1103,12 +1139,17 @@ class TestFeedbackEndpoints:
         await store.record_feedback(
             signal_name="exact_duplicate", moderator="mod1", decision="CONFIRMED_BOT"
         )
-        login_as(app_client, "VIEWER")
+        login_as(app_client, "MODERATOR")
 
         resp = app_client.get("/api/moderation/feedback")
 
         assert resp.status_code == 200
         assert len(resp.json()) == 1
+
+    async def test_list_viewer_forbidden(self, app_client: TestClient) -> None:
+        login_as(app_client, "VIEWER")
+        resp = app_client.get("/api/moderation/feedback")
+        assert resp.status_code == 403
 
 
 class TestDailyStatsEndpoint:
@@ -1206,9 +1247,17 @@ class TestConfigEndpoints:
         resp = app_client.get("/api/moderation/config")
         assert resp.status_code == 401
 
+    async def test_get_requires_moderator(self, app_client: TestClient) -> None:
+        # MEDIUM #12 (security-аудит 2026-08-15): раньше был защищён только
+        # require_authenticated, без минимальной роли — любой VIEWER мог
+        # прочитать веса/пороги детекторов. Теперь требует MODERATOR+.
+        login_as(app_client, "VIEWER")
+        resp = app_client.get("/api/moderation/config")
+        assert resp.status_code == 403
+
     async def test_get_404_when_no_config_file(self, app_client: TestClient) -> None:
         # tmp_root не создаёт config/moderation.yml сам по себе.
-        login_as(app_client, "VIEWER")
+        login_as(app_client, "MODERATOR")
         resp = app_client.get("/api/moderation/config")
         assert resp.status_code == 404
 
@@ -1221,7 +1270,7 @@ class TestConfigEndpoints:
             "version: 1\nmode: AGGRESSIVE\nrisk_thresholds: {observe: 20, timeout: 50, ban: 90}\n",
             encoding="utf-8",
         )
-        login_as(app_client, "VIEWER")
+        login_as(app_client, "MODERATOR")
 
         resp = app_client.get("/api/moderation/config")
 
@@ -1237,7 +1286,7 @@ class TestConfigEndpoints:
         config_dir = tmp_root / "config"
         config_dir.mkdir()
         (config_dir / "moderation.yml").write_text("mode: NOT_A_REAL_MODE\n", encoding="utf-8")
-        login_as(app_client, "VIEWER")
+        login_as(app_client, "MODERATOR")
 
         resp = app_client.get("/api/moderation/config")
 
@@ -1316,8 +1365,22 @@ class TestWebSocket:
             raised = True
         assert raised
 
-    def test_sends_snapshot_after_login(self, app_client: TestClient) -> None:
+    def test_rejects_viewer(self, app_client: TestClient) -> None:
+        # MODERATOR, не VIEWER: clusters/verdicts — личные данные
+        # (2026-08-15, тот же порог, что REST GET /clusters, /verdicts).
+        # Соединение принимается (accept() до проверки роли — сервер сперва
+        # ждёт первое сообщение с profile), поэтому сама with-обвязка не
+        # падает; закрытие видно только по коду при попытке отправить
+        # сообщение или получить ответ.
         login_as(app_client, "VIEWER")
+        with app_client.websocket_connect("/api/moderation/ws") as ws:
+            ws.send_text("main")
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                ws.receive_json()
+        assert exc_info.value.code == 4403
+
+    def test_sends_snapshot_after_login(self, app_client: TestClient) -> None:
+        login_as(app_client, "MODERATOR")
         with app_client.websocket_connect("/api/moderation/ws") as ws:
             ws.send_text("main")
             data = ws.receive_json()
@@ -1339,8 +1402,16 @@ class TestContentWebSocket:
             raised = True
         assert raised
 
-    def test_sends_empty_snapshot_by_default(self, app_client: TestClient) -> None:
+    def test_rejects_viewer(self, app_client: TestClient) -> None:
         login_as(app_client, "VIEWER")
+        with app_client.websocket_connect("/api/moderation/content_ws") as ws:
+            ws.send_text("main")
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                ws.receive_json()
+        assert exc_info.value.code == 4403
+
+    def test_sends_empty_snapshot_by_default(self, app_client: TestClient) -> None:
+        login_as(app_client, "MODERATOR")
         with app_client.websocket_connect("/api/moderation/content_ws") as ws:
             ws.send_text("main")
             data = ws.receive_json()
@@ -1357,7 +1428,7 @@ class TestContentWebSocket:
             blocked_by="content_moderation_disabled", enforced=False,
         )
 
-        login_as(app_client, "VIEWER")
+        login_as(app_client, "MODERATOR")
         with app_client.websocket_connect("/api/moderation/content_ws") as ws:
             ws.send_text("main")
             data = ws.receive_json()

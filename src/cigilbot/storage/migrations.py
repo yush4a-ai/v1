@@ -418,6 +418,108 @@ ALTER TABLE mod_content_events ADD COLUMN manual_action_by TEXT;
 ALTER TABLE mod_content_events ADD COLUMN manual_action_at REAL;
 """
 
+# Переключатель автоклипа канала из панели (bot/autoclip.py), без рестарта
+# бота — тот же singleton-паттерн, что mod_content_settings (миграция 014).
+# enabled здесь ПОВЕРХ, а не ВМЕСТО autoclip.enabled в
+# config/channels/<канал>.yml: YAML остаётся дефолтом при первом включении
+# канала, эта таблица — быстрый живой рубильник поверх него, который
+# AutoclipHub перечитывает в своём reconcile-цикле. NULL/нет строки —
+# "явного решения через панель не было", тогда используется значение из
+# YAML, а не жёстко закодированный дефолт здесь.
+_MIGRATION_017_AUTOCLIP_SETTINGS = """
+CREATE TABLE IF NOT EXISTS mod_autoclip_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled INTEGER NOT NULL,
+    updated_by TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+"""
+
+# Живые пороги трёх триггеров (bot/autoclip.py) поверх той же таблицы, что
+# миграция 017 завела для enabled — расширяет её, а не заводит отдельную,
+# потому что смысл один и тот же ("настройка автоклипа канала из панели",
+# singleton-строка id=1). NULL в любом новом поле — тот же принцип, что и у
+# enabled: "панель не трогала этот параметр", используется YAML.
+#
+# enabled тоже становится NULL-допустимым (пересоздание таблицы — SQLite не
+# умеет снимать NOT NULL через plain ALTER TABLE): строка теперь может
+# существовать только из-за set_autoclip_thresholds (пороги настроены
+# раньше, чем канал явно включили переключателем), и такая запись не
+# должна интерпретироваться как "панель решила выключить канал". Различать
+# два случая колонкой-флагом (enabled_explicit) было бы дублированием
+# смысла, который NULL уже выражает сам по себе.
+#
+# keyword_phrases/voice_phrases — JSON-массив строк (json.dumps/json.loads,
+# тот же приём, что required_signal_names в mod_patterns) — список
+# переменной длины плохо ложится в отдельные колонки постоянного числа.
+_MIGRATION_018_AUTOCLIP_THRESHOLDS = """
+CREATE TABLE mod_autoclip_settings_new (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled INTEGER,
+    updated_by TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    burst_unique_authors_threshold INTEGER,
+    burst_window_seconds REAL,
+    keyword_phrases TEXT,
+    voice_phrases TEXT,
+    cooldown_seconds REAL
+);
+INSERT INTO mod_autoclip_settings_new (id, enabled, updated_by, updated_at)
+    SELECT id, enabled, updated_by, updated_at FROM mod_autoclip_settings;
+DROP TABLE mod_autoclip_settings;
+ALTER TABLE mod_autoclip_settings_new RENAME TO mod_autoclip_settings;
+"""
+
+# Авто-подстройка порога всплеска под текущее число зрителей канала
+# (bot/autoclip.py, HelixClient.get_streams) — та же таблица, что пороги
+# (миграция 018): singleton-строка "настройки автоклипа канала из панели".
+# Все новые поля NULL-допустимы без NOT NULL, поэтому, в отличие от
+# миграции 018, простой ADD COLUMN достаточен — пересоздавать таблицу не
+# нужно. last_viewer_count — кэш последнего успешного опроса Twitch
+# (AutoclipHub._poll_viewer_counts пишет сюда), чтобы панель могла
+# показать реальное текущее вычисленное значение порога, а не только сам
+# факт "авто-режим включён", даже между опросами.
+_MIGRATION_019_AUTOCLIP_AUTO_SCALE = """
+ALTER TABLE mod_autoclip_settings ADD COLUMN burst_auto_scale_enabled INTEGER;
+ALTER TABLE mod_autoclip_settings ADD COLUMN burst_auto_scale_percent REAL;
+ALTER TABLE mod_autoclip_settings ADD COLUMN burst_auto_scale_min INTEGER;
+ALTER TABLE mod_autoclip_settings ADD COLUMN burst_auto_scale_max INTEGER;
+ALTER TABLE mod_autoclip_settings ADD COLUMN last_viewer_count INTEGER;
+ALTER TABLE mod_autoclip_settings ADD COLUMN last_viewer_count_at REAL;
+"""
+
+# Токен для клиппинга (TWITCH_CLIP_*, scope clips:edit) — per-channel, не в
+# .env. Причина: Twitch Helix POST /helix/clips принимает только токен,
+# принадлежащий реальному broadcaster'у/модератору/редактору ИМЕННО ЭТОГО
+# канала — общий на весь бот .env-токен (как было раньше) работает только
+# для того одного канала, на который он выпущен, и молча проваливает клипы
+# на остальных (см. инцидент: paverpapa не получал клипов, потому что
+# TWITCH_CLIP_* в .env был выпущен от dobriy_yura). Тот же singleton-приём,
+# что и mod_autoclip_settings/mod_content_settings — id=1, broadcaster_id не
+# хранится в строке, эту роль играет сам файл mod.<broadcaster_id>.db.
+# Отдельная таблица, не расширение mod_autoclip_settings: секреты — не то
+# же самое, что пороги, разная таблица снижает риск случайно захватить
+# токен вместе с остальными настройками при отладке/дампе.
+_MIGRATION_020_CLIP_TOKEN = """
+CREATE TABLE IF NOT EXISTS mod_clip_token (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    access_token TEXT NOT NULL,
+    refresh_token TEXT NOT NULL,
+    user_login TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+"""
+
+# Twitch Helix POST /clips не принимает ни длительность, ни сдвиг назад —
+# сам решает окно клипа относительно момента вызова API. capture_delay_
+# seconds придерживает вызов create_clip() после срабатывания триггера,
+# чтобы момент реакции стримера оказался ближе к концу окна, а не к началу
+# (см. bot/autoclip.py::ChannelAutoclip._create_clip).
+_MIGRATION_021_AUTOCLIP_CAPTURE_DELAY = """
+ALTER TABLE mod_autoclip_settings ADD COLUMN capture_delay_seconds REAL;
+"""
+
 MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, _MIGRATION_001_CORE_AUDIT),
     (2, _MIGRATION_002_ACTIONS),
@@ -435,6 +537,11 @@ MIGRATIONS: tuple[tuple[int, str], ...] = (
     (14, _MIGRATION_014_CONTENT_RULES),
     (15, _MIGRATION_015_TWITCH_MESSAGE_ID),
     (16, _MIGRATION_016_MANUAL_ACTION_MARK),
+    (17, _MIGRATION_017_AUTOCLIP_SETTINGS),
+    (18, _MIGRATION_018_AUTOCLIP_THRESHOLDS),
+    (19, _MIGRATION_019_AUTOCLIP_AUTO_SCALE),
+    (20, _MIGRATION_020_CLIP_TOKEN),
+    (21, _MIGRATION_021_AUTOCLIP_CAPTURE_DELAY),
 )
 
 

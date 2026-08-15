@@ -1,0 +1,32 @@
+# Автоклип включён с дефолтными порогами (см. config/channels/example.yml
+# для описания полей). Подстройте window_seconds/unique_authors_threshold,
+# если триггер срабатывает слишком часто/редко для размера чата этого канала.
+autoclip:
+  enabled: true
+  cooldown_seconds: 300
+
+  burst:
+    enabled: true
+    window_seconds: 20
+    unique_authors_threshold: 12
+
+  keyword:
+    enabled: true
+    phrases:
+      - "клип это"
+      - "клип"
+      - "клипаните"
+      - "клипайте"
+      - "clip it"
+      - "clip that"
+
+  voice:
+    enabled: true
+    phrases:
+      - "клип это"
+      - "клип"
+      - "заклипай"
+      - "клипаните"
+      - "клипайте"
+      - "clip it"
+      - "clip that"

@@ -40,6 +40,7 @@ class Config:
     personality: str
     instance: str
     moderation_enabled: bool
+    autoclip_enabled: bool
 
     @property
     def db_path(self) -> str:
@@ -111,4 +112,9 @@ def load_config() -> Config:
         # наблюдает и пишет вердикты в БД, но ничего не делает в чате.
         # Выбор SIMULATION/SHADOW/LIVE и авто-действия появятся на этапе 7-9.
         moderation_enabled=os.environ.get("MODERATION_ENABLED", "true").lower() == "true",
+        # Выключено по умолчанию — в отличие от moderation_enabled: клипы
+        # видны зрителям и создаются от лица настроенного Twitch-аккаунта,
+        # включать стоит осознанно, после подбора порогов в
+        # config/channels/<канал>.yml (см. bot/autoclip_config.py).
+        autoclip_enabled=os.environ.get("AUTOCLIP_ENABLED", "false").lower() == "true",
     )

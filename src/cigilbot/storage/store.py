@@ -130,6 +130,81 @@ class ContentSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class AutoclipSettings:
+    """Живые настройки автоклипа канала (bot/autoclip.py) поверх
+    config/channels/<канал>.yml — панель пишет сюда, AutoclipHub перечитывает
+    в своём reconcile-цикле без рестарта бота (см. миграцию 017).
+
+    Каждое поле независимо: None означает "по этому параметру через панель
+    явного решения ещё не было" — вызывающий код (AutoclipHub) в этом
+    случае падает обратно на значение из YAML для конкретно этого поля, а
+    не считает весь канал молчаливо выключенным/сброшенным на дефолт."""
+
+    enabled: bool | None
+    updated_by: str
+    updated_at: float
+    burst_unique_authors_threshold: int | None = None
+    burst_window_seconds: float | None = None
+    keyword_phrases: tuple[str, ...] | None = None
+    voice_phrases: tuple[str, ...] | None = None
+    cooldown_seconds: float | None = None
+    # Twitch сам решает окно клипа относительно момента вызова API — эта
+    # пауза сдвигает вызов create_clip() назад, чтобы момент реакции
+    # стримера оказался ближе к концу окна, а не к началу (см.
+    # bot/autoclip.py::ChannelAutoclip._create_clip).
+    capture_delay_seconds: float | None = None
+    # Авто-подстройка порога всплеска под текущее число зрителей (см.
+    # AutoclipHub._poll_viewer_counts) — независима от
+    # burst_unique_authors_threshold: включённый авто-режим ИГНОРИРУЕТ
+    # ручной порог, а не комбинирует их (см. bot/autoclip.py::_merge_config).
+    burst_auto_scale_enabled: bool | None = None
+    burst_auto_scale_percent: float | None = None
+    burst_auto_scale_min: int | None = None
+    burst_auto_scale_max: int | None = None
+    # Кэш последнего успешного опроса Twitch — не элемент настройки, а
+    # наблюдаемое состояние, но живёт в той же строке: панели нужно
+    # показать реальное текущее значение порога, а не только факт "авто
+    # включён", даже в промежутке между опросами.
+    last_viewer_count: int | None = None
+    last_viewer_count_at: float | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "enabled": self.enabled,
+            "updated_by": self.updated_by,
+            "updated_at": self.updated_at,
+            "burst_unique_authors_threshold": self.burst_unique_authors_threshold,
+            "burst_window_seconds": self.burst_window_seconds,
+            "keyword_phrases": list(self.keyword_phrases) if self.keyword_phrases is not None else None,
+            "voice_phrases": list(self.voice_phrases) if self.voice_phrases is not None else None,
+            "cooldown_seconds": self.cooldown_seconds,
+            "capture_delay_seconds": self.capture_delay_seconds,
+            "burst_auto_scale_enabled": self.burst_auto_scale_enabled,
+            "burst_auto_scale_percent": self.burst_auto_scale_percent,
+            "burst_auto_scale_min": self.burst_auto_scale_min,
+            "burst_auto_scale_max": self.burst_auto_scale_max,
+            "last_viewer_count": self.last_viewer_count,
+            "last_viewer_count_at": self.last_viewer_count_at,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ClipToken:
+    """Токен для создания клипов (bot/autoclip.py, TWITCH_CLIP_* scope
+    clips:edit), одна строка на канал (см. миграцию 020). Раньше жил одним
+    общим набором в .env — сломалось на канале, для которого токен не был
+    выпущен (Twitch привязывает право клипать к конкретному broadcaster_id).
+    broadcaster_id не хранится в самой строке — эту роль уже играет файл
+    mod.<broadcaster_id>.db, в котором лежит эта таблица."""
+
+    access_token: str
+    refresh_token: str
+    user_login: str
+    user_id: str
+    updated_at: float
+
+
+@dataclass(frozen=True, slots=True)
 class DiscordWebhookConfig:
     """Discord-webhook канала (направление 01 master-plan.html) — тот же
     singleton-паттерн, что AttackModeStatus: одна строка на БД, одна БД на
@@ -267,6 +342,14 @@ class ModerationStore:
         # весь журнал целиком, а дописывает в конец — заметно дешевле при
         # частых мелких записях (вердикт на каждое сообщение чата).
         await self._conn.execute("PRAGMA journal_mode=WAL")
+        # Без busy_timeout конкурентный писатель получает немедленный
+        # sqlite3.OperationalError: database is locked вместо короткого
+        # ожидания — mod.<broadcaster_id>.db пишется и ботом (движок,
+        # executor, автоклип), и панелью (Attack Mode, Pattern Library,
+        # autoclip settings, clip-token OAuth callback) одновременно, тот
+        # же риск, что уже закрыт в registry_store.py/fingerprints_store.py
+        # (bug-аудит 2026-08-15, HIGH #6).
+        await self._conn.execute("PRAGMA busy_timeout=5000")
         await migrate(self._conn)
 
     async def close(self) -> None:
@@ -711,7 +794,15 @@ class ModerationStore:
     ) -> list[dict[str, Any]]:
         """Лента подозрительных вердиктов для экрана Live — не всё подряд
         (каждое сообщение чата даёт вердикт), а только risk_score выше
-        порога, иначе лента захлёстывает обычной перепиской."""
+        порога, иначе лента захлёстывает обычной перепиской.
+
+        Доверенные пользователи (mod_trusted) и вердикты, уже разобранные
+        модератором как "это бот" (mod_feedback.decision=CONFIRMED_BOT),
+        исключены здесь, а не только на клиенте — раньше панель прятала их
+        только через client-side dismissedVerdictIds (живёт до перезагрузки
+        вкладки), и после F5 они снова появлялись в ленте: вердикты в БД
+        никуда не деваются (аудит), но разобранные модератором не должны
+        продолжать засорять ленту подозрительных на каждой перезагрузке."""
         self._db.row_factory = aiosqlite.Row
         cursor = await self._db.execute(
             """
@@ -721,6 +812,11 @@ class ModerationStore:
             FROM mod_verdicts v
             LEFT JOIN mod_messages m ON m.id = v.message_id
             WHERE v.risk_score >= ?
+              AND v.user_id NOT IN (SELECT user_id FROM mod_trusted)
+              AND v.id NOT IN (
+                  SELECT verdict_id FROM mod_feedback
+                  WHERE decision = 'CONFIRMED_BOT' AND verdict_id IS NOT NULL
+              )
             ORDER BY v.created_at DESC
             LIMIT ?
             """,
@@ -1430,6 +1526,207 @@ class ModerationStore:
                 updated_at = excluded.updated_at
             """,
             (int(enabled), updated_by, now),
+        )
+        await self._db.commit()
+
+    async def get_autoclip_settings(self) -> AutoclipSettings:
+        """None в любом поле — по этому параметру строки/значения нет,
+        живой рубильник не должен подменять собой дефолт из YAML для
+        конкретно этого поля (см. AutoclipSettings)."""
+        cursor = await self._db.execute(
+            """
+            SELECT enabled, updated_by, updated_at, burst_unique_authors_threshold,
+                   burst_window_seconds, keyword_phrases, voice_phrases, cooldown_seconds,
+                   capture_delay_seconds,
+                   burst_auto_scale_enabled, burst_auto_scale_percent, burst_auto_scale_min,
+                   burst_auto_scale_max, last_viewer_count, last_viewer_count_at
+            FROM mod_autoclip_settings WHERE id = 1
+            """
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return AutoclipSettings(enabled=None, updated_by="", updated_at=0.0)
+        (
+            enabled, updated_by, updated_at, burst_threshold, burst_window,
+            keyword_json, voice_json, cooldown_seconds, capture_delay_seconds,
+            auto_scale_enabled, auto_scale_percent, auto_scale_min, auto_scale_max,
+            last_viewer_count, last_viewer_count_at,
+        ) = row
+        return AutoclipSettings(
+            enabled=None if enabled is None else bool(enabled),
+            updated_by=updated_by,
+            updated_at=updated_at,
+            burst_unique_authors_threshold=burst_threshold,
+            burst_window_seconds=burst_window,
+            keyword_phrases=tuple(json.loads(keyword_json)) if keyword_json is not None else None,
+            voice_phrases=tuple(json.loads(voice_json)) if voice_json is not None else None,
+            cooldown_seconds=cooldown_seconds,
+            capture_delay_seconds=capture_delay_seconds,
+            burst_auto_scale_enabled=None if auto_scale_enabled is None else bool(auto_scale_enabled),
+            burst_auto_scale_percent=auto_scale_percent,
+            burst_auto_scale_min=auto_scale_min,
+            burst_auto_scale_max=auto_scale_max,
+            last_viewer_count=last_viewer_count,
+            last_viewer_count_at=last_viewer_count_at,
+        )
+
+    async def set_autoclip_enabled(self, enabled: bool, *, updated_by: str) -> None:
+        """Меняет только enabled — пороги (burst/keyword/voice/cooldown),
+        если уже настроены через set_autoclip_thresholds, остаются как
+        есть (ON CONFLICT не трогает эти колонки)."""
+        now = time.time()
+        await self._db.execute(
+            """
+            INSERT INTO mod_autoclip_settings (id, enabled, updated_by, updated_at)
+            VALUES (1, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                enabled = excluded.enabled,
+                updated_by = excluded.updated_by,
+                updated_at = excluded.updated_at
+            """,
+            (int(enabled), updated_by, now),
+        )
+        await self._db.commit()
+
+    async def set_autoclip_thresholds(
+        self,
+        *,
+        burst_unique_authors_threshold: int | None,
+        burst_window_seconds: float | None,
+        keyword_phrases: tuple[str, ...] | None,
+        voice_phrases: tuple[str, ...] | None,
+        cooldown_seconds: float | None,
+        updated_by: str,
+        capture_delay_seconds: float | None = None,
+    ) -> None:
+        """Меняет только пороги — enabled НЕ трогается ни при создании
+        строки (остаётся NULL — "явного решения о вкл/выкл через панель не
+        было", не False: настройка порогов сама по себе не должна ни
+        включать, ни выключать канал), ни при обновлении (ON CONFLICT не
+        упоминает enabled вовсе, в отличие от set_autoclip_enabled)."""
+        now = time.time()
+        await self._db.execute(
+            """
+            INSERT INTO mod_autoclip_settings (
+                id, enabled, updated_by, updated_at, burst_unique_authors_threshold,
+                burst_window_seconds, keyword_phrases, voice_phrases, cooldown_seconds,
+                capture_delay_seconds
+            )
+            VALUES (1, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                updated_by = excluded.updated_by,
+                updated_at = excluded.updated_at,
+                burst_unique_authors_threshold = excluded.burst_unique_authors_threshold,
+                burst_window_seconds = excluded.burst_window_seconds,
+                keyword_phrases = excluded.keyword_phrases,
+                voice_phrases = excluded.voice_phrases,
+                cooldown_seconds = excluded.cooldown_seconds,
+                capture_delay_seconds = excluded.capture_delay_seconds
+            """,
+            (
+                updated_by, now, burst_unique_authors_threshold, burst_window_seconds,
+                json.dumps(list(keyword_phrases)) if keyword_phrases is not None else None,
+                json.dumps(list(voice_phrases)) if voice_phrases is not None else None,
+                cooldown_seconds, capture_delay_seconds,
+            ),
+        )
+        await self._db.commit()
+
+    async def set_autoclip_auto_scale(
+        self,
+        *,
+        enabled: bool,
+        percent: float | None,
+        minimum: int | None,
+        maximum: int | None,
+        updated_by: str,
+    ) -> None:
+        """Отдельный метод от set_autoclip_thresholds: включение авто-режима
+        не должно требовать одновременной передачи ручных порогов и
+        наоборот — те же независимые ON CONFLICT-колонки, что у
+        set_autoclip_enabled/set_autoclip_thresholds."""
+        now = time.time()
+        await self._db.execute(
+            """
+            INSERT INTO mod_autoclip_settings (
+                id, updated_by, updated_at, burst_auto_scale_enabled,
+                burst_auto_scale_percent, burst_auto_scale_min, burst_auto_scale_max
+            )
+            VALUES (1, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                updated_by = excluded.updated_by,
+                updated_at = excluded.updated_at,
+                burst_auto_scale_enabled = excluded.burst_auto_scale_enabled,
+                burst_auto_scale_percent = excluded.burst_auto_scale_percent,
+                burst_auto_scale_min = excluded.burst_auto_scale_min,
+                burst_auto_scale_max = excluded.burst_auto_scale_max
+            """,
+            (updated_by, now, int(enabled), percent, minimum, maximum),
+        )
+        await self._db.commit()
+
+    async def update_autoclip_viewer_count(self, viewer_count: int) -> None:
+        """Пишет AutoclipHub._poll_viewer_counts после каждого успешного
+        опроса Twitch — если строки ещё нет (канал ни разу не настраивали
+        через панель), тихо ничего не делает: кэш viewer count нужен только
+        для отображения в уже существующей настройке, заводить строку ради
+        него одного бессмысленно."""
+        await self._db.execute(
+            "UPDATE mod_autoclip_settings SET last_viewer_count = ?, last_viewer_count_at = ? WHERE id = 1",
+            (viewer_count, time.time()),
+        )
+        await self._db.commit()
+
+    async def get_clip_token(self) -> ClipToken | None:
+        """None — на этом канале ещё не проходили /auth/clip/login (панель,
+        экран Автоклип). Вызывающий код (ClipTokenManager) должен явно
+        решить, что делать при отсутствии токена, а не получить
+        непонятный 401 от Helix."""
+        cursor = await self._db.execute(
+            "SELECT access_token, refresh_token, user_login, user_id, updated_at FROM mod_clip_token WHERE id = 1"
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        access_token, refresh_token, user_login, user_id, updated_at = row
+        return ClipToken(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            user_login=user_login,
+            user_id=user_id,
+            updated_at=updated_at,
+        )
+
+    async def set_clip_token(
+        self, *, access_token: str, refresh_token: str, user_login: str, user_id: str
+    ) -> None:
+        """Пишет полную строку — вызывается только из OAuth-коллбэка
+        (panel/auth.py::_process_clip_callback), где известны все поля
+        разом. Для одиночного обновления access/refresh при lazy-refresh
+        см. update_clip_access_token — тот не трогает user_login/user_id."""
+        now = time.time()
+        await self._db.execute(
+            """
+            INSERT INTO mod_clip_token (id, access_token, refresh_token, user_login, user_id, updated_at)
+            VALUES (1, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                access_token = excluded.access_token,
+                refresh_token = excluded.refresh_token,
+                user_login = excluded.user_login,
+                user_id = excluded.user_id,
+                updated_at = excluded.updated_at
+            """,
+            (access_token, refresh_token, user_login, user_id, now),
+        )
+        await self._db.commit()
+
+    async def update_clip_access_token(self, *, access_token: str, refresh_token: str) -> None:
+        """Пишет ClipTokenManager._refresh после каждого обновления по
+        истечении срока — не трогает user_login/user_id (владелец токена не
+        меняется при обновлении, только сам токен)."""
+        await self._db.execute(
+            "UPDATE mod_clip_token SET access_token = ?, refresh_token = ?, updated_at = ? WHERE id = 1",
+            (access_token, refresh_token, time.time()),
         )
         await self._db.commit()
 

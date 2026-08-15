@@ -183,15 +183,29 @@ class ActionExecutor:
             user_token=self._user_token,
         )
         if result.success and self._fingerprint_store is not None:
-            state = await self._store.get_user_state(user_id)
-            login = state.login if state is not None else user_id
-            await self._fingerprint_store.record_ban(
-                user_id=user_id,
-                login=login,
-                banned_on_broadcaster_id=self._broadcaster_id,
-                banned_on_login=self._channel_login,
-                reason=reason,
-            )
+            # Бан на Twitch УЖЕ состоялся и необратим к этому моменту — сбой
+            # здесь (например, SQLite locked без busy_timeout) не должен
+            # превращать успешный бан в ActionResult(success=False):
+            # _run_per_target записал бы цель в failed, хотя реального
+            # провала действия не было, только потеря fingerprint-записи
+            # (bug-аудит 2026-08-15, MEDIUM #10 — тот же принцип, что
+            # CLAUDE.md уже требует для модерации: потеря вспомогательной
+            # записи не должна маскировать состоявшееся действие).
+            try:
+                state = await self._store.get_user_state(user_id)
+                login = state.login if state is not None else user_id
+                await self._fingerprint_store.record_ban(
+                    user_id=user_id,
+                    login=login,
+                    banned_on_broadcaster_id=self._broadcaster_id,
+                    banned_on_login=self._channel_login,
+                    reason=reason,
+                )
+            except Exception:
+                log.exception(
+                    "Бан user_id=%s состоялся, но запись в fingerprint_store не удалась",
+                    user_id,
+                )
         return result
 
     async def _timeout_one(
@@ -278,11 +292,25 @@ class ActionExecutor:
         total = len(ids)
 
         for i, target_id in enumerate(ids):
-            result = await call(target_id)
-            if result.success:
-                succeeded.append(target_id)
+            try:
+                result = await call(target_id)
+            except Exception as exc:
+                # Без этого try/except необработанное исключение (например,
+                # в _ban_one — сам бан на Twitch УЖЕ прошёл успешно, но
+                # последующий self._store.get_user_state/record_ban упал)
+                # всплывает из process_pending, всё задание целиком
+                # помечается status="failed", а record_action_audit для уже
+                # состоявшихся реальных банов не вызывается вовсе — аудит
+                # теряет их безвозвратно (bug-аудит 2026-08-15, MEDIUM #10).
+                # Здесь сбой одной цели не должен прерывать оставшиеся и не
+                # должен стирать уже собранные succeeded/failed.
+                log.exception("Сбой обработки цели %s в задании", target_id)
+                failed.append((target_id, str(exc)))
             else:
-                failed.append((target_id, result.error))
+                if result.success:
+                    succeeded.append(target_id)
+                else:
+                    failed.append((target_id, result.error))
 
             if queue_id is not None:
                 await self._store.update_action_progress(queue_id, i + 1, total)

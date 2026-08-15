@@ -31,7 +31,7 @@ from pathlib import Path
 
 import httpx
 import streamlink
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -45,7 +45,17 @@ import paths
 from bot.twitch_helix import HelixResolveError, HelixResolver
 from cigilbot.storage.registry_store import RegistryStore
 from panel.auth import require_role_min
-from paths import BOT_VAR, ENV_FILE, MAIN_PROFILE, PROMPTS_DIR, REGISTRY_DB, REPO_ROOT, VENV_PYTHON
+from panel.rate_limit import limiter
+from paths import (
+    BOT_VAR,
+    ENV_FILE,
+    MAIN_PROFILE,
+    PROMPTS_DIR,
+    REGISTRY_DB,
+    REPO_ROOT,
+    VENV_PYTHON,
+    safe_segment,
+)
 
 log = logging.getLogger("panel.bots")
 
@@ -132,6 +142,15 @@ async def fetch_channel_live(channel: str) -> dict:
     return {"channel": channel, "live": live}
 
 
+class StartStopRequest(BaseModel):
+    profile: str = MAIN_PROFILE
+
+
+class SwitchChannelRequest(BaseModel):
+    profile: str
+    channel: str
+
+
 class SavePromptRequest(BaseModel):
     name: str
     personality: str
@@ -185,10 +204,15 @@ def _env_file_for(profile: str) -> Path:
     """Профиль "main" читается из КОРНЕВОГО .env монорепо, не из
     .env — после слияния панелей общий конфиг живёт в
     одном файле на весь репозиторий (см. panel/paths.py). Остальные
-    профили остались рядом с main.py, как и были."""
+    профили остались рядом с main.py, как и были.
+
+    safe_segment() — защита от path traversal через profile: без неё
+    profile="../../secret" читал/писал произвольный файл на диске
+    (в отличие от cigilbot-стороны, paths.mod_db(), эта защита здесь
+    отсутствовала до находки в security-аудите 2026-08-15)."""
     if profile == MAIN_PROFILE:
         return ENV_FILE
-    return ROOT / f".env.{profile}"
+    return ROOT / f".env.{safe_segment(profile)}"
 
 
 def list_profiles() -> list[str]:
@@ -196,7 +220,10 @@ def list_profiles() -> list[str]:
     if ENV_FILE.exists():
         profiles.append(MAIN_PROFILE)
     for p in sorted(ROOT.glob(".env.*")):
-        if p.name == ".env.example":
+        # .env.example — шаблон, не профиль. .env.backup-* — ручные копии
+        # .env (например перед рискованной правкой), не боты: были ошибочно
+        # видны в сайдбаре как отдельный "бот" под именем backup-<дата>.
+        if p.name == ".env.example" or p.name.startswith(".env.backup"):
             continue
         profiles.append(p.name.removeprefix(".env."))
     return profiles
@@ -250,21 +277,11 @@ def read_env(profile: str) -> dict[str, str]:
 
 
 def write_env_values(profile: str, updates: dict[str, str]) -> None:
-    env_file = _env_file_for(profile)
-    lines = env_file.read_text(encoding="utf-8").splitlines()
-    seen = set()
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key = stripped.split("=", 1)[0].strip()
-        if key in updates:
-            lines[i] = f"{key}={updates[key]}"
-            seen.add(key)
-    for key, value in updates.items():
-        if key not in seen:
-            lines.append(f"{key}={value}")
-    env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # paths.write_env_values() — единая реализация вместо трёх независимых
+    # копий (была тут, в panel/auth.py и cigilbot/integrations/mod_token.py),
+    # которые могли гоняться друг с другом при параллельной записи одного
+    # .env (bug-аудит 2026-08-15, HIGH #4).
+    paths.write_env_values(_env_file_for(profile), updates)
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +294,7 @@ def write_env_values(profile: str, updates: dict[str, str]) -> None:
 def _pid_file(profile: str, kind: str) -> Path:
     if profile == MAIN_PROFILE:
         return VAR / "run" / f"{kind}.pid"
-    return VAR / "run" / f"{kind}.{profile}.pid"
+    return VAR / "run" / f"{kind}.{safe_segment(profile)}.pid"
 
 
 def _read_pid(path: Path) -> int | None:
@@ -335,7 +352,13 @@ def _pid_lock(pid_file: Path):
             break
         except FileExistsError:
             with contextlib.suppress(OSError):
-                if time.monotonic() - lock_path.stat().st_mtime > _LOCK_STALE_SECONDS:
+                # time.time(), не time.monotonic() — st_mtime считается по
+                # эпохе, monotonic() от произвольной точки отсчёта; их
+                # разность не значит "секунд назад" и лок никогда не
+                # считался устаревшим по этой проверке (тот же баг найден
+                # и исправлен в cigilbot/integrations/bot_process_control.py
+                # и paths.py::_env_file_lock, bug-аудит 2026-08-15, MEDIUM #13).
+                if time.time() - lock_path.stat().st_mtime > _LOCK_STALE_SECONDS:
                     lock_path.unlink(missing_ok=True)
                     continue
             if time.monotonic() >= deadline:
@@ -389,7 +412,15 @@ def _start(profile: str, script: str, pid_file: Path, log_out: Path, log_err: Pa
 
 def _instance_path(profile: str, name: str, ext: str) -> Path:
     """Тот же алгоритм имени файла, что и Config._path в bot/config.py —
-    панель должна читать ФАЙЛЫ ТОГО ЖЕ инстанса, что сейчас запущен."""
+    панель должна читать ФАЙЛЫ ТОГО ЖЕ инстанса, что сейчас запущен.
+
+    read_env(profile) уже проходит через _env_file_for(), которая
+    валидирует profile через safe_segment() — вторая проверка здесь не
+    нужна, но сам INSTANCE (из содержимого .env, не из запроса) тоже
+    подставляется в путь: он пишется только через new_profile_from_template
+    (INSTANCE=profile, тот же уже провалидированный profile) или вручную
+    оператором с доступом к файлам на диске, поэтому отдельно не
+    проверяется."""
     instance = read_env(profile).get("INSTANCE", "").strip()
     filename = f"{name}.{instance}.{ext}" if instance else f"{name}.{ext}"
     return VAR / filename
@@ -497,6 +528,15 @@ def get_profile_status(profile: str) -> dict:
         # в списке "Боты" панели (см. api_profiles) — управляются через
         # раздел "Модерация", у них нет Chat/Brain/Prompt.
         "is_moderation_only": not env.get("DEEPSEEK_API_KEY", "").strip(),
+        # Основной бот (профиль MAIN_PROFILE, живёт в корневом .env) — у него
+        # модерация (Cigilbot) и свой чат-LLM одновременно, поэтому
+        # is_moderation_only ниже не годится как признак "это тот самый
+        # флагманский бот": DEEPSEEK_API_KEY у него заполнен. is_flagship —
+        # отдельный признак чисто для сайдбара (2026-08-15, пользователь:
+        # "хочу запустить множество LLM-ботов, а cigilbot — основной, не
+        # хочу чтобы он был в одной категории с ними"). Остальные профили
+        # (.env.<profile>) — простые чат-компаньоны без модерации.
+        "is_flagship": profile == MAIN_PROFILE,
     }
 
 
@@ -691,15 +731,28 @@ async def api_add_channel(payload: dict, session: tuple[str, str] = require_role
 
 
 @router.post("/api/start")
-def api_start(profile: str = MAIN_PROFILE, session: tuple[str, str] = require_role_min("ADMIN")):
-    started = start_profile(profile)
-    return JSONResponse({"started": started, "status": get_profile_status(profile)})
+def api_start(
+    payload: StartStopRequest = StartStopRequest(),
+    session: tuple[str, str] = require_role_min("ADMIN"),
+):
+    # Тело запроса (Pydantic), не query-параметр функции — FastAPI резолвит
+    # голый `profile: str` как query-параметр на POST, и такой запрос можно
+    # отправить обычной HTML-формой без JS (Content-Type: application/
+    # x-www-form-urlencoded, не application/json), т.е. cross-site без
+    # чтения ответа. SameSite=Lax сейчас блокирует это на практике, но это
+    # была единственная линия защиты, без CSRF-токена (security-аудит
+    # 2026-08-15, MEDIUM #14). JSON-body такой форме недоступен.
+    started = start_profile(payload.profile)
+    return JSONResponse({"started": started, "status": get_profile_status(payload.profile)})
 
 
 @router.post("/api/stop")
-def api_stop(profile: str = MAIN_PROFILE, session: tuple[str, str] = require_role_min("ADMIN")):
-    stop_profile(profile)
-    return JSONResponse({"status": get_profile_status(profile)})
+def api_stop(
+    payload: StartStopRequest = StartStopRequest(),
+    session: tuple[str, str] = require_role_min("ADMIN"),
+):
+    stop_profile(payload.profile)
+    return JSONResponse({"status": get_profile_status(payload.profile)})
 
 
 def _load_channel_history() -> list[str]:
@@ -720,7 +773,7 @@ def _remember_channel(channel: str) -> None:
 
 
 def _prompt_history_file(profile: str) -> Path:
-    return PROMPT_HISTORY_DIR / f"{profile}.json"
+    return PROMPT_HISTORY_DIR / f"{safe_segment(profile)}.json"
 
 
 def _load_prompt_history(profile: str) -> list[dict]:
@@ -763,9 +816,12 @@ def api_channel_history(session: tuple[str, str] = require_role_min("VIEWER")):
 
 @router.post("/api/switch_channel")
 def api_switch_channel(
-    profile: str, channel: str, session: tuple[str, str] = require_role_min("ADMIN")
+    payload: SwitchChannelRequest, session: tuple[str, str] = require_role_min("ADMIN")
 ):
-    channel = channel.strip().lstrip("#").lower()
+    # JSON body, не query-параметры — см. комментарий у api_start (security-
+    # аудит 2026-08-15, MEDIUM #14).
+    profile = payload.profile
+    channel = payload.channel.strip().lstrip("#").lower()
     if not re.fullmatch(r"[a-z0-9_]{1,25}", channel):
         return JSONResponse({"error": "Некорректное имя канала"}, status_code=400)
 
@@ -798,7 +854,12 @@ def api_get_current_prompt(
 
 @router.get("/api/prompt/{name}")
 def api_get_prompt(name: str, session: tuple[str, str] = require_role_min("VIEWER")):
-    path = PROMPTS_DIR / f"{name}.txt"
+    # FastAPI/Starlette запрещает только литеральный "/" в сегменте пути —
+    # "\" (разделитель пути на Windows) проходит нетронутым, поэтому
+    # traversal через name="..\\..\\Windows\\win.ini" без этой проверки
+    # отдавал содержимое произвольного .txt-файла на диске (security-аудит
+    # 2026-08-15, CRITICAL #1).
+    path = PROMPTS_DIR / f"{safe_segment(name)}.txt"
     if not path.exists():
         return JSONResponse({"error": "не найдено"}, status_code=404)
     return JSONResponse({"personality": path.read_text(encoding="utf-8").strip()})
@@ -985,14 +1046,24 @@ def api_set_viewer_note(
 
 
 @router.post("/api/chat_send")
+@limiter.limit("30/minute")
 def api_send_chat_message(
-    payload: SendChatMessageRequest, session: tuple[str, str] = require_role_min("MODERATOR")
+    request: Request,
+    payload: SendChatMessageRequest,
+    session: tuple[str, str] = require_role_min("MODERATOR"),
 ):
     """Ставит сообщение в очередь panel_outbox (bot.db) — сам процесс бота
     вычитывает её раз в секунду (main.py::_poll_panel_outbox) и отправляет
     от своего имени в указанный канал через MessageQueue. Панель ничего не
     исполняет сама (см. CLAUDE.md), только пишет намерение в БД, которую
-    читает бот — тот же принцип, что у desired_state/Attack Mode."""
+    читает бот — тот же принцип, что у desired_state/Attack Mode.
+
+    30/minute — ограничение введено, чтобы скомпрометированная или
+    недобросовестная MODERATOR-сессия не могла флудить чат через панель:
+    раньше единственным лимитом была проверка длины сообщения (≤500
+    символов), без ограничения частоты (см. security-аудит, находка
+    Medium). request — первым позиционным параметром: slowapi ищет его по
+    имени/позиции в сигнатуре декорированной функции."""
     text = payload.text.strip()
     if not text:
         return JSONResponse({"error": "Пустое сообщение"}, status_code=400)

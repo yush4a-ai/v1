@@ -62,7 +62,10 @@ from urllib.parse import urlencode
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
+from starlette.requests import HTTPConnection
 
+import paths
+from panel.rate_limit import limiter
 from paths import MAIN_PROFILE, PanelRoots
 
 log = logging.getLogger("panel.auth")
@@ -101,6 +104,13 @@ BOT_TOKEN_OAUTH_SCOPES = "moderator:manage:banned_users moderator:manage:chat_me
 # (баны/таймауты через executor.py), этот про обычные сообщения в чате.
 CHAT_TOKEN_OAUTH_SCOPES = "chat:read chat:edit"
 
+# Права для создания клипов (bot/autoclip.py, POST /helix/clips) — третий
+# независимый scope, не связанный ни с BOT_TOKEN_OAUTH_SCOPES (баны), ни с
+# CHAT_TOKEN_OAUTH_SCOPES (IRC): Twitch не позволяет добавить scope к уже
+# выпущенному токену, так что clips:edit не может быть пристроен ни к
+# одному из существующих токенов бота, только выпущен заново.
+CLIP_TOKEN_OAUTH_SCOPES = "clips:edit"
+
 SESSION_KEY = "panel_user"
 _STATE_TTL_SECONDS = 600  # окно на прохождение логина на Twitch
 
@@ -134,6 +144,19 @@ _pending_states: dict[str, float] = {}
 # какой из них завершился — прочитать это из state, не из URL.
 _pending_bot_states: dict[str, tuple[float, str]] = {}
 
+# Ещё одно отдельное хранилище state — для clip-token flow. Не переиспользует
+# purpose внутри _pending_bot_states, хотя механизм тот же: clip-flow не
+# делит redirect_uri с bot-flow (свой clip_redirect_uri, отдельно
+# зарегистрированный в Twitch Dev Console), так что нет той причины,
+# которая заставила mod/chat flow делить один словарь.
+#
+# Значение — (created_at, broadcaster_id): токен клиппинга per-channel (см.
+# миграцию 020), а Twitch возвращает пользователя на фиксированный
+# redirect_uri без query-параметров — единственный способ callback'у узнать,
+# для какого канала шёл вход, это прочитать broadcaster_id из state, тем же
+# приёмом, что _pending_bot_states уже использует для purpose.
+_pending_clip_states: dict[str, tuple[float, str]] = {}
+
 
 def _prune_states() -> None:
     cutoff = time.time() - _STATE_TTL_SECONDS
@@ -147,6 +170,12 @@ def _prune_bot_states() -> None:
         _pending_bot_states.pop(state, None)
 
 
+def _prune_clip_states() -> None:
+    cutoff = time.time() - _STATE_TTL_SECONDS
+    for state in [s for s, (created, _broadcaster_id) in _pending_clip_states.items() if created < cutoff]:
+        _pending_clip_states.pop(state, None)
+
+
 @dataclass(frozen=True, slots=True)
 class PanelAuthConfig:
     client_id: str
@@ -154,6 +183,7 @@ class PanelAuthConfig:
     channel: str
     redirect_uri: str
     bot_redirect_uri: str
+    clip_redirect_uri: str
 
     @property
     def configured(self) -> bool:
@@ -193,6 +223,9 @@ def load_panel_auth_config(
         ),
         bot_redirect_uri=get(
             "PANEL_TWITCH_BOT_REDIRECT_URI", f"http://localhost:{default_port}/auth/bot/callback"
+        ),
+        clip_redirect_uri=get(
+            "PANEL_TWITCH_CLIP_REDIRECT_URI", f"http://localhost:{default_port}/auth/clip/callback"
         ),
     )
 
@@ -427,35 +460,19 @@ async def _resolve_roles_by_channel(
 
 def _write_env_values(root: Path, updates: dict[str, str]) -> None:
     """Точечная запись переменных в корневой .env без потери остального
-    файла — тот же приём, что panel/bots_api.py::write_env_values(), но для
-    основного профиля напрямую (bot-токен один на процесс панели, как и
-    PANEL_TWITCH_*, не за каждый профиль бота отдельно). Продублировано, а
-    не импортировано, чтобы избежать циклического импорта: bots_api сам
-    импортирует panel.auth (см. moderation_api.py, где применён тот же
-    приём для _db_path).
+    файла — тонкая обёртка над paths.write_env_values() (единая реализация,
+    раньше была продублирована здесь, в panel/bots_api.py и в
+    cigilbot/integrations/mod_token.py; три копии могли гоняться друг с
+    другом при параллельной записи одного файла — bug-аудит 2026-08-15,
+    HIGH #4). Обёртка сохранена ради сигнатуры root: Path, которую здесь
+    ожидают вызывающие (roots.repo, не сам файл).
 
     root здесь — ВСЕГДА PanelRoots.repo, то есть корень монорепо. Сюда
     после входа под аккаунтом бота ложатся TWITCH_MOD_*, и ровно отсюда их
     читает cigilbot/consumer.py. Если передать другой корень, панель
     отрапортует об успешно полученном токене, а баны начнут падать с 401,
     потому что executor прочитает пустое место (см. paths.py)."""
-    env_file = root / ".env"
-    if not env_file.exists():
-        env_file.write_text("", encoding="utf-8")
-    lines = env_file.read_text(encoding="utf-8").splitlines()
-    seen: set[str] = set()
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key = stripped.split("=", 1)[0].strip()
-        if key in updates:
-            lines[i] = f"{key}={updates[key]}"
-            seen.add(key)
-    for key, value in updates.items():
-        if key not in seen:
-            lines.append(f"{key}={value}")
-    env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    paths.write_env_values(root / ".env", updates)
 
 
 SESSION_NEXT_KEY = "panel_auth_next"
@@ -478,6 +495,7 @@ def _safe_next(raw: str) -> str:
 
 
 @router.get("/login")
+@limiter.limit("10/minute")
 async def auth_login(request: Request, next: str = DEFAULT_AFTER_LOGIN) -> RedirectResponse:
     cfg: PanelAuthConfig = request.app.state.panel_auth_config
     if not cfg.configured:
@@ -508,6 +526,7 @@ async def auth_login(request: Request, next: str = DEFAULT_AFTER_LOGIN) -> Redir
 
 
 @router.get("/callback")
+@limiter.limit("20/minute")
 async def auth_callback(request: Request, code: str = "", state: str = "", error: str = "") -> RedirectResponse:
     if error:
         raise HTTPException(status_code=400, detail=f"Twitch отказал во входе: {error}")
@@ -630,10 +649,18 @@ def require_authenticated(request: Request) -> tuple[str, str]:
     return str(user.get("role", "VIEWER")), str(user.get("login", "аноним"))
 
 
-async def role_for_profile(request: Request, profile: str) -> str:
+async def role_for_profile(request: HTTPConnection, profile: str) -> str:
     """Роль вошедшего для канала КОНКРЕТНОГО канала (параметр называется
     "profile" по историческим причинам, значение — broadcaster_id, см.
     комментарий у _list_profile_channels) — не общая роль сессии.
+
+    Принимает HTTPConnection, не Request: общий предок Request и
+    WebSocket в Starlette, у обоих есть нужные .session/.app.state —
+    moderation_api.py::ws_moderation/ws_content_events вызывают эту же
+    функцию из WebSocket-обработчика (см. находку BOLA в security-аудите:
+    там раньше проверялось только "залогинен ли вообще", не роль на
+    конкретном канале).
+
     session["roles"] — {channel_login: role}, посчитанный на все известные
     каналы разом при входе (см. _resolve_roles_by_channel); здесь просто
     достаём канал этого broadcaster_id и смотрим роль по нему.
@@ -723,6 +750,7 @@ AuthenticatedRole = Depends(require_authenticated)
 
 
 @router.get("/bot/login")
+@limiter.limit("10/minute")
 async def auth_bot_login(request: Request) -> RedirectResponse:
     cfg: PanelAuthConfig = request.app.state.panel_auth_config
     if not cfg.configured:
@@ -755,6 +783,7 @@ async def auth_bot_login(request: Request) -> RedirectResponse:
 
 
 @router.get("/bot/chat_login")
+@limiter.limit("10/minute")
 async def auth_bot_chat_login(request: Request) -> RedirectResponse:
     """Тот же flow, что /bot/login, но для чат-токена бота (TWITCH_BOT_TOKEN,
     IRC chat:read/chat:edit) — не Helix moderator:manage:* из BOT_TOKEN_OAUTH_SCOPES.
@@ -871,6 +900,7 @@ async def _process_bot_callback(
 
 
 @router.get("/bot/callback")
+@limiter.limit("20/minute")
 async def auth_bot_callback(request: Request, code: str = "", state: str = "", error: str = "") -> HTMLResponse:
     """Реальный OAuth redirect target (совпадает с PanelAuthConfig.bot_redirect_uri,
     зарегистрированным в Twitch Dev Console) — отдаёт человекочитаемую
@@ -957,3 +987,220 @@ async def auth_bot_chat_status(request: Request) -> dict[str, object]:
         "configured": has_token,
         "bot_login": values.get("TWITCH_BOT_NICK", ""),
     }
+
+
+# ---------------------------------------------------------------------------
+# Clip-token OAuth (bot/autoclip.py). Третий независимый flow — не расширяет
+# ни bot-token (moderator:manage:*), ни chat-token (chat:read/edit) выше:
+# clips:edit требует свой собственный токен, потому что Twitch не даёт
+# добавить scope к уже выпущенному. ADMIN+ обязателен на login, той же
+# причине, что и у /bot/login — иначе любой VIEWER мог бы инициировать
+# перезапись боевого токена клиппинга через один открытый в браузере URL.
+#
+# Кто должен нажать "Получить токен для клиппинга" — тот, под чьим Twitch-
+# логином в браузере пройдёт OAuth, тот и станет владельцем токена (сейчас
+# обычно тот же аккаунт бота, что и /bot/login, см. docstring
+# cigilbot/integrations/clip_token.py). В отличие от bot-token flow, здесь
+# НЕ делается проверка "модератор ли этот аккаунт" через
+# _fetch_moderated_channel_ids: clips:edit по документации Twitch работает
+# для broadcaster'а, модератора ИЛИ редактора канала, а "редактор" нельзя
+# дёшево проверить без ещё одного scope, который этому flow не нужен —
+# вместо позитивной проверки прав auth_clip_callback просто предупреждает,
+# что 403 при реальном создании клипа будет значить нехватку прав.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/clip/login")
+@limiter.limit("10/minute")
+async def auth_clip_login(request: Request, profile: str) -> RedirectResponse:
+    """profile — broadcaster_id канала, для которого получаем токен (тот же
+    нейминг, что весь остальной moderation_api.py — см. комментарий там про
+    historical naming). Токен клиппинга per-channel (см. миграцию 020): один
+    и тот же .env-токен на все каналы раньше молча проваливал клипы на
+    каналах, для которых он не был выпущен."""
+    cfg: PanelAuthConfig = request.app.state.panel_auth_config
+    if not cfg.configured:
+        raise HTTPException(
+            status_code=503,
+            detail="Вход через Twitch не настроен: заполните PANEL_TWITCH_CLIENT_ID/"
+            "PANEL_TWITCH_CLIENT_SECRET/PANEL_TWITCH_CHANNEL в .env",
+        )
+    role, _login = require_authenticated(request)
+    if role not in ("ADMIN", "OWNER"):
+        raise HTTPException(status_code=403, detail="Получение токена для клиппинга требует роль ADMIN+")
+
+    from cigilbot.storage.registry_store import RegistryStore
+
+    roots: PanelRoots = request.app.state.panel_roots
+    registry = RegistryStore(str(roots.registry_db))
+    await registry.connect()
+    try:
+        channel = await registry.get_channel(profile)
+    finally:
+        await registry.close()
+    if channel is None:
+        raise HTTPException(status_code=404, detail=f"Канал {profile!r} не найден в Channel Registry")
+
+    _prune_clip_states()
+    state = secrets.token_urlsafe(24)
+    _pending_clip_states[state] = (time.time(), profile)
+
+    params = {
+        "client_id": cfg.client_id,
+        "redirect_uri": cfg.clip_redirect_uri,
+        "response_type": "code",
+        "scope": CLIP_TOKEN_OAUTH_SCOPES,
+        "state": state,
+        # Тот же приём, что и у bot-token flow: не даём Twitch молча
+        # переиспользовать уже открытую в браузере сессию — риск выпустить
+        # токен клиппинга на неверный аккаунт молча.
+        "force_verify": "true",
+    }
+    return RedirectResponse(f"{TWITCH_AUTHORIZE_URL}?{urlencode(params)}")
+
+
+async def _process_clip_callback(
+    request: Request, *, code: str, state: str, error: str
+) -> dict[str, object]:
+    """Логика обмена code -> токен клиппинга + запись в mod.<broadcaster_id>.db
+    — структура зеркальна _process_bot_callback, но без purpose (один flow,
+    один callback) и без проверки статуса модератора (см. докстринг блока
+    выше). broadcaster_id канала берётся из state (см. auth_clip_login), не
+    из PanelAuthConfig.channel — тот описывает только один канал панели в
+    целом, а токен клиппинга привязан к каналу, выбранному в UI."""
+    if error:
+        raise HTTPException(status_code=400, detail=f"Twitch отказал во входе: {error}")
+
+    if state not in _pending_clip_states:
+        raise HTTPException(status_code=400, detail="Неизвестный или истёкший state — начните вход заново")
+    _created_at, broadcaster_id = _pending_clip_states.pop(state)
+
+    cfg: PanelAuthConfig = request.app.state.panel_auth_config
+    if not cfg.configured:
+        raise HTTPException(status_code=503, detail="Вход через Twitch не настроен")
+
+    from cigilbot.storage.registry_store import RegistryStore
+    from cigilbot.storage.store import ModerationStore
+
+    roots: PanelRoots = request.app.state.panel_roots
+    registry = RegistryStore(str(roots.registry_db))
+    await registry.connect()
+    try:
+        channel = await registry.get_channel(broadcaster_id)
+    finally:
+        await registry.close()
+    if channel is None:
+        raise HTTPException(status_code=404, detail=f"Канал {broadcaster_id!r} не найден в Channel Registry")
+
+    try:
+        access_token, refresh_token = await _exchange_code_with_refresh(
+            cfg, code, redirect_uri=cfg.clip_redirect_uri
+        )
+        user_login, user_id = await _fetch_viewer(cfg, access_token)
+        is_broadcaster = user_login == channel.login.lstrip("#").lower()
+    except TwitchAuthError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    import paths
+
+    store = ModerationStore(str(paths.mod_db(broadcaster_id)))
+    await store.connect()
+    try:
+        await store.set_clip_token(
+            access_token=access_token, refresh_token=refresh_token, user_login=user_login, user_id=user_id
+        )
+    finally:
+        await store.close()
+
+    warning = None
+    if not is_broadcaster:
+        warning = (
+            f"Аккаунт {user_login!r}, под которым вы только что вошли, — не вещатель канала "
+            f"{channel.login!r}. Создание клипов сработает, только если этот аккаунт модератор "
+            f"или редактор канала — иначе Twitch вернёт 403 при первой попытке."
+        )
+
+    return {
+        "ok": True,
+        "user_login": user_login,
+        "channel_login": channel.login,
+        "is_broadcaster": is_broadcaster,
+        "warning": warning,
+    }
+
+
+@router.get("/clip/callback")
+@limiter.limit("20/minute")
+async def auth_clip_callback(request: Request, code: str = "", state: str = "", error: str = "") -> HTMLResponse:
+    """Реальный OAuth redirect target (совпадает с PanelAuthConfig.clip_redirect_uri,
+    зарегистрированным в Twitch Dev Console отдельно от bot_redirect_uri)."""
+    try:
+        result = await _process_clip_callback(request, code=code, state=state, error=error)
+    except HTTPException as exc:
+        body = (
+            f"<h2>Не удалось получить токен для клиппинга</h2><p>{exc.detail}</p>"
+            '<p><a href="/moderation">Вернуться в панель</a></p>'
+        )
+        return HTMLResponse(body, status_code=exc.status_code)
+
+    warning_html = f'<p style="color:#f5b942">{result["warning"]}</p>' if result["warning"] else ""
+    ok_html = (
+        '<p style="color:#34d399">Токен готов к использованию.</p>' if not result["warning"] else ""
+    )
+    body = f"""
+    <div style="font-family:sans-serif;max-width:480px;margin:60px auto;padding:24px;">
+      <h2>Токен для клиппинга получен (канал: {result["channel_login"]})</h2>
+      <p>Вошли как: <b>{result["user_login"]}</b></p>
+      {ok_html}
+      {warning_html}
+      <p><a href="/moderation">Вернуться в панель</a></p>
+    </div>
+    """
+    return HTMLResponse(body)
+
+
+@router.get("/clip/callback.json")
+async def auth_clip_callback_json(
+    request: Request, code: str = "", state: str = "", error: str = ""
+) -> dict[str, object]:
+    """Тот же обмен, но JSON-ответ — для тестов и программных клиентов."""
+    return await _process_clip_callback(request, code=code, state=state, error=error)
+
+
+@router.get("/clip/status")
+async def auth_clip_status(request: Request, profile: str) -> dict[str, object]:
+    """Есть ли уже токен для клиппинга на конкретном канале — читает
+    mod.<broadcaster_id>.db заново на каждый запрос. Файл БД может ещё не
+    существовать (канал без единой строки модерации/автоклипа) — трактуем
+    как "не настроено", не создавая файл впустую только ради статус-
+    проверки (в отличие от _open_or_create_store в moderation_api.py,
+    которому создание файла нужно для последующей записи).
+
+    require_authenticated здесь раньше отсутствовал: любой, даже не
+    вошедший, мог опросить статус токена клиппинга произвольного канала по
+    broadcaster_id. Само по себе не секрет (только bool + login), но
+    ручка стояла открытой рядом с остальными auth-эндпоинтами, которые все
+    её требуют — оставлять один незащищённый выбивался бы из общего
+    инварианта "проверка прав в роутере". paths.mod_db() валидирует
+    broadcaster_id (числовой Twitch ID/MAIN_PROFILE) и поднимает
+    ValueError на что угодно ещё — здесь превращаем это в честный 400."""
+    require_authenticated(request)
+    import paths
+    from cigilbot.storage.store import ModerationStore
+
+    try:
+        db_path = paths.mod_db(profile)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not db_path.exists():
+        return {"configured": False, "user_login": ""}
+
+    store = ModerationStore(str(db_path))
+    await store.connect()
+    try:
+        token = await store.get_clip_token()
+    finally:
+        await store.close()
+    if token is None:
+        return {"configured": False, "user_login": ""}
+    return {"configured": True, "user_login": token.user_login}

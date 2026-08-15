@@ -38,7 +38,7 @@ from cigilbot.orchestration.executor import parse_payload
 from cigilbot.storage.registry_store import RegistryStore
 from cigilbot.storage.store import ModerationStore, PatternInput
 from panel.auth import require_authenticated, role_for_profile
-from paths import MOD_VAR, REGISTRY_DB, REPO_ROOT
+from paths import MOD_VAR, REGISTRY_DB, REPO_ROOT, safe_segment
 
 # Где лежат mod.<broadcaster_id>.db и registry.db. Раньше это был
 # `Path(__file__).parent.parent` — панель жила внутри Cigilbot, корень
@@ -84,7 +84,21 @@ def _db_path(broadcaster_id: str) -> Path:
     # каналы сразу, поэтому идентификатор канала (не INSTANCE бота) — ключ
     # выбора файла; broadcaster_id стабилен к переименованию канала, в
     # отличие от login.
-    return ROOT / f"mod.{broadcaster_id}.db"
+    #
+    # broadcaster_id приходит сюда напрямую из query-параметра "profile"
+    # (или из первого сообщения WebSocket) — safe_segment() (paths.py)
+    # защищает от выхода за пределы var/cigilbot/ через разделители пути.
+    # Проверка сознательно НЕ белый список формата (числовой Twitch ID) —
+    # тесты этого файла используют произвольные строковые суррогаты
+    # ("other", "second") как легитимный broadcaster_id, и в api_overview
+    # значение приходит уже из Channel Registry (доверенный источник), не
+    # только из запроса.
+    try:
+        return ROOT / f"mod.{safe_segment(broadcaster_id)}.db"
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Некорректный profile/broadcaster_id: {broadcaster_id!r}"
+        ) from exc
 
 
 async def _open_store(broadcaster_id: str) -> ModerationStore:
@@ -94,6 +108,21 @@ async def _open_store(broadcaster_id: str) -> ModerationStore:
             status_code=404, detail=f"БД канала {broadcaster_id!r} ещё не создана"
         )
     store = ModerationStore(str(path))
+    await store.connect()
+    return store
+
+
+async def _open_or_create_store(broadcaster_id: str) -> ModerationStore:
+    """Как _open_store, но создаёт mod.<broadcaster_id>.db, если файла ещё
+    нет — только для настроек автоклипа (autoclip_settings ниже). В отличие
+    от остальных эндпоинтов этого роутера, автоклип НЕ требует, чтобы на
+    канале хоть раз стартовала модерация (MODERATION_ENABLED может быть
+    выключен, автоклип — независимая фича, см. bot/autoclip.py); 404 здесь
+    заставил бы включать модерацию только ради того, чтобы завести файл БД
+    под настройку, к модерации не относящуюся. ModerationStore.connect()
+    сам создаёт файл и прогоняет миграции с нуля (aiosqlite.connect на
+    несуществующий путь создаёт файл — штатное поведение sqlite)."""
+    store = ModerationStore(str(_db_path(broadcaster_id)))
     await store.connect()
     return store
 
@@ -224,10 +253,17 @@ async def api_overview(
 
 @router.get("/clusters")
 async def api_clusters(
+    request: Request,
     profile: str = "main",
     limit: int = 50,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> list[dict[str, object]]:
+    # MODERATOR, не VIEWER: ники подозреваемых в спаме и risk_score
+    # конкретных людей — не публичная информация. Обычный зритель, вошедший
+    # через Twitch без модераторских прав, не должен видеть чужие данные
+    # только по факту входа (2026-08-15, решение по итогам UX-аудита панели —
+    # см. тот же сдвиг VIEWER->MODERATOR на всех "личных данных" ручках ниже).
+    require_role(await role_for_profile(request, profile), "MODERATOR")
     store = await _open_store(profile)
     try:
         return await store.get_active_clusters(limit=limit)
@@ -237,11 +273,13 @@ async def api_clusters(
 
 @router.get("/verdicts")
 async def api_verdicts(
+    request: Request,
     profile: str = "main",
     min_risk: int = 30,
     limit: int = 100,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> list[dict[str, object]]:
+    require_role(await role_for_profile(request, profile), "MODERATOR")
     store = await _open_store(profile)
     try:
         return await store.get_recent_verdicts(min_risk_level=min_risk, limit=limit)
@@ -251,10 +289,12 @@ async def api_verdicts(
 
 @router.get("/audit")
 async def api_audit(
+    request: Request,
     profile: str = "main",
     limit: int = 100,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> list[dict[str, object]]:
+    require_role(await role_for_profile(request, profile), "MODERATOR")
     store = await _open_store(profile)
     try:
         return await store.get_action_audit(limit=limit)
@@ -264,12 +304,14 @@ async def api_audit(
 
 @router.get("/users")
 async def api_list_users(
+    request: Request,
     profile: str = "main",
     search: str = "",
     limit: int = 100,
     offset: int = 0,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> list[dict[str, object]]:
+    require_role(await role_for_profile(request, profile), "MODERATOR")
     store = await _open_store(profile)
     try:
         return await store.list_users(search=search, limit=limit, offset=offset)
@@ -292,6 +334,7 @@ PASTE_WAVE_WINDOW_SECONDS = 120.0
 
 @router.get("/recent_messages")
 async def api_list_recent_messages(
+    request: Request,
     profile: str = "main",
     limit: int = 15,
     session: tuple[str, str] = Depends(require_authenticated),
@@ -299,6 +342,7 @@ async def api_list_recent_messages(
     """Последние сообщения чата для клика "вставить как образец пасты"
     (см. store.list_recent_messages — избегает ручного копирования из
     внешнего чат-виджета, которое цепляло мусор вроде ника)."""
+    require_role(await role_for_profile(request, profile), "MODERATOR")
     store = await _open_store(profile)
     try:
         return await store.list_recent_messages(limit=limit)
@@ -308,11 +352,13 @@ async def api_list_recent_messages(
 
 @router.get("/paste_wave")
 async def api_find_paste_wave(
+    request: Request,
     sample_text: str,
     profile: str = "main",
     window_seconds: float = PASTE_WAVE_WINDOW_SECONDS,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> list[dict[str, object]]:
+    require_role(await role_for_profile(request, profile), "MODERATOR")
     if not sample_text.strip():
         raise HTTPException(status_code=400, detail="Введите текст пасты для поиска")
     store = await _open_store(profile)
@@ -335,8 +381,14 @@ class SetRoleRequest(BaseModel):
 
 @router.get("/panel_users")
 async def api_panel_users(
-    profile: str = "main", session: tuple[str, str] = Depends(require_authenticated)
+    request: Request,
+    profile: str = "main",
+    session: tuple[str, str] = Depends(require_authenticated),
 ) -> list[dict[str, object]]:
+    # ADMIN, не VIEWER: список ADMIN/OWNER-логинов канала — разведочная
+    # информация (см. security-аудит), нет причин показывать её ниже роли,
+    # которая и так может им управлять.
+    require_role(await role_for_profile(request, profile), "ADMIN")
     store = await _open_store(profile)
     try:
         return await store.list_panel_users()
@@ -346,9 +398,16 @@ async def api_panel_users(
 
 @router.post("/panel_users")
 async def api_set_panel_user(
-    payload: SetRoleRequest, session: tuple[str, str] = Depends(require_authenticated)
+    request: Request,
+    payload: SetRoleRequest,
+    session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
-    caller_role, _caller_login = session
+    # Роль на КОНКРЕТНОМ канале payload.profile, не общая роль сессии —
+    # раньше здесь читался caller_role из session (роль на канале самой
+    # панели), что позволяло ADMIN одного канала назначать роли на любом
+    # другом канале, лишь бы знать его broadcaster_id (см. security-аудит,
+    # находка BFLA). Тот же паттерн, что везде в этом роутере ниже.
+    caller_role = await role_for_profile(request, payload.profile)
     require_role(caller_role, "ADMIN")
 
     new_role = payload.role.upper()
@@ -545,8 +604,11 @@ async def api_unmark_user_safe(
 
 @router.get("/trusted")
 async def api_list_trusted(
-    profile: str = "main", session: tuple[str, str] = Depends(require_authenticated)
+    request: Request,
+    profile: str = "main",
+    session: tuple[str, str] = Depends(require_authenticated),
 ) -> list[dict[str, object]]:
+    require_role(await role_for_profile(request, profile), "MODERATOR")
     store = await _open_store(profile)
     try:
         return await store.list_trusted()
@@ -577,8 +639,13 @@ class PatternRequest(BaseModel):
 
 @router.get("/patterns")
 async def api_list_patterns(
-    profile: str = "main", session: tuple[str, str] = Depends(require_authenticated)
+    request: Request,
+    profile: str = "main",
+    session: tuple[str, str] = Depends(require_authenticated),
 ) -> list[dict[str, object]]:
+    # MODERATOR: точные пороги (min_risk_score, required_signal_names) — это
+    # инструкция "как не попасться" для того, кто читает список.
+    require_role(await role_for_profile(request, profile), "MODERATOR")
     store = await _open_store(profile)
     try:
         patterns = await store.list_patterns()
@@ -692,8 +759,13 @@ class ContentRuleRequest(BaseModel):
 
 @router.get("/content_rules")
 async def api_list_content_rules(
-    profile: str = "main", session: tuple[str, str] = Depends(require_authenticated)
+    request: Request,
+    profile: str = "main",
+    session: tuple[str, str] = Depends(require_authenticated),
 ) -> list[dict[str, object]]:
+    # MODERATOR: список запрещённых слов/фраз тривиально обходится, если
+    # знаешь список — не публичная информация.
+    require_role(await role_for_profile(request, profile), "MODERATOR")
     store = await _open_store(profile)
     try:
         rules = await store.list_content_rules()
@@ -777,8 +849,11 @@ class SetContentModerationEnabledRequest(BaseModel):
 
 @router.get("/content_settings")
 async def api_get_content_settings(
-    profile: str = "main", session: tuple[str, str] = Depends(require_authenticated)
+    request: Request,
+    profile: str = "main",
+    session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
+    require_role(await role_for_profile(request, profile), "VIEWER")
     store = await _open_store(profile)
     try:
         settings = await store.get_content_settings()
@@ -804,8 +879,153 @@ async def api_set_content_moderation_enabled(
     return settings.to_dict()
 
 
+# ---------------------------------------------------------------------------
+# Живой рубильник автоклипа (bot/autoclip.py) — тот же принцип, что
+# Attack Mode/Content Settings: панель пишет в mod.<broadcaster_id>.db,
+# AutoclipHub._reconcile перечитывает раз в RECONCILE_INTERVAL_SECONDS, без
+# рестарта бота. Использует _open_or_create_store, не _open_store: автоклип
+# не требует, чтобы модерация хоть раз стартовала на этом канале.
+# ---------------------------------------------------------------------------
+
+
+class SetAutoclipEnabledRequest(BaseModel):
+    profile: str = "main"
+    enabled: bool
+
+
+@router.get("/autoclip_settings")
+async def api_get_autoclip_settings(
+    request: Request,
+    profile: str = "main",
+    session: tuple[str, str] = Depends(require_authenticated),
+) -> dict[str, object]:
+    # VIEWER, а не только ADMIN/OWNER (у мутирующей ручки ниже) — но всё
+    # равно обязательна: без неё чтение создавало mod.<broadcaster_id>.db
+    # для ЛЮБОГО broadcaster_id, включая канал, где у вошедшего нет вообще
+    # никакой роли (_open_or_create_store создаёт файл, если его не было).
+    require_role(await role_for_profile(request, profile), "VIEWER")
+    store = await _open_or_create_store(profile)
+    try:
+        settings = await store.get_autoclip_settings()
+    finally:
+        await store.close()
+    return settings.to_dict()
+
+
+@router.post("/autoclip_settings")
+async def api_set_autoclip_enabled(
+    request: Request,
+    payload: SetAutoclipEnabledRequest,
+    session: tuple[str, str] = Depends(require_authenticated),
+) -> dict[str, object]:
+    _global_role, login = session
+    require_role(await role_for_profile(request, payload.profile), "MODERATOR")
+    store = await _open_or_create_store(payload.profile)
+    try:
+        await store.set_autoclip_enabled(payload.enabled, updated_by=login)
+        settings = await store.get_autoclip_settings()
+    finally:
+        await store.close()
+    return settings.to_dict()
+
+
+class SetAutoclipThresholdsRequest(BaseModel):
+    """Поля-None означают "не менять этот параметр — вернуться к значению
+    из config/channels/<канал>.yml", тот же принцип, что AutoclipSettings.
+    Пустая строка в списке фраз недопустима — тот же смысл, что и в
+    ContentRuleRequest.phrase (пустая фраза совпала бы с чем угодно)."""
+
+    profile: str = "main"
+    burst_unique_authors_threshold: int | None = None
+    burst_window_seconds: float | None = None
+    keyword_phrases: list[str] | None = None
+    voice_phrases: list[str] | None = None
+    cooldown_seconds: float | None = None
+    capture_delay_seconds: float | None = None
+
+
+@router.post("/autoclip_settings/thresholds")
+async def api_set_autoclip_thresholds(
+    request: Request,
+    payload: SetAutoclipThresholdsRequest,
+    session: tuple[str, str] = Depends(require_authenticated),
+) -> dict[str, object]:
+    _global_role, login = session
+    require_role(await role_for_profile(request, payload.profile), "MODERATOR")
+
+    if payload.burst_unique_authors_threshold is not None and payload.burst_unique_authors_threshold < 1:
+        raise HTTPException(status_code=400, detail="burst_unique_authors_threshold должен быть не меньше 1")
+    if payload.burst_window_seconds is not None and payload.burst_window_seconds <= 0:
+        raise HTTPException(status_code=400, detail="burst_window_seconds должен быть больше 0")
+    if payload.cooldown_seconds is not None and payload.cooldown_seconds < 0:
+        raise HTTPException(status_code=400, detail="cooldown_seconds не может быть отрицательным")
+    if payload.capture_delay_seconds is not None and payload.capture_delay_seconds < 0:
+        raise HTTPException(status_code=400, detail="capture_delay_seconds не может быть отрицательным")
+    for phrases in (payload.keyword_phrases, payload.voice_phrases):
+        if phrases is not None and any(not p.strip() for p in phrases):
+            raise HTTPException(status_code=400, detail="Пустая фраза в списке недопустима")
+
+    store = await _open_or_create_store(payload.profile)
+    try:
+        await store.set_autoclip_thresholds(
+            burst_unique_authors_threshold=payload.burst_unique_authors_threshold,
+            burst_window_seconds=payload.burst_window_seconds,
+            keyword_phrases=tuple(payload.keyword_phrases) if payload.keyword_phrases is not None else None,
+            voice_phrases=tuple(payload.voice_phrases) if payload.voice_phrases is not None else None,
+            cooldown_seconds=payload.cooldown_seconds,
+            capture_delay_seconds=payload.capture_delay_seconds,
+            updated_by=login,
+        )
+        settings = await store.get_autoclip_settings()
+    finally:
+        await store.close()
+    return settings.to_dict()
+
+
+class SetAutoclipAutoScaleRequest(BaseModel):
+    """percent/minimum/maximum обязательны при enabled=True (формула без
+    них не считается) — при enabled=False можно не передавать, тогда
+    отправляются как есть (None), потому что порог перестаёт вычисляться."""
+
+    profile: str = "main"
+    enabled: bool
+    percent: float | None = None
+    minimum: int | None = None
+    maximum: int | None = None
+
+
+@router.post("/autoclip_settings/auto_scale")
+async def api_set_autoclip_auto_scale(
+    request: Request,
+    payload: SetAutoclipAutoScaleRequest,
+    session: tuple[str, str] = Depends(require_authenticated),
+) -> dict[str, object]:
+    _global_role, login = session
+    require_role(await role_for_profile(request, payload.profile), "MODERATOR")
+
+    if payload.enabled:
+        if payload.percent is None or not (0 < payload.percent <= 1):
+            raise HTTPException(status_code=400, detail="percent должен быть в диапазоне (0, 1]")
+        if payload.minimum is None or payload.minimum < 1:
+            raise HTTPException(status_code=400, detail="minimum должен быть не меньше 1")
+        if payload.maximum is None or payload.maximum < payload.minimum:
+            raise HTTPException(status_code=400, detail="maximum должен быть не меньше minimum")
+
+    store = await _open_or_create_store(payload.profile)
+    try:
+        await store.set_autoclip_auto_scale(
+            enabled=payload.enabled, percent=payload.percent,
+            minimum=payload.minimum, maximum=payload.maximum, updated_by=login,
+        )
+        settings = await store.get_autoclip_settings()
+    finally:
+        await store.close()
+    return settings.to_dict()
+
+
 @router.get("/content_events")
 async def api_list_content_events(
+    request: Request,
     profile: str = "main",
     limit: int = 50,
     session: tuple[str, str] = Depends(require_authenticated),
@@ -813,6 +1033,9 @@ async def api_list_content_events(
     """Лента срабатываний словарного детектора для панели — отдельно от
     /verdicts, т.к. content-события не имеют risk_score/confidence/signals
     (см. докстринг миграции 014)."""
+    # MODERATOR: конкретные логины и категория нарушения (расизм/угрозы/
+    # реклама) — личные данные, не публичная лента.
+    require_role(await role_for_profile(request, profile), "MODERATOR")
     store = await _open_store(profile)
     try:
         return await store.list_content_events(limit=limit)
@@ -881,6 +1104,15 @@ async def ws_content_events(websocket: WebSocket) -> None:
             profile = first.strip() or "main"
     except (TimeoutError, WebSocketDisconnect):
         pass
+
+    # См. ws_moderation — та же дыра (BOLA) была здесь: profile из первого
+    # сообщения без проверки роли на канал. MODERATOR, не VIEWER: лента
+    # событий содержит конкретные логины и категорию нарушения — те же
+    # личные данные, что закрыты на REST GET /content_events (2026-08-15).
+    role = await role_for_profile(websocket, profile)
+    if _ROLE_RANK[role] < _ROLE_RANK["MODERATOR"]:
+        await websocket.close(code=4403)
+        return
 
     try:
         while True:
@@ -965,8 +1197,11 @@ async def api_deactivate_attack_mode(
 
 @router.get("/attack_mode")
 async def api_get_attack_mode(
-    profile: str = "main", session: tuple[str, str] = Depends(require_authenticated)
+    request: Request,
+    profile: str = "main",
+    session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
+    require_role(await role_for_profile(request, profile), "VIEWER")
     store = await _open_store(profile)
     try:
         status = await store.get_active_attack_mode()
@@ -1037,8 +1272,11 @@ async def api_deactivate_giveaway_mode(
 
 @router.get("/giveaway_mode")
 async def api_get_giveaway_mode(
-    profile: str = "main", session: tuple[str, str] = Depends(require_authenticated)
+    request: Request,
+    profile: str = "main",
+    session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
+    require_role(await role_for_profile(request, profile), "VIEWER")
     store = await _open_store(profile)
     try:
         status = await store.get_active_giveaway_mode()
@@ -1098,8 +1336,11 @@ async def api_set_discord_webhook(
 
 @router.get("/discord_webhook")
 async def api_get_discord_webhook(
-    profile: str = "main", session: tuple[str, str] = Depends(require_authenticated)
+    request: Request,
+    profile: str = "main",
+    session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
+    require_role(await role_for_profile(request, profile), "VIEWER")
     store = await _open_store(profile)
     try:
         config = await store.get_discord_webhook()
@@ -1193,10 +1434,13 @@ async def api_record_feedback(
 
 @router.get("/feedback")
 async def api_list_feedback(
+    request: Request,
     profile: str = "main",
     limit: int = 100,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> list[dict[str, object]]:
+    # MODERATOR: запись фидбека содержит user_id конкретного зрителя.
+    require_role(await role_for_profile(request, profile), "MODERATOR")
     store = await _open_store(profile)
     try:
         return await store.list_feedback(limit=limit)
@@ -1206,10 +1450,15 @@ async def api_list_feedback(
 
 @router.get("/stats/daily")
 async def api_get_daily_stats(
+    request: Request,
     profile: str = "main",
     days: int = 30,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> list[dict[str, object]]:
+    # Единственная VIEWER-ручка в этом файле, которую стоит оставить открытой
+    # намеренно (2026-08-15): агрегированная статистика по дням без личных
+    # данных — кандидат на будущий публичный экран статистики для зрителей.
+    require_role(await role_for_profile(request, profile), "VIEWER")
     store = await _open_store(profile)
     try:
         return await store.get_daily_stats(days=days)
@@ -1250,6 +1499,18 @@ class ConfigSaveRequest(BaseModel):
 async def api_get_config(
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
+    # MODERATOR+, не просто require_authenticated — в отличие от остальных
+    # GET-ручек этого роутера (все проходят per-channel role_for_profile),
+    # эта была защищена только фактом входа, без минимальной роли вовсе:
+    # любой VIEWER на любом канале мог прочитать полные веса/пороги
+    # детекторов (MIN_FAMILIES_FOR_BAN, confidence.minimum_for_ban и т.д.),
+    # что при координированной атаке помогает подбирать поведение ниже
+    # порогов срабатывания. Запись (api_save_config ниже) уже требует
+    # ADMIN — асимметрия чтение/запись не была оправдана характером данных
+    # (security-аудит 2026-08-15, MEDIUM #12).
+    role, _login = session
+    require_role(role, "MODERATOR")
+
     path = _config_path()
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"{path} не найден")
@@ -1324,6 +1585,19 @@ async def ws_moderation(websocket: WebSocket) -> None:
             profile = first.strip() or "main"
     except (TimeoutError, WebSocketDisconnect):
         pass
+
+    # Раньше здесь проверялось только "залогинен ли вообще" (SESSION_KEY
+    # выше) — profile из первого сообщения клиента открывал БД любого
+    # канала без проверки, что у вошедшего есть на него хоть какая-то
+    # роль (см. security-аудит, BOLA). role_for_profile принимает
+    # HTTPConnection — WebSocket ей подходит так же, как Request.
+    # MODERATOR, не VIEWER: clusters/verdicts — ники подозреваемых и
+    # risk_score конкретных людей, те же личные данные, что закрыты на
+    # REST GET /clusters, /verdicts (2026-08-15).
+    role = await role_for_profile(websocket, profile)
+    if _ROLE_RANK[role] < _ROLE_RANK["MODERATOR"]:
+        await websocket.close(code=4403)
+        return
 
     try:
         while True:

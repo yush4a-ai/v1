@@ -36,6 +36,7 @@ from cigilbot.domain.normalize import MessageFingerprint, fingerprint
 from cigilbot.domain.patterns import Pattern, match_patterns
 from cigilbot.domain.scoring import families_triggered, risk_score
 from cigilbot.domain.types import (
+    Action,
     ChannelContext,
     ChatEvent,
     ClusterInfo,
@@ -442,6 +443,16 @@ class ModerationEngine:
         # (панель), is_hype — из эвристики по фактической скорости чата.
         # Явно переданный channel_context (тесты, будущие вызывающие с более
         # точным знанием контекста) полностью уважается и не переопределяется.
+        #
+        # observe() — диспетчер, стадии конвейера (docs/moderation-plan.md,
+        # раздел 3: Normalizer -> Feature Extraction -> Detection Engine ->
+        # Cluster Detection -> Risk Score -> Confidence -> Moderation Policy
+        # -> Audit Logger) вынесены в именованные приватные методы ниже —
+        # порядок вызовов и все обоснования конкретных решений сохранены
+        # дословно на местах, где они были (architecture-аудит 2026-08-15,
+        # MEDIUM #15: 149-строчный observe() затруднял точечное тестирование
+        # отдельных стадий и требовал читать весь метод целиком на любое
+        # изменение одной стадии).
         channel_context = channel_context or self._auto_channel_context(event.timestamp)
         fp = fingerprint(event.text)
         user = await self._get_or_create_user(event)
@@ -449,6 +460,33 @@ class ModerationEngine:
         if self._store is not None:
             await self._store.upsert_user(event)
 
+        signals, own_cluster = self._run_detection_and_clustering(
+            event, fp, user, channel_context
+        )
+        score, conf = self._score_and_assess_confidence(
+            signals, user, own_cluster, channel_context
+        )
+        families = families_triggered(signals)
+        action, blocked_by, reason = self._decide_action(score, conf, signals, families, user, event)
+
+        own_cluster = self._match_cluster_pattern(own_cluster)
+        stable_cluster_id = await self._persist_cluster(own_cluster)
+
+        verdict = self._build_verdict(
+            event, score, conf, signals, families, action, reason, stable_cluster_id, blocked_by, user
+        )
+
+        message_id = await self._persist(verdict, event, fp)
+        await self._check_content(event, user, message_id=message_id)
+        return verdict
+
+    def _run_detection_and_clustering(
+        self,
+        event: ChatEvent,
+        fp: MessageFingerprint,
+        user: UserState,
+        channel_context: ChannelContext,
+    ) -> tuple[list[Signal], ClusterInfo | None]:
         detection_ctx = DetectionContext(
             event=event,
             fingerprint=fp,
@@ -482,6 +520,15 @@ class ModerationEngine:
         if own_cluster is not None:
             signals.extend(own_cluster.signals)
 
+        return signals, own_cluster
+
+    def _score_and_assess_confidence(
+        self,
+        signals: list[Signal],
+        user: UserState,
+        own_cluster: ClusterInfo | None,
+        channel_context: ChannelContext,
+    ) -> tuple[int, float]:
         # Attack Mode (этап 9c) — только повышает Sensitivity для расчёта
         # risk_score, как и AGGRESSIVE. Не трогает MIN_FAMILIES_FOR_BAN и
         # confidence-пороги в policy.py — тот инвариант заперт константой,
@@ -493,7 +540,6 @@ class ModerationEngine:
             sensitivity=sensitivity,
             regular_user=user.trust_level == TrustLevel.REGULAR,
         )
-        families = families_triggered(signals)
         # Feedback loop (этап 9d): самое ненадёжное из сработавших правил
         # определяет итоговую скидку confidence — берём МАКСИМАЛЬНЫЙ
         # fp_penalty среди сигналов, а не средний. Средний размыл бы сигнал
@@ -509,7 +555,17 @@ class ModerationEngine:
             sample_size=own_cluster.size if own_cluster is not None else 1,
             fp_penalty=fp_penalty,
         )
+        return score, conf
 
+    def _decide_action(
+        self,
+        score: int,
+        conf: float,
+        signals: list[Signal],
+        families: int,
+        user: UserState,
+        event: ChatEvent,
+    ) -> tuple[Action, str, str]:
         action, blocked_by = policy.decide(
             risk_score=score,
             confidence=conf,
@@ -520,15 +576,20 @@ class ModerationEngine:
             is_provisional=user.account_created_at is None,
         )
         reason = policy.build_reason(action, tuple(signals), blocked_by)
+        return action, blocked_by, reason
 
+    def _match_cluster_pattern(self, own_cluster: ClusterInfo | None) -> ClusterInfo | None:
         # Bot Pattern Library (этап 9b) — классифицирует уже готовый
         # вердикт/кластер названием шаблона, ничего не пересчитывает и не
         # может изменить action/risk/confidence выше.
-        if own_cluster is not None:
-            cluster_pattern = match_patterns(own_cluster, self._patterns)
-            if cluster_pattern is not None:
-                own_cluster = replace(own_cluster, pattern_id=cluster_pattern.id)
+        if own_cluster is None:
+            return None
+        cluster_pattern = match_patterns(own_cluster, self._patterns)
+        if cluster_pattern is not None:
+            return replace(own_cluster, pattern_id=cluster_pattern.id)
+        return own_cluster
 
+    async def _persist_cluster(self, own_cluster: ClusterInfo | None) -> int | None:
         # Стабильный cluster_id ДО создания Verdict (BUG-002 аудита):
         # clustering.find_clusters() пересчитывает состав кластера заново на
         # каждое сообщение и выдаёт локальный счётчик id, стартующий с 1 при
@@ -540,18 +601,35 @@ class ModerationEngine:
         # выдан при первом обнаружении. Без store (SHADOW-тесты, replay.py)
         # используем локальный id как раньше — стабильность через процессы
         # тогда всё равно недостижима.
-        stable_cluster_id = own_cluster.cluster_id if own_cluster is not None else None
-        if own_cluster is not None and self._store is not None:
-            try:
-                stable_cluster_id, is_new_cluster = await self._store.upsert_cluster_by_members_ex(
-                    own_cluster
-                )
-            except Exception:
-                log.exception("Не удалось сохранить/обновить кластер в БД")
-            else:
-                if is_new_cluster:
-                    self._notify_new_cluster(replace(own_cluster, cluster_id=stable_cluster_id))
+        if own_cluster is None:
+            return None
+        stable_cluster_id = own_cluster.cluster_id
+        if self._store is None:
+            return stable_cluster_id
+        try:
+            stable_cluster_id, is_new_cluster = await self._store.upsert_cluster_by_members_ex(
+                own_cluster
+            )
+        except Exception:
+            log.exception("Не удалось сохранить/обновить кластер в БД")
+        else:
+            if is_new_cluster:
+                self._notify_new_cluster(replace(own_cluster, cluster_id=stable_cluster_id))
+        return stable_cluster_id
 
+    def _build_verdict(
+        self,
+        event: ChatEvent,
+        score: int,
+        conf: float,
+        signals: list[Signal],
+        families: int,
+        action: Action,
+        reason: str,
+        stable_cluster_id: int | None,
+        blocked_by: str,
+        user: UserState,
+    ) -> Verdict:
         verdict = Verdict(
             user_id=event.user_id,
             login=event.login,
@@ -572,9 +650,6 @@ class ModerationEngine:
         matched_pattern = match_patterns(verdict, self._patterns)
         if matched_pattern is not None:
             verdict = replace(verdict, pattern_id=matched_pattern.id)
-
-        message_id = await self._persist(verdict, event, fp)
-        await self._check_content(event, user, message_id=message_id)
         return verdict
 
     async def _persist(

@@ -18,3 +18,33 @@ channel_profile:
     - pl
     - cs
     - sk
+
+# Автоклип: секция необязательна, по умолчанию enabled: false (канал
+# должен явно включить). Три независимых триггера — любой сработавший
+# создаёт клип через Twitch Helix. cooldown_seconds общий для burst и
+# keyword; голосовая команда стримера его не учитывает.
+# См. src/bot/autoclip_config.py.
+autoclip:
+  enabled: false
+  cooldown_seconds: 300
+
+  burst:
+    enabled: true
+    window_seconds: 20
+    unique_authors_threshold: 12
+
+  keyword:
+    enabled: true
+    phrases:
+      - "клип это"
+      - "клип"
+      - "clip it"
+      - "clip that"
+
+  voice:
+    enabled: true
+    phrases:
+      - "клип это"
+      - "заклипай"
+      - "clip it"
+      - "clip that"
