@@ -48,7 +48,6 @@ from panel.auth import require_role_min
 from panel.rate_limit import limiter
 from paths import (
     BOT_VAR,
-    ENV_FILE,
     MAIN_PROFILE,
     PROMPTS_DIR,
     REGISTRY_DB,
@@ -215,15 +214,27 @@ def _env_file_for(profile: str) -> Path:
     safe_segment() — защита от path traversal через profile: без неё
     profile="../../secret" читал/писал произвольный файл на диске
     (в отличие от cigilbot-стороны, paths.mod_db(), эта защита здесь
-    отсутствовала до находки в security-аудите 2026-08-15)."""
+    отсутствовала до находки в security-аудите 2026-08-15).
+
+    Путь строится от ROOT (переменная модуля), а не от импортированной
+    константы paths.ENV_FILE: ROOT — единственное, что подменяют тесты
+    (tests/panel/conftest.py), и через ENV_FILE профиль "main" уходил мимо
+    подмены в БОЕВОЙ .env разработчика — то есть тест, тронувший профиль
+    main, читал (и при записи изменил бы) настоящие ключи. Найдено
+    bug-аудитом 2026-08-17, когда временный тест напечатал реальный
+    DEEPSEEK_API_KEY. Тот же приём и та же причина, что у
+    moderation_api.py::_open_panel_users_store."""
     if profile == MAIN_PROFILE:
-        return ENV_FILE
+        return ROOT / ".env"
     return ROOT / f".env.{safe_segment(profile)}"
 
 
 def list_profiles() -> list[str]:
     profiles = []
-    if ENV_FILE.exists():
+    # От ROOT, не от paths.ENV_FILE — см. _env_file_for(): иначе список
+    # профилей в тестах включал бы "main" по факту существования боевого
+    # .env, независимо от подменённого корня.
+    if (ROOT / ".env").exists():
         profiles.append(MAIN_PROFILE)
     for p in sorted(ROOT.glob(".env.*")):
         # .env.example — шаблон, не профиль. .env.backup-* — ручные копии
@@ -237,7 +248,16 @@ def list_profiles() -> list[str]:
 
 def new_profile_from_template(profile: str, bot_token: str, bot_nick: str) -> None:
     """Создаёт .env.<profile> с минимальным набором полей, остальное можно
-    донастроить через панель (канал, промт, голос)."""
+    донастроить через панель (канал, промт, голос).
+
+    bot_token/bot_nick приходят из запроса и подставляются в построчный
+    формат .env — перевод строки в них дописал бы в файл посторонние
+    переменные (bug-аудит 2026-08-17, тот же вектор, что закрыт в
+    paths.write_env_values; здесь файл пишется напрямую, минуя её, поэтому
+    проверка продублирована)."""
+    for name, value in (("bot_token", bot_token), ("bot_nick", bot_nick)):
+        if "\n" in value or "\r" in value:
+            raise ValueError(f"Значение {name} содержит перевод строки")
     env_file = _env_file_for(profile)
     if env_file.exists():
         raise FileExistsError(profile)
@@ -898,21 +918,33 @@ async def api_apply_prompt(
 
     one_line = " ".join(text.split("\n")).strip()
 
-    current = read_env(payload.profile).get("BOT_PERSONALITY", "")
-    if current and current != one_line:
-        _push_prompt_history(payload.profile, current)
+    def _apply_and_restart() -> bool:
+        """Всё блокирующее — одним куском в отдельном потоке.
 
-    write_env_values(payload.profile, {"BOT_PERSONALITY": one_line})
+        Хендлер async, а внутри subprocess.run(taskkill/tasklist), запуск
+        нового процесса и файловый лок с time.sleep(0.1) в цикле ожидания:
+        прямой вызов из корутины останавливает event loop панели целиком на
+        всё время перезапуска бота — вместе с WebSocket-лентами модерации,
+        которые обслуживает то же приложение. Тот же класс находки, что уже
+        закрыт в registry_api.py (bug-аудит 2026-08-15, HIGH), сюда фикс
+        тогда не дошёл (bug-аудит 2026-08-17)."""
+        current = read_env(payload.profile).get("BOT_PERSONALITY", "")
+        if current and current != one_line:
+            _push_prompt_history(payload.profile, current)
 
-    bot_pid_file = _pid_file(payload.profile, "bot")
-    was_running = _is_running(bot_pid_file)
-    if was_running:
-        _stop_pid(bot_pid_file)
-        logs_dir = VAR / "logs"
-        suffix = f".{payload.profile}" if payload.profile != MAIN_PROFILE else ""
-        _start(payload.profile, "main.py", bot_pid_file,
-               logs_dir / f"stdout{suffix}.log", logs_dir / f"stderr{suffix}.log")
+        write_env_values(payload.profile, {"BOT_PERSONALITY": one_line})
 
+        bot_pid_file = _pid_file(payload.profile, "bot")
+        running = _is_running(bot_pid_file)
+        if running:
+            _stop_pid(bot_pid_file)
+            logs_dir = VAR / "logs"
+            suffix = f".{payload.profile}" if payload.profile != MAIN_PROFILE else ""
+            _start(payload.profile, "main.py", bot_pid_file,
+                   logs_dir / f"stdout{suffix}.log", logs_dir / f"stderr{suffix}.log")
+        return running
+
+    was_running = await asyncio.to_thread(_apply_and_restart)
     return JSONResponse({"applied": True, "restarted": was_running})
 
 
