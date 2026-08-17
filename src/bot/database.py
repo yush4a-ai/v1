@@ -90,8 +90,14 @@ class Database:
         await self._conn.commit()
 
     async def close(self) -> None:
+        # Сбрасываем _conn, а не только закрываем соединение — иначе
+        # идемпотентность connect() (см. её докстринг) превращается в
+        # ловушку: connect() после close() видит _conn "не None" и молча
+        # возвращается, ничего не открыв заново, хотя соединение уже
+        # закрыто (bug-аудит 2026-08-15, HIGH #12).
         if self._conn:
             await self._conn.close()
+            self._conn = None
 
     async def touch_viewer(self, username: str) -> None:
         now = time.time()

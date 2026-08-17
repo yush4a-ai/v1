@@ -19,6 +19,7 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from cigilbot.domain.normalize import fingerprint
 from cigilbot.domain.types import (
     Action,
     ChatEvent,
@@ -1209,7 +1210,13 @@ class TestDailyStatsEndpoint:
         assert resp.status_code == 401
 
     async def test_returns_stats(self, app_client: TestClient, store: ModerationStore) -> None:
-        await store.increment_daily_stats(date="2026-08-08", total_messages=42)
+        # get_daily_stats() считается напрямую по mod_messages, не по
+        # mod_stats_daily (bug-аудит store.py, 2026-08-17) — пишем реальное
+        # сообщение, а не увеличиваем удалённый счётчик.
+        event = ChatEvent(
+            user_id="1", login="viewer1", text="привет", timestamp=time.time(), channel="test",
+        )
+        await store.save_message(event, fingerprint(event.text))
         login_as(app_client, "VIEWER")
 
         resp = app_client.get("/api/moderation/stats/daily")
@@ -1217,7 +1224,7 @@ class TestDailyStatsEndpoint:
         assert resp.status_code == 200
         data = resp.json()
         assert len(data) == 1
-        assert data[0]["total_messages"] == 42
+        assert data[0]["total_messages"] == 1
 
 
 class TestOverviewEndpoint:

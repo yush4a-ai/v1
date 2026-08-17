@@ -65,3 +65,45 @@ class TestRecordBan:
         actors = await store.list_all()
 
         assert {a.user_id for a in actors} == {"1", "2"}
+
+
+class TestConnectionLifecycle:
+    async def test_using_store_before_connect_raises(self, tmp_path: Path) -> None:
+        store = FingerprintStore(str(tmp_path / "unconnected.db"))
+        with pytest.raises(RuntimeError, match="connect"):
+            await store.list_all()
+
+    async def test_close_before_connect_is_a_noop(self, tmp_path: Path) -> None:
+        store = FingerprintStore(str(tmp_path / "unconnected.db"))
+        await store.close()
+
+    async def test_reconnect_after_close_works(self, tmp_path: Path) -> None:
+        db = tmp_path / "reconnect.db"
+        store = FingerprintStore(str(db))
+        await store.connect()
+        await store.record_ban(
+            user_id="1", login="bot1", banned_on_broadcaster_id="A", banned_on_login="channel_a"
+        )
+        await store.close()
+
+        await store.connect()
+        actor = await store.get("1")
+        assert actor is not None
+        assert actor.login == "bot1"
+        await store.close()
+
+    async def test_use_after_close_raises_connect_error_not_stale_connection(
+        self, tmp_path: Path
+    ) -> None:
+        """bug-аудит 2026-08-15, HIGH #12: close() закрывал aiosqlite-
+        соединение, но не обнулял _conn — свойство _db (единственный
+        guard "не вызван ли connect()") видело _conn "не None" и отдавало
+        УЖЕ ЗАКРЫТОЕ соединение вместо RuntimeError. Вызывающий код получал
+        невнятный aiosqlite.ValueError("no active connection") вместо
+        понятной ошибки жизненного цикла."""
+        store = FingerprintStore(str(tmp_path / "reconnect.db"))
+        await store.connect()
+        await store.close()
+
+        with pytest.raises(RuntimeError, match="connect"):
+            await store.list_all()

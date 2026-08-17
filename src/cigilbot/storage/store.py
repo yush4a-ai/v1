@@ -338,6 +338,15 @@ class ModerationStore:
 
     async def connect(self) -> None:
         self._conn = await aiosqlite.connect(self._path)
+        # Раньше выставлялся точечно в 16 read-методах и никогда не
+        # сбрасывался обратно — тихая мутация состояния общего соединения:
+        # порядок вызовов молча влиял на то, что возвращает следующий метод
+        # (row[N] по-прежнему работает и на aiosqlite.Row, поэтому не
+        # ломалось, но полагалось на совпадение, а не на контракт). Один
+        # раз здесь, как в registry_store.py/fingerprints_store.py —
+        # соединение приватное для ModerationStore, менять его на лету
+        # незачем.
+        self._conn.row_factory = aiosqlite.Row
         # WAL вместо стандартного rollback-журнала: коммит не переписывает
         # весь журнал целиком, а дописывает в конец — заметно дешевле при
         # частых мелких записях (вердикт на каждое сообщение чата).
@@ -362,8 +371,14 @@ class ModerationStore:
         await migrate(self._conn)
 
     async def close(self) -> None:
+        # Сбрасываем _conn, а не только закрываем соединение — иначе
+        # закрытая, но не обнулённая ссылка проходит мимо guard'а в
+        # свойстве _db ("connect() ещё не вызван"), и следующий запрос
+        # падает с невнятным исключением про закрытое соединение вместо
+        # понятного RuntimeError (bug-аудит 2026-08-15, HIGH #12).
         if self._conn is not None:
             await self._conn.close()
+            self._conn = None
 
     async def commit(self) -> None:
         """Явный коммит для вызывающих, которые сами объединяют несколько
@@ -428,7 +443,6 @@ class ModerationStore:
         return int(row[0]) if row else 0
 
     async def get_user_state(self, user_id: str) -> UserState | None:
-        self._db.row_factory = aiosqlite.Row
         cursor = await self._db.execute("SELECT * FROM mod_users WHERE user_id = ?", (user_id,))
         row = await cursor.fetchone()
         if row is None:
@@ -455,7 +469,6 @@ class ModerationStore:
         подстроке login (без учёта регистра) — точечный поиск конкретного
         зрителя, не полнотекстовый индекс, канал не настолько велик, чтобы
         LIKE по индексированному login был узким местом."""
-        self._db.row_factory = aiosqlite.Row
         if search:
             cursor = await self._db.execute(
                 """
@@ -649,7 +662,11 @@ class ModerationStore:
         return cluster_id
 
     async def upsert_cluster_by_members(self, cluster: ClusterInfo) -> int:
-        """То, что реально должен вызывать engine.py на каждый observe().
+        """Тонкая обёртка над upsert_cluster_by_members_ex(), отбрасывающая
+        is_new — сам движок (engine.py) зовёт _ex-вариант напрямую, ему
+        нужен именно is_new для Discord-алерта (см. докстринг _ex). Эта
+        версия используется тестами и местами, которым признак "новый vs
+        рост существующего" не нужен.
 
         Ищет уже существующий АКТИВНЫЙ кластер, чьи участники (mod_cluster_members)
         пересекаются хотя бы одним user_id с новым набором — если находит,
@@ -665,14 +682,6 @@ class ModerationStore:
         счёт вытеснения старых сообщений из окна), а не случайное совпадение:
         рёбра между сообщениями требуют реального сходства контента/домена/
         структуры, не одной лишь синхронности по времени.
-
-        Для различения "новый инцидент vs рост уже известного" (нужно
-        Discord-алерту — направление 01 master-plan.html: триггер только на
-        новый активный кластер, не на каждое обновление) есть
-        upsert_cluster_by_members_ex(), которая возвращает ту же пару
-        значений явно. Эта функция возвращает только id — существующие
-        вызывающие места (engine.py, тесты) не переписаны под кортеж, чтобы
-        не трогать их без необходимости.
         """
         cluster_id, _is_new = await self.upsert_cluster_by_members_ex(cluster)
         return cluster_id
@@ -754,7 +763,6 @@ class ModerationStore:
         return cursor.lastrowid
 
     async def get_pending_actions(self, *, limit: int = 10) -> list[QueueItem]:
-        self._db.row_factory = aiosqlite.Row
         cursor = await self._db.execute(
             "SELECT id, requested_by, requested_role, payload_json FROM mod_action_queue "
             "WHERE status = 'pending' ORDER BY id LIMIT ?",
@@ -825,7 +833,6 @@ class ModerationStore:
         """Активные кластеры для главного экрана панели, отсортированы по
         риску. `status='active'` — кластеры, по которым ещё не нажимали
         действие и не помечали safe/ignore (см. mod_clusters.status)."""
-        self._db.row_factory = aiosqlite.Row
         cursor = await self._db.execute(
             """
             SELECT id, created_at, size, risk_score, confidence, similarity_score,
@@ -875,7 +882,6 @@ class ModerationStore:
         вкладки), и после F5 они снова появлялись в ленте: вердикты в БД
         никуда не деваются (аудит), но разобранные модератором не должны
         продолжать засорять ленту подозрительных на каждой перезагрузке."""
-        self._db.row_factory = aiosqlite.Row
         cursor = await self._db.execute(
             """
             SELECT v.id, v.created_at, v.user_id, v.login, v.risk_score, v.confidence,
@@ -920,7 +926,6 @@ class ModerationStore:
 
     async def get_action_audit(self, *, limit: int = 100) -> list[dict[str, Any]]:
         """Журнал 'кто нажал что и по какому правилу' для экрана Audit."""
-        self._db.row_factory = aiosqlite.Row
         cursor = await self._db.execute(
             """
             SELECT id, created_at, actor, actor_role, action, scope, cluster_id,
@@ -959,7 +964,6 @@ class ModerationStore:
         await self._db.commit()
 
     async def list_panel_users(self) -> list[dict[str, Any]]:
-        self._db.row_factory = aiosqlite.Row
         cursor = await self._db.execute(
             "SELECT login, role, created_at, last_seen FROM mod_panel_users ORDER BY login"
         )
@@ -1030,7 +1034,6 @@ class ModerationStore:
         """login/message_count — из mod_users, для экрана "Доверенные
         зрители" (направление 04 master-plan.html): без них панель не
         может показать ник и историю активности, только голый user_id."""
-        self._db.row_factory = aiosqlite.Row
         cursor = await self._db.execute(
             # rowid, а не id: у mod_trusted первичный ключ — user_id (TEXT),
             # отдельной колонки id нет, но неявный rowid растёт по порядку
@@ -1071,7 +1074,6 @@ class ModerationStore:
         return cursor.lastrowid
 
     async def list_patterns(self, *, enabled_only: bool = False) -> list[Pattern]:
-        self._db.row_factory = aiosqlite.Row
         where = "WHERE enabled = 1" if enabled_only else ""
         cursor = await self._db.execute(
             f"""
@@ -1235,7 +1237,6 @@ class ModerationStore:
         return false_positives / len(rows)
 
     async def list_feedback(self, *, limit: int = 100) -> list[dict[str, Any]]:
-        self._db.row_factory = aiosqlite.Row
         cursor = await self._db.execute(
             """
             SELECT id, created_at, signal_name, verdict_id, cluster_id, user_id,
@@ -1252,40 +1253,75 @@ class ModerationStore:
 
     # -- дневная статистика (этап 9d) ----------------------------------------
 
-    async def increment_daily_stats(self, *, date: str, **counters: int) -> None:
-        """date в формате YYYY-MM-DD (UTC). counters — любое подмножество
-        колонок mod_stats_daily (total_messages, suspicious, would_timeout,
-        would_ban, actual_timeouts, actual_bans, clusters, false_positives);
-        каждый вызов ДОБАВЛЯЕТ к текущему значению, не перезаписывает —
-        engine.py/panel вызывают это по одному счётчику за раз по мере
-        появления событий, а не пересчитывают всё разом."""
-        allowed = {
-            "total_messages", "suspicious", "would_timeout", "would_ban",
-            "actual_timeouts", "actual_bans", "clusters", "false_positives",
-        }
-        unknown = set(counters) - allowed
-        if unknown:
-            raise ValueError(f"Неизвестные счётчики mod_stats_daily: {sorted(unknown)}")
-        if not counters:
-            return
-
-        await self._db.execute(
-            f"""
-            INSERT INTO mod_stats_daily (date, {", ".join(counters)})
-            VALUES (?, {", ".join("?" for _ in counters)})
-            ON CONFLICT(date) DO UPDATE SET
-                {", ".join(f"{col} = mod_stats_daily.{col} + excluded.{col}" for col in counters)}
-            """,
-            (date, *counters.values()),
-        )
-        await self._db.commit()
-
     async def get_daily_stats(self, *, days: int = 30) -> list[dict[str, Any]]:
-        self._db.row_factory = aiosqlite.Row
+        """Один агрегированный элемент за period=days, не по-дневная
+        разбивка — оба потребителя (panel/moderation.js::loadStats(),
+        report.py::build_report()) суммируют весь список одинаково, реальная
+        группировка по датам никому не нужна.
+
+        Считается напрямую по mod_messages/mod_verdicts/mod_clusters/
+        mod_actions за период — раньше писалось через increment_daily_stats()
+        в отдельную таблицу mod_stats_daily, но тот метод не вызывался ни из
+        engine.py, ни из executor.py (докстринг обещал вызовы, которых не
+        было) — таблица в проде была всегда пустой, и панель, и CLI-отчёт
+        показывали нули (bug-аудит 2026-08-15 + доп. аудит store.py,
+        2026-08-17). mod_stats_daily остаётся в схеме нетронутой (тот же
+        принцип, что у mod_inbox/panel_admins, см. CLAUDE.md) — дропать
+        существующую таблицу самим не стоит, просто больше не пишем и не
+        читаем её.
+
+        false_positives сюда не входит: report.py уже считает его отдельно,
+        напрямую из list_feedback() — дублировать источник незачем."""
+        since = time.time() - days * 86400
+
         cursor = await self._db.execute(
-            "SELECT * FROM mod_stats_daily ORDER BY date DESC LIMIT ?", (days,)
+            "SELECT COUNT(*) FROM mod_messages WHERE created_at >= ?", (since,)
         )
-        return [dict(row) for row in await cursor.fetchall()]
+        row = await cursor.fetchone()
+        total_messages = int(row[0]) if row else 0
+
+        # См. get_digest_stats: "подозрительное" — TIMEOUT/BAN, не OBSERVE.
+        cursor = await self._db.execute(
+            "SELECT "
+            "SUM(CASE WHEN recommended_action = 'TIMEOUT' THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN recommended_action = 'BAN' THEN 1 ELSE 0 END) "
+            "FROM mod_verdicts WHERE created_at >= ? AND recommended_action IN ('TIMEOUT', 'BAN')",
+            (since,),
+        )
+        row = await cursor.fetchone()
+        would_timeout = int(row[0]) if row and row[0] is not None else 0
+        would_ban = int(row[1]) if row and row[1] is not None else 0
+        suspicious = would_timeout + would_ban
+
+        clusters = await self.count_recent_new_clusters(since=since)
+
+        # mod_actions — ручные действия из панели (record_action_audit),
+        # succeeded > 0 значит хотя бы одна цель реально исполнена этим
+        # запросом. Не mod_action_queue: та таблица хранит задания и их
+        # статус обработки, не факт успешного исполнения на Twitch.
+        cursor = await self._db.execute(
+            "SELECT "
+            "SUM(CASE WHEN action = 'TIMEOUT' THEN succeeded ELSE 0 END), "
+            "SUM(CASE WHEN action = 'BAN' THEN succeeded ELSE 0 END) "
+            "FROM mod_actions WHERE created_at >= ?",
+            (since,),
+        )
+        row = await cursor.fetchone()
+        actual_timeouts = int(row[0]) if row and row[0] is not None else 0
+        actual_bans = int(row[1]) if row and row[1] is not None else 0
+
+        return [
+            {
+                "total_messages": total_messages,
+                "suspicious": suspicious,
+                "would_timeout": would_timeout,
+                "would_ban": would_ban,
+                "actual_timeouts": actual_timeouts,
+                "actual_bans": actual_bans,
+                "clusters": clusters,
+                "false_positives": 0,
+            }
+        ]
 
     # -- аудит действий ----------------------------------------------------
 
@@ -1441,11 +1477,7 @@ class ModerationStore:
         would_ban = int(row[1]) if row and row[1] is not None else 0
         suspicious_verdicts = would_timeout + would_ban
 
-        cursor = await self._db.execute(
-            "SELECT COUNT(*) FROM mod_clusters WHERE created_at >= ?", (since,)
-        )
-        row = await cursor.fetchone()
-        new_clusters = int(row[0]) if row else 0
+        new_clusters = await self.count_recent_new_clusters(since=since)
 
         return DigestStats(
             total_messages=total_messages,
@@ -1494,7 +1526,6 @@ class ModerationStore:
             for r in await cursor.fetchall()
         )
 
-        self._db.row_factory = aiosqlite.Row
         cursor = await self._db.execute(
             "SELECT created_at, actor, action, scope, succeeded, failed "
             "FROM mod_actions WHERE created_at >= ? "
@@ -1521,7 +1552,6 @@ class ModerationStore:
         раньше ADVERTISING) — check_content() возвращает первое совпадение,
         порядок определяет, какая категория выигрывает при пересечении
         формулировок в разных правилах."""
-        self._db.row_factory = aiosqlite.Row
         where = "WHERE enabled = 1" if enabled_only else ""
         order = (
             "CASE category "
@@ -1892,7 +1922,6 @@ class ModerationStore:
         manual_action/manual_action_by/manual_action_at (миграция 016) —
         пометка "по этой строке уже нажали кнопку в панели", переживает
         обновление страницы (см. mark_content_event_manual_action)."""
-        self._db.row_factory = aiosqlite.Row
         cursor = await self._db.execute(
             """
             SELECT e.id, e.created_at, e.user_id, e.login, e.category, e.matched_phrase,
@@ -1956,7 +1985,6 @@ class ModerationStore:
         цепляло мусор (ник, время — см. предыдущее сообщение пользователя
         с "ЫЫЫЫ75): " в начале образца) — список из самой БД гарантирует
         точный текст, без ручной правки."""
-        self._db.row_factory = aiosqlite.Row
         cursor = await self._db.execute(
             "SELECT login, text, created_at FROM mod_messages ORDER BY created_at DESC LIMIT ?",
             (limit,),
@@ -1991,7 +2019,6 @@ class ModerationStore:
         sample_hash = minhash(sample_text)
         since = time.time() - window_seconds
 
-        self._db.row_factory = aiosqlite.Row
         cursor = await self._db.execute(
             "SELECT user_id, login, text, created_at FROM mod_messages "
             "WHERE created_at >= ? ORDER BY created_at DESC",

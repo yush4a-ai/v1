@@ -43,3 +43,26 @@ class TestPurgeOldMessages:
 
     async def test_nothing_to_delete_returns_zero(self, db: Database) -> None:
         assert await db.purge_old_messages(older_than_days=30.0) == 0
+
+
+class TestConnectionLifecycle:
+    """bug-аудит 2026-08-15, HIGH #12: close() закрывал соединение, но не
+    обнулял _conn — идемпотентный connect() (докстринг: "срабатывает у
+    twitchio на КАЖДЫЙ реконнект IRC") после close() видел _conn "не None"
+    и молча возвращался, ничего не открыв заново."""
+
+    async def test_close_before_connect_is_a_noop(self, tmp_path: Path) -> None:
+        database = Database(str(tmp_path / "unconnected.db"))
+        await database.close()
+
+    async def test_reconnect_after_close_works(self, tmp_path: Path) -> None:
+        database = Database(str(tmp_path / "reconnect.db"))
+        await database.connect()
+        await database.touch_viewer("viewer1")
+        await database.close()
+
+        await database.connect()
+        cursor = await database._conn.execute("SELECT username FROM viewers")
+        rows = await cursor.fetchall()
+        assert [row[0] for row in rows] == ["viewer1"]
+        await database.close()

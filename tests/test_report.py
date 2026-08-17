@@ -1,11 +1,20 @@
-"""Тесты report.py: агрегация mod_stats_daily/mod_feedback в текстовую сводку."""
+"""Тесты report.py: агрегация get_daily_stats()/mod_feedback в текстовую сводку.
+
+get_daily_stats() считается напрямую по mod_messages/mod_verdicts/
+mod_clusters/mod_actions (bug-аудит store.py, 2026-08-17) — тестовые данные
+здесь пишутся через реальные save_message/save_verdict, не через удалённый
+increment_daily_stats().
+"""
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
 
+from cigilbot.domain.normalize import fingerprint
+from cigilbot.domain.types import Action, ChatEvent, Verdict
 from cigilbot.orchestration.report import build_report
 from cigilbot.storage.store import ModerationStore
 
@@ -17,6 +26,12 @@ async def store(tmp_path: Path) -> ModerationStore:
     return s
 
 
+def make_event(*, user_id: str, login: str, timestamp: float) -> ChatEvent:
+    return ChatEvent(
+        user_id=user_id, login=login, text="привет чат", timestamp=timestamp, channel="test",
+    )
+
+
 class TestBuildReport:
     async def test_empty_db_gives_zeroed_report(self, store: ModerationStore) -> None:
         report = await build_report(store)
@@ -25,22 +40,32 @@ class TestBuildReport:
         assert report.total_suspicious == 0
         assert report.signal_fp_stats == []
 
-    async def test_sums_across_multiple_days(self, store: ModerationStore) -> None:
-        await store.increment_daily_stats(date="2026-08-07", total_messages=100, suspicious=10)
-        await store.increment_daily_stats(date="2026-08-08", total_messages=50, suspicious=5)
+    async def test_sums_messages_and_suspicious_verdicts(self, store: ModerationStore) -> None:
+        now = time.time()
+        for i in range(3):
+            event = make_event(user_id=str(i), login=f"viewer{i}", timestamp=now)
+            await store.save_message(event, fingerprint(event.text))
+        verdict = Verdict(
+            user_id="1", login="a", risk_score=90, confidence=0.9, signals=(),
+            recommended_action=Action.BAN, reason="test", timestamp=now,
+        )
+        await store.save_verdict(verdict)
 
         report = await build_report(store)
 
-        assert report.total_messages == 150
-        assert report.total_suspicious == 15
+        assert report.total_messages == 3
+        assert report.total_suspicious == 1
 
     async def test_respects_days_window(self, store: ModerationStore) -> None:
-        for day in range(1, 11):
-            await store.increment_daily_stats(date=f"2026-08-{day:02d}", total_messages=1)
+        now = time.time()
+        old_event = make_event(user_id="1", login="old", timestamp=now - 10 * 86400)
+        recent_event = make_event(user_id="2", login="recent", timestamp=now)
+        await store.save_message(old_event, fingerprint(old_event.text))
+        await store.save_message(recent_event, fingerprint(recent_event.text))
 
         report = await build_report(store, days=3)
 
-        assert report.total_messages == 3
+        assert report.total_messages == 1
 
     async def test_signal_fp_stats_aggregated_per_signal(self, store: ModerationStore) -> None:
         await store.record_feedback(
@@ -64,11 +89,16 @@ class TestBuildReport:
 
 class TestFormatSummary:
     async def test_includes_key_numbers(self, store: ModerationStore) -> None:
-        await store.increment_daily_stats(
-            date="2026-08-08", total_messages=200, suspicious=20,
-            would_timeout=5, would_ban=1, actual_timeouts=0, actual_bans=0,
-            clusters=2, false_positives=1,
-        )
+        now = time.time()
+        for i in range(200):
+            event = make_event(user_id=str(i), login=f"v{i}", timestamp=now)
+            await store.save_message(event, fingerprint(event.text))
+        for i in range(20):
+            verdict = Verdict(
+                user_id=str(i), login=f"v{i}", risk_score=90, confidence=0.9, signals=(),
+                recommended_action=Action.BAN, reason="test", timestamp=now,
+            )
+            await store.save_verdict(verdict)
 
         report = await build_report(store)
         text = report.format_summary()

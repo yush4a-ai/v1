@@ -197,3 +197,31 @@ class TestConnectionLifecycle:
     async def test_close_before_connect_is_a_noop(self, tmp_path: Path) -> None:
         store = RegistryStore(str(tmp_path / "unconnected.db"))
         await store.close()
+
+    async def test_reconnect_after_close_works(self, tmp_path: Path) -> None:
+        db = tmp_path / "reconnect.db"
+        store = RegistryStore(str(db))
+        await store.connect()
+        await store.upsert_channel(broadcaster_id="1", login="alpha", registered_by="test")
+        await store.close()
+
+        await store.connect()
+        channels = await store.list_channels()
+        assert [c.login for c in channels] == ["alpha"]
+        await store.close()
+
+    async def test_use_after_close_raises_connect_error_not_stale_connection(
+        self, tmp_path: Path
+    ) -> None:
+        """bug-аудит 2026-08-15, HIGH #12: close() закрывал aiosqlite-
+        соединение, но не обнулял _conn — свойство _db (единственный
+        guard "не вызван ли connect()") видело _conn "не None" и отдавало
+        УЖЕ ЗАКРЫТОЕ соединение вместо RuntimeError. Вызывающий код получал
+        невнятный aiosqlite.ValueError("no active connection") вместо
+        понятной ошибки жизненного цикла."""
+        store = RegistryStore(str(tmp_path / "reconnect.db"))
+        await store.connect()
+        await store.close()
+
+        with pytest.raises(RuntimeError, match="connect"):
+            await store.list_channels()

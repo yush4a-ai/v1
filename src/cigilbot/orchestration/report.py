@@ -68,9 +68,11 @@ async def build_report(store: ModerationStore, *, days: int = 30) -> ModerationR
     daily_rows = await store.get_daily_stats(days=days)
     feedback_rows = await store.list_feedback(limit=10_000)
 
+    # false_positives сюда не входит — get_daily_stats() больше не считает
+    # его (см. её докстринг), реальный источник ниже, по feedback_rows.
     totals = {
         "total_messages": 0, "suspicious": 0, "would_timeout": 0, "would_ban": 0,
-        "actual_timeouts": 0, "actual_bans": 0, "clusters": 0, "false_positives": 0,
+        "actual_timeouts": 0, "actual_bans": 0, "clusters": 0,
     }
     for row in daily_rows:
         for key in totals:
@@ -88,6 +90,12 @@ async def build_report(store: ModerationStore, *, days: int = 30) -> ModerationR
         )
         for name, decisions in per_signal.items()
     ]
+    # Раньше total_false_positives читался из totals["false_positives"],
+    # который всегда был 0 (mod_stats_daily никогда не заполнялась, см.
+    # get_daily_stats) — отчёт врал про число FP, хотя сами данные для
+    # этого поля уже лежали в feedback_rows, просто не были просуммированы
+    # сюда (bug-аудит store.py, 2026-08-17).
+    total_false_positives = sum(s.false_positive_count for s in signal_stats)
 
     return ModerationReport(
         days_covered=days,
@@ -98,6 +106,6 @@ async def build_report(store: ModerationStore, *, days: int = 30) -> ModerationR
         total_actual_timeouts=totals["actual_timeouts"],
         total_actual_bans=totals["actual_bans"],
         total_clusters=totals["clusters"],
-        total_false_positives=totals["false_positives"],
+        total_false_positives=total_false_positives,
         signal_fp_stats=signal_stats,
     )

@@ -81,10 +81,14 @@ def _read_env_file(env_file: Path) -> dict[str, str]:
 class ModTokenManager:
     """Держит текущий access_token в памяти, обновляет по требованию.
 
-    Один инстанс на процесс бота, создаётся при старте (main.py), передаётся
-    в ActionExecutor как источник актуального user_token — executor.py не
-    знает про refresh, просто спрашивает get_valid_access_token() перед
-    каждым вызовом Helix.
+    Один инстанс на процесс бота — создаётся в ModerationHub.start()
+    (cigilbot/orchestration/pipeline.py) и передаётся в каждый
+    ChannelPipeline, а не создаётся заново на каждый канал: Twitch ротирует
+    refresh_token при каждом обмене, и по-канальные менеджеры, стартующие
+    с одинаковым refresh_token из общего .env, отзывали бы токен друг у
+    друга (bug-аудит 2026-08-17, HIGH). ActionExecutor получает актуальный
+    user_token через get_valid_access_token() — executor.py не знает про
+    refresh вообще.
     """
 
     def __init__(

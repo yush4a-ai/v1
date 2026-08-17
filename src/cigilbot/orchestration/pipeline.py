@@ -109,7 +109,13 @@ class ChannelPipeline:
     """
 
     def __init__(
-        self, *, broadcaster_id: str, channel: str, mod_db_path: Path, fingerprints_db_path: Path
+        self,
+        *,
+        broadcaster_id: str,
+        channel: str,
+        mod_db_path: Path,
+        fingerprints_db_path: Path,
+        mod_token_manager: ModTokenManager | None = None,
     ) -> None:
         self.broadcaster_id = broadcaster_id
         self.channel = channel
@@ -120,7 +126,17 @@ class ChannelPipeline:
         # для detection-кеша, этот только пишет по одной записи за раз.
         self.fingerprint_store = FingerprintStore(str(fingerprints_db_path))
         self.engine: ModerationEngine | None = None
-        self.mod_token_manager: ModTokenManager | None = None
+        # Передан хабом, а не создан здесь: токен модератора один на ВЕСЬ
+        # процесс бота (User Access Token аккаунта бота, годен для любого
+        # канала, где бот реально модератор — см. докстринг _poll_action_queue
+        # про то, почему broadcaster_id из состояния токена не используется).
+        # Раньше каждый ChannelPipeline создавал свой ModTokenManager из
+        # одного .env — все стартовали с одинаковым refresh_token, и первый
+        # канал, дошедший до _refresh(), отзывал его у остальных: Twitch
+        # ротирует refresh_token при каждом обмене, второй канал получал
+        # 400 invalid_grant (bug-аудит 2026-08-17, HIGH). Один инстанс на
+        # хаб убирает гонку структурно, а не локом.
+        self.mod_token_manager = mod_token_manager
         self.helix_client: HelixClient | None = None
         # Отдельный клиент только для get_users() (возраст аккаунта) — та
         # ручка работает по App Access Token (client_id/secret), без scope
@@ -172,8 +188,10 @@ class ChannelPipeline:
         )
 
     def _setup_twitch_clients(self) -> None:
-        """Токен модератора живёт в КОРНЕВОМ .env (одна панель, одна кнопка
-        получения токена, см. panel/auth.py::/auth/bot/login)."""
+        """account_age_client — свой на канал (лёгкий, App Access Token,
+        без состояния кроме кэша токена внутри HelixClient). mod_token_manager
+        общий на процесс, передан хабом в конструктор — здесь только решаем,
+        появляется ли helix_client для очереди действий."""
         client_id = os.environ.get("PANEL_TWITCH_CLIENT_ID", "")
         client_secret = os.environ.get("PANEL_TWITCH_CLIENT_SECRET", "")
         if not (client_id and client_secret):
@@ -185,11 +203,6 @@ class ChannelPipeline:
             return
 
         self.account_age_client = HelixClient(client_id, client_secret)
-        self.mod_token_manager = load_mod_token_manager(
-            client_id=client_id,
-            client_secret=client_secret,
-            env_file=paths.REPO_ROOT / ".env",
-        )
         if self.mod_token_manager is not None:
             self.helix_client = HelixClient(client_id, client_secret)
             log.info("Токен модератора настроен — очередь действий будет исполняться")
@@ -496,6 +509,10 @@ class ModerationHub:
         # Отдельно от ChannelPipeline.fingerprint_store, который только
         # пишет после BAN (см. докстринг там).
         self._fingerprints: FingerprintStore | None = None
+        # Один инстанс на процесс, общий для всех ChannelPipeline — см.
+        # докстринг параметра mod_token_manager в ChannelPipeline.__init__
+        # про то, почему не по одному на канал.
+        self._mod_token_manager: ModTokenManager | None = None
         self._pipelines: dict[str, ChannelPipeline] = {}
         # login -> broadcaster_id: события из чата приходят с именем канала
         # (twitchio знает login, не числовой id), а пайплайны разложены по
@@ -513,6 +530,7 @@ class ModerationHub:
         await self._registry.connect()
         self._fingerprints = FingerprintStore(str(self._fingerprints_db_path))
         await self._fingerprints.connect()
+        self._mod_token_manager = self._load_mod_token_manager()
         await self._reconcile()
         await self._sync_fingerprints()
         self._reconcile_task = asyncio.create_task(self._reconcile_loop(), name="mod-reconcile")
@@ -520,6 +538,20 @@ class ModerationHub:
             self._sync_fingerprints_loop(), name="mod-fingerprints"
         )
         log.info("Модерация запущена в процессе бота (каналов: %d)", len(self._pipelines))
+
+    def _load_mod_token_manager(self) -> ModTokenManager | None:
+        """Токен модератора живёт в КОРНЕВОМ .env (одна панель, одна кнопка
+        получения токена, см. panel/auth.py::/auth/bot/login). Один вызов на
+        хаб, не на канал — см. докстринг self._mod_token_manager."""
+        client_id = os.environ.get("PANEL_TWITCH_CLIENT_ID", "")
+        client_secret = os.environ.get("PANEL_TWITCH_CLIENT_SECRET", "")
+        if not (client_id and client_secret):
+            return None
+        return load_mod_token_manager(
+            client_id=client_id,
+            client_secret=client_secret,
+            env_file=paths.REPO_ROOT / ".env",
+        )
 
     async def stop(self) -> None:
         if self._reconcile_task is not None:
@@ -534,6 +566,9 @@ class ModerationHub:
             await pipeline.stop()
         self._pipelines.clear()
         self._by_login.clear()
+        if self._mod_token_manager is not None:
+            await self._mod_token_manager.close()
+            self._mod_token_manager = None
         if self._registry is not None:
             await self._registry.close()
             self._registry = None
@@ -629,6 +664,7 @@ class ModerationHub:
             channel=login,
             mod_db_path=paths.mod_db(record.broadcaster_id),
             fingerprints_db_path=paths.FINGERPRINTS_DB,
+            mod_token_manager=self._mod_token_manager,
         )
         try:
             await pipeline.start()

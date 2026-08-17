@@ -120,21 +120,32 @@ def _parse_iso8601(value: str) -> float:
 class _RateLimiter:
     """Простой ограничитель частоты запросов — не даёт executor'у делать
     больше N запросов в секунду, даже если очередь просит забанить сотню
-    пользователей разом (см. раздел 16 ТЗ "Rate Limiting")."""
+    пользователей разом (см. раздел 16 ТЗ "Rate Limiting").
+
+    HelixClient — один инстанс на канал, но внутри канала его используют
+    параллельно несколько фоновых задач (_poll_account_age и
+    _poll_action_queue в pipeline.py, каждая своим циклом). Без лока
+    read-sleep-write не атомарен: несколько корутин читают одно и то же
+    _last_request, спят на основе него и лишь потом пишут — все просыпаются
+    одновременно и лимит нарушается пропорционально числу конкурентных
+    вызовов (bug-аудит 2026-08-17, HIGH; воспроизведено — 5 конкурентных
+    запросов уходили за 0.2с вместо заявленных 0.8с при 5 rps)."""
 
     def __init__(self, max_per_second: float) -> None:
         self._min_interval = 1.0 / max_per_second if max_per_second > 0 else 0.0
         self._last_request = 0.0
+        self._lock = asyncio.Lock()
 
     async def wait(self) -> None:
         if self._min_interval <= 0:
             return
-        now = time.monotonic()
-        elapsed = now - self._last_request
-        remaining = self._min_interval - elapsed
-        if remaining > 0:
-            await asyncio.sleep(remaining)
-        self._last_request = time.monotonic()
+        async with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_request
+            remaining = self._min_interval - elapsed
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+            self._last_request = time.monotonic()
 
 
 class HelixClient:

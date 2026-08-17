@@ -226,7 +226,10 @@ class TestSaveVerdict:
             (verdict_id,),
         )
         row = await cursor.fetchone()
-        assert row == (42, 0.55, "OBSERVE")
+        assert row is not None
+        # row_factory теперь всегда aiosqlite.Row (см. connect()), а не
+        # дефолтный кортеж — сравниваем через tuple(row), не завися от типа.
+        assert tuple(row) == (42, 0.55, "OBSERVE")
 
         cursor = await store._db.execute(
             "SELECT COUNT(*) FROM mod_signals WHERE verdict_id = ?", (verdict_id,)
@@ -259,7 +262,8 @@ class TestSaveVerdict:
             "SELECT pattern_id FROM mod_verdicts WHERE id = ?", (verdict_id,)
         )
         row = await cursor.fetchone()
-        assert row == (pattern_id,)
+        assert row is not None
+        assert tuple(row) == (pattern_id,)
 
 
 class TestPurgeOldRecords:
@@ -967,6 +971,36 @@ class TestNotConnected:
         with pytest.raises(RuntimeError, match="connect"):
             _ = store._db
 
+    async def test_same_instance_reconnects_after_close(
+        self, tmp_path: Path, event_factory: EventFactory
+    ) -> None:
+        store = ModerationStore(str(tmp_path / "reconnect.db"))
+        await store.connect()
+        await store.upsert_user(event_factory(user_id="1", login="viewer1"))
+        await store.close()
+
+        await store.connect()
+        state = await store.get_user_state("1")
+        assert state is not None
+        assert state.login == "viewer1"
+        await store.close()
+
+    async def test_use_after_close_raises_connect_error_not_stale_connection(
+        self, tmp_path: Path
+    ) -> None:
+        """bug-аудит 2026-08-15, HIGH #12: close() закрывал aiosqlite-
+        соединение, но не обнулял _conn — свойство _db (единственный
+        guard "не вызван ли connect()") видело _conn "не None" и отдавало
+        УЖЕ ЗАКРЫТОЕ соединение вместо RuntimeError. Вызывающий код получал
+        невнятный aiosqlite.ValueError("no active connection") вместо
+        понятной ошибки жизненного цикла."""
+        store = ModerationStore(str(tmp_path / "reconnect.db"))
+        await store.connect()
+        await store.close()
+
+        with pytest.raises(RuntimeError, match="connect"):
+            _ = store._db
+
 
 class TestActionQueue:
     async def test_enqueue_returns_id(self, store: ModerationStore) -> None:
@@ -1455,47 +1489,86 @@ class TestFeedback:
 
 
 class TestDailyStats:
-    async def test_increment_creates_row(self, store: ModerationStore) -> None:
-        await store.increment_daily_stats(date="2026-08-08", total_messages=10, suspicious=3)
+    """get_daily_stats() считается напрямую по mod_messages/mod_verdicts/
+    mod_clusters/mod_actions, не по mod_stats_daily — increment_daily_stats()
+    убран, таблица никогда не заполнялась в проде (bug-аудит store.py,
+    2026-08-17), панель и report.py показывали нули. Один агрегированный
+    элемент за весь период, не по-дневная разбивка — оба потребителя
+    суммируют список одинаково, дат в ответе не используют."""
 
-        rows = await store.get_daily_stats()
+    async def test_returns_single_aggregated_row(
+        self, store: ModerationStore, event_factory: EventFactory
+    ) -> None:
+        now = time.time()
+        event = event_factory(user_id="1", login="viewer1", timestamp=now)
+        await store.save_message(event, fingerprint(event.text))
+
+        rows = await store.get_daily_stats(days=30)
 
         assert len(rows) == 1
-        assert rows[0]["date"] == "2026-08-08"
-        assert rows[0]["total_messages"] == 10
-        assert rows[0]["suspicious"] == 3
-        assert rows[0]["would_ban"] == 0
+        assert rows[0]["total_messages"] == 1
 
-    async def test_increment_accumulates(self, store: ModerationStore) -> None:
-        await store.increment_daily_stats(date="2026-08-08", total_messages=10)
-        await store.increment_daily_stats(date="2026-08-08", total_messages=5)
+    async def test_counts_messages_since_period_start(
+        self, store: ModerationStore, event_factory: EventFactory
+    ) -> None:
+        now = time.time()
+        old = event_factory(user_id="1", login="a", timestamp=now - 40 * 86400)
+        recent = event_factory(user_id="2", login="b", timestamp=now - 10)
+        await store.save_message(old, fingerprint(old.text))
+        await store.save_message(recent, fingerprint(recent.text))
 
-        rows = await store.get_daily_stats()
+        rows = await store.get_daily_stats(days=30)
 
-        assert rows[0]["total_messages"] == 15
+        assert rows[0]["total_messages"] == 1
 
-    async def test_separate_dates_separate_rows(self, store: ModerationStore) -> None:
-        await store.increment_daily_stats(date="2026-08-07", total_messages=10)
-        await store.increment_daily_stats(date="2026-08-08", total_messages=5)
+    async def test_counts_would_timeout_and_would_ban(self, store: ModerationStore) -> None:
+        now = time.time()
+        timeout_verdict = Verdict(
+            user_id="1", login="a", risk_score=60, confidence=0.6, signals=(),
+            recommended_action=Action.TIMEOUT, reason="test", timestamp=now,
+        )
+        ban_verdict = Verdict(
+            user_id="2", login="b", risk_score=90, confidence=0.9, signals=(),
+            recommended_action=Action.BAN, reason="test", timestamp=now,
+        )
+        await store.save_verdict(timeout_verdict)
+        await store.save_verdict(ban_verdict)
 
-        rows = await store.get_daily_stats()
+        rows = await store.get_daily_stats(days=30)
 
-        assert len(rows) == 2
+        assert rows[0]["would_timeout"] == 1
+        assert rows[0]["would_ban"] == 1
+        assert rows[0]["suspicious"] == 2
 
-    async def test_unknown_counter_rejected(self, store: ModerationStore) -> None:
-        with pytest.raises(ValueError, match="typo_counter"):
-            await store.increment_daily_stats(date="2026-08-08", typo_counter=1)
+    async def test_counts_clusters(self, store: ModerationStore) -> None:
+        await store.save_cluster(make_cluster())
 
-    async def test_no_counters_is_noop(self, store: ModerationStore) -> None:
-        await store.increment_daily_stats(date="2026-08-08")
-        assert await store.get_daily_stats() == []
+        rows = await store.get_daily_stats(days=30)
 
-    async def test_days_limit_respected(self, store: ModerationStore) -> None:
-        for day in range(1, 6):
-            await store.increment_daily_stats(date=f"2026-08-{day:02d}", total_messages=1)
+        assert rows[0]["clusters"] == 1
 
-        rows = await store.get_daily_stats(days=2)
+    async def test_counts_actual_timeouts_and_bans_from_mod_actions(
+        self, store: ModerationStore
+    ) -> None:
+        await store.record_action_audit(
+            actor="mod1", actor_role="MODERATOR", action="TIMEOUT", scope="user",
+            reason="spam", confirmation="MANUAL", succeeded=3, failed=1, details={},
+        )
+        await store.record_action_audit(
+            actor="mod1", actor_role="MODERATOR", action="BAN", scope="cluster",
+            reason="bot wave", confirmation="MANUAL", succeeded=5, failed=0, details={},
+        )
 
-        assert len(rows) == 2
-        # ORDER BY date DESC -> самые свежие даты первыми
-        assert rows[0]["date"] == "2026-08-05"
+        rows = await store.get_daily_stats(days=30)
+
+        assert rows[0]["actual_timeouts"] == 3
+        assert rows[0]["actual_bans"] == 5
+
+    async def test_empty_store_returns_zeros(self, store: ModerationStore) -> None:
+        rows = await store.get_daily_stats(days=30)
+
+        assert len(rows) == 1
+        assert rows[0] == {
+            "total_messages": 0, "suspicious": 0, "would_timeout": 0, "would_ban": 0,
+            "actual_timeouts": 0, "actual_bans": 0, "clusters": 0, "false_positives": 0,
+        }

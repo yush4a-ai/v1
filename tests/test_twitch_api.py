@@ -7,6 +7,8 @@ cigilbot/twitch_api.py).
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 
@@ -431,3 +433,41 @@ class TestRetryAndRateLimit:
         # Экспоненциальный backoff (backoff_base_seconds=1.0): 1, 2, 4 —
         # ни одна попытка не должна была вырасти до ~3600 сек из заголовка.
         assert all(delay < 10.0 for delay in sleep_calls)
+
+    async def test_rate_limiter_serializes_concurrent_callers(self) -> None:
+        """bug-аудит 2026-08-17, HIGH: _RateLimiter.wait() читал
+        _last_request, спал, потом писал — без лока. HelixClient один на
+        канал, но используется параллельно из _poll_account_age и
+        _poll_action_queue (pipeline.py) — несколько корутин могли читать
+        одно и то же старое _last_request до того, как любая из них
+        успевала его обновить, вычислять одинаковый remaining и засыпать
+        независимо друг от друга вместо очереди. Воспроизведено руками:
+        5 конкурентных запросов уходили за 0.2с вместо ожидаемых 0.8с при
+        5 rps.
+
+        Прямая проверка: пока критическая секция wait() занята одним
+        вызывающим (лок захвачен вручную), второй конкурентный wait() не
+        должен иметь возможности читать/писать _last_request — он обязан
+        блокироваться на await self._lock, а не проскочить мимо."""
+        limiter_module = __import__(
+            "cigilbot.integrations.twitch_api", fromlist=["_RateLimiter"]
+        )
+        limiter = limiter_module._RateLimiter(max_per_second=1000.0)  # sleep не понадобится
+
+        assert hasattr(limiter, "_lock") and isinstance(limiter._lock, asyncio.Lock), (
+            "_RateLimiter должен сериализовать доступ к _last_request через "
+            "asyncio.Lock — без него конкурентные вызывающие обходят лимит"
+        )
+
+        await limiter._lock.acquire()
+        try:
+            second_call = asyncio.create_task(limiter.wait())
+            await asyncio.sleep(0)  # даём second_call шанс выполниться, если сможет
+            assert not second_call.done(), (
+                "второй wait() завершился, пока лок был занят первым — "
+                "критическая секция не сериализована"
+            )
+        finally:
+            limiter._lock.release()
+
+        await second_call  # теперь должен беспрепятственно завершиться

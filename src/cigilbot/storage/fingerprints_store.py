@@ -53,8 +53,14 @@ class FingerprintStore:
         await migrate(self._conn)
 
     async def close(self) -> None:
+        # Сбрасываем _conn, а не только закрываем соединение — иначе
+        # закрытая, но не обнулённая ссылка проходит мимо guard'а в
+        # свойстве _db ("connect() ещё не вызван"), и следующий запрос
+        # падает с невнятным исключением про закрытое соединение вместо
+        # понятного RuntimeError (bug-аудит 2026-08-15, HIGH #12).
         if self._conn is not None:
             await self._conn.close()
+            self._conn = None
 
     @property
     def _db(self) -> aiosqlite.Connection:

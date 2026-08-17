@@ -173,12 +173,19 @@ class _FakePipeline:
     fail_start_for: set[str] = set()
 
     def __init__(
-        self, *, broadcaster_id: str, channel: str, mod_db_path: Path, fingerprints_db_path: Path
+        self,
+        *,
+        broadcaster_id: str,
+        channel: str,
+        mod_db_path: Path,
+        fingerprints_db_path: Path,
+        mod_token_manager: object | None = None,
     ) -> None:
         self.broadcaster_id = broadcaster_id
         self.channel = channel
         self.mod_db_path = mod_db_path
         self.fingerprints_db_path = fingerprints_db_path
+        self.mod_token_manager = mod_token_manager
         self.started = False
         self.stopped = False
         self.submitted: list[dict[str, object]] = []
@@ -287,6 +294,57 @@ class TestHubRouting:
         try:
             assert fake_pipeline.instances == []
             assert hub.submit(_chat("x", channel="alpha")) is False
+        finally:
+            await hub.stop()
+
+
+class TestHubSharesOneModTokenManager:
+    """bug-аудит 2026-08-17, HIGH: раньше каждый ChannelPipeline создавал
+    свой ModTokenManager из общего .env — Twitch ротирует refresh_token при
+    каждом обмене, второй канал получал invalid_grant (см. test_mod_token.py
+    ::TestConcurrentManagersOnSharedEnv для гонки на уровне менеджера).
+    Здесь проверяется структурная сторона фикса: ModerationHub создаёт
+    ОДИН ModTokenManager и передаёт один и тот же объект каждому каналу."""
+
+    async def test_all_pipelines_receive_the_same_manager_instance(
+        self, tmp_path: Path, fake_pipeline: type[_FakePipeline], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _SentinelManager:
+            closed = False
+
+            async def close(self) -> None:
+                self.closed = True
+
+        sentinel = _SentinelManager()
+        monkeypatch.setenv("PANEL_TWITCH_CLIENT_ID", "cid")
+        monkeypatch.setenv("PANEL_TWITCH_CLIENT_SECRET", "csecret")
+        monkeypatch.setattr(pipeline_mod, "load_mod_token_manager", lambda **kwargs: sentinel)
+
+        db = await _registry_with(
+            tmp_path, [("1", "alpha", "running"), ("2", "beta", "running")]
+        )
+        hub = ModerationHub(registry_db_path=db)
+        await hub.start()
+        try:
+            assert len(fake_pipeline.instances) == 2
+            managers = {id(p.mod_token_manager) for p in fake_pipeline.instances}
+            assert managers == {id(sentinel)}, "оба канала должны получить один и тот же инстанс"
+        finally:
+            await hub.stop()
+
+        assert sentinel.closed is True
+
+    async def test_no_client_credentials_means_no_manager(
+        self, tmp_path: Path, fake_pipeline: type[_FakePipeline], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("PANEL_TWITCH_CLIENT_ID", raising=False)
+        monkeypatch.delenv("PANEL_TWITCH_CLIENT_SECRET", raising=False)
+
+        db = await _registry_with(tmp_path, [("1", "alpha", "running")])
+        hub = ModerationHub(registry_db_path=db)
+        await hub.start()
+        try:
+            assert fake_pipeline.instances[0].mod_token_manager is None
         finally:
             await hub.stop()
 
