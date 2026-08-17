@@ -46,7 +46,7 @@ def escalated_timeout_duration(prior_timeouts: int) -> int:
 
 # BUG-003 аудита: задание, застрявшее в status='running' дольше этого —
 # почти наверняка след упавшего/перезапущенного бота, не медленный прогресс.
-# Даже кластер на 200 (MAX_MANUAL_BULK_TARGETS в moderation_api.py) целей
+# Даже кластер на 200 (MAX_MANUAL_BULK_TARGETS в panel/services.py) целей
 # при консервативном рейт-лимите Helix (8 req/сек, twitch_api.py) исполняется
 # за ~25 сек — 2 минуты оставляют кратный запас и всё ещё быстро возвращают
 # зависшее задание в оборот, а не ждут часами.

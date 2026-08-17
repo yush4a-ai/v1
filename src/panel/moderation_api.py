@@ -27,17 +27,18 @@ mod_panel_users) — не из заголовка, который клиент �
 
 from __future__ import annotations
 
-import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from cigilbot.domain.types import ContentCategory
-from cigilbot.orchestration.executor import parse_payload
 from cigilbot.storage.registry_store import RegistryStore
 from cigilbot.storage.store import ModerationStore, PatternInput
-from panel.auth import require_authenticated, role_for_profile
+from panel import services
+from panel.auth import SESSION_KEY, require_authenticated, role_for_profile
 from paths import MOD_VAR, REGISTRY_DB, REPO_ROOT, safe_segment
 
 # Где лежат mod.<broadcaster_id>.db и registry.db. Раньше это был
@@ -153,6 +154,43 @@ async def _open_or_create_store(broadcaster_id: str) -> ModerationStore:
     return store
 
 
+@asynccontextmanager
+async def channel_store(
+    request: Request | WebSocket, profile: str, minimum: str, *, create: bool = False
+) -> AsyncIterator[tuple[ModerationStore, str, str]]:
+    """Проверка роли НА КАНАЛЕ + открытие его БД + гарантированное закрытие,
+    одним выражением: `async with channel_store(request, profile, "MODERATOR")
+    as (store, role, login):`.
+
+    Заменяет связку из трёх шагов, повторявшуюся в этом файле 45 раз
+    (role_for_profile -> require_role -> _open_store -> try/finally close).
+    Это не косметика: ровно на пропуске одного из шагов уже дважды случались
+    реальные инциденты, оба задокументированы прямо в коде — BOLA
+    (ws_moderation проверял только факт входа, не роль на канале) и BFLA
+    (api_set_panel_user брал роль из сессии вместо канала). Пока проверка —
+    строчка, которую надо не забыть написать, третий инцидент был вопросом
+    времени; здесь забыть её нельзя, не получив store.
+
+    Возвращает (store, role, login), потому что вызывающим нужны и роль
+    (пишется в аудит mod_actions), и логин (updated_by в настройках).
+
+    create=True — только для автоклипа, см. _open_or_create_store."""
+    role = await role_for_profile(request, profile)
+    require_role(role, minimum)
+    # Логин — напрямую из сессии, не через require_authenticated(): та
+    # принимает Request, а этим менеджером пользуются и WebSocket-роуты
+    # (у обоих общий предок HTTPConnection с .session). Отсутствие сессии
+    # здесь недостижимо — role_for_profile выше уже вернула бы VIEWER, и
+    # require_role отклонил бы всё, кроме minimum="VIEWER".
+    user = request.session.get(SESSION_KEY) or {}
+    login = str(user.get("login", "аноним"))
+    store = await (_open_or_create_store(profile) if create else _open_store(profile))
+    try:
+        yield store, role, login
+    finally:
+        await store.close()
+
+
 # ---------------------------------------------------------------------------
 # Профили — список каналов, известных Channel Registry (registry.db). Поле
 # "profile" в ответе — теперь broadcaster_id (см. комментарий выше), не
@@ -178,20 +216,26 @@ async def api_profiles(
 # ---------------------------------------------------------------------------
 
 
+async def _open_store_unchecked(broadcaster_id: str) -> ModerationStore:
+    """Открывает БД канала БЕЗ проверки роли — только для api_overview.
+
+    Права там проверяются один раз на уровне эндпоинта (require_authenticated),
+    а не на каждый канал: Operator Home по замыслу показывает сводку по всем
+    каналам Registry сразу. Отдельное имя, а не channel_store — чтобы
+    "открыть БД без проверки прав" нельзя было сделать случайно, не написав
+    _unchecked явно."""
+    store = ModerationStore(str(_db_path(broadcaster_id)))
+    await store.connect()
+    return store
+
+
 @router.get("/overview")
 async def api_overview(
     hours: float = 24.0,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
-    """Operator Home (направление 06 master-plan.html): KPI across всех
-    каналов Registry, карточка на канал, лента последних алертов — одним
-    запросом вместо N, как раньше делал loadChannels() в JS (attack_mode
-    дёргался отдельно на каждый профиль).
-
-    Алерт-лента строится из mod_clusters (created_at, статус active), не из
-    отдельного лога — своей таблицы для истории алертов нет, а отправленные
-    в Discord алерты (cigilbot/alerts.py::send_cluster_alert) триггерятся
-    на то же событие "новый кластер"."""
+    """Агрегация вынесена в services.build_overview — здесь остался только
+    источник данных (Channel Registry) и способ открыть БД канала."""
     registry = RegistryStore(str(REGISTRY_DB))
     await registry.connect()
     try:
@@ -199,82 +243,12 @@ async def api_overview(
     finally:
         await registry.close()
 
-    since = time.time() - hours * 3600
-    channel_cards: list[dict[str, object]] = []
-    alerts: list[dict[str, object]] = []
-    total_new_clusters = 0
-    total_would_timeout = 0
-    total_would_ban = 0
-    total_messages = 0
-
-    for c in channels:
-        path = _db_path(c.broadcaster_id)
-        if not path.exists():
-            channel_cards.append(
-                {
-                    "profile": c.broadcaster_id,
-                    "channel": c.login,
-                    "status": "offline",
-                    "active_clusters": 0,
-                    "new_clusters": 0,
-                    "would_timeout": 0,
-                    "would_ban": 0,
-                }
-            )
-            continue
-        store = ModerationStore(str(path))
-        await store.connect()
-        try:
-            digest = await store.get_digest_stats(since=since)
-            active_clusters = await store.get_active_clusters(limit=5)
-            attack = await store.get_active_attack_mode()
-        finally:
-            await store.close()
-
-        total_new_clusters += digest.new_clusters
-        total_would_timeout += digest.would_timeout
-        total_would_ban += digest.would_ban
-        total_messages += digest.total_messages
-
-        status = "attack" if attack is not None else ("live" if active_clusters else "idle")
-        channel_cards.append(
-            {
-                "profile": c.broadcaster_id,
-                "channel": c.login,
-                "status": status,
-                "active_clusters": len(active_clusters),
-                "new_clusters": digest.new_clusters,
-                "would_timeout": digest.would_timeout,
-                "would_ban": digest.would_ban,
-            }
-        )
-
-        for cluster in active_clusters:
-            alerts.append(
-                {
-                    "channel": c.login,
-                    "profile": c.broadcaster_id,
-                    "cluster_id": cluster["id"],
-                    "created_at": cluster["created_at"],
-                    "size": cluster["size"],
-                    "risk_score": cluster["risk_score"],
-                }
-            )
-
-    alerts.sort(key=lambda a: a["created_at"], reverse=True)  # type: ignore[arg-type,return-value]
-
-    return {
-        "kpi": {
-            "channels_connected": len(channels),
-            "new_clusters": total_new_clusters,
-            "would_timeout": total_would_timeout,
-            "would_ban": total_would_ban,
-            "total_messages": total_messages,
-            "hours": hours,
-        },
-        "channels": channel_cards,
-        "alerts": alerts[:20],
-    }
+    return await services.build_overview(
+        channels,
+        hours=hours,
+        open_store=_open_store_unchecked,
+        db_exists=lambda bid: _db_path(bid).exists(),
+    )
 
 
 @router.get("/clusters")
@@ -289,12 +263,8 @@ async def api_clusters(
     # через Twitch без модераторских прав, не должен видеть чужие данные
     # только по факту входа (2026-08-15, решение по итогам UX-аудита панели —
     # см. тот же сдвиг VIEWER->MODERATOR на всех "личных данных" ручках ниже).
-    require_role(await role_for_profile(request, profile), "MODERATOR")
-    store = await _open_store(profile)
-    try:
+    async with channel_store(request, profile, "MODERATOR") as (store, _role, _login):
         return await store.get_active_clusters(limit=limit)
-    finally:
-        await store.close()
 
 
 @router.get("/verdicts")
@@ -305,12 +275,8 @@ async def api_verdicts(
     limit: int = 100,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> list[dict[str, object]]:
-    require_role(await role_for_profile(request, profile), "MODERATOR")
-    store = await _open_store(profile)
-    try:
+    async with channel_store(request, profile, "MODERATOR") as (store, _role, _login):
         return await store.get_recent_verdicts(min_risk_level=min_risk, limit=limit)
-    finally:
-        await store.close()
 
 
 @router.get("/audit")
@@ -320,12 +286,8 @@ async def api_audit(
     limit: int = 100,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> list[dict[str, object]]:
-    require_role(await role_for_profile(request, profile), "MODERATOR")
-    store = await _open_store(profile)
-    try:
+    async with channel_store(request, profile, "MODERATOR") as (store, _role, _login):
         return await store.get_action_audit(limit=limit)
-    finally:
-        await store.close()
 
 
 @router.get("/users")
@@ -337,12 +299,8 @@ async def api_list_users(
     offset: int = 0,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> list[dict[str, object]]:
-    require_role(await role_for_profile(request, profile), "MODERATOR")
-    store = await _open_store(profile)
-    try:
+    async with channel_store(request, profile, "MODERATOR") as (store, _role, _login):
         return await store.list_users(search=search, limit=limit, offset=offset)
-    finally:
-        await store.close()
 
 
 # ---------------------------------------------------------------------------
@@ -368,12 +326,8 @@ async def api_list_recent_messages(
     """Последние сообщения чата для клика "вставить как образец пасты"
     (см. store.list_recent_messages — избегает ручного копирования из
     внешнего чат-виджета, которое цепляло мусор вроде ника)."""
-    require_role(await role_for_profile(request, profile), "MODERATOR")
-    store = await _open_store(profile)
-    try:
+    async with channel_store(request, profile, "MODERATOR") as (store, _role, _login):
         return await store.list_recent_messages(limit=limit)
-    finally:
-        await store.close()
 
 
 @router.get("/paste_wave")
@@ -384,14 +338,10 @@ async def api_find_paste_wave(
     window_seconds: float = PASTE_WAVE_WINDOW_SECONDS,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> list[dict[str, object]]:
-    require_role(await role_for_profile(request, profile), "MODERATOR")
     if not sample_text.strip():
         raise HTTPException(status_code=400, detail="Введите текст пасты для поиска")
-    store = await _open_store(profile)
-    try:
+    async with channel_store(request, profile, "MODERATOR") as (store, _role, _login):
         return await store.find_paste_wave(sample_text=sample_text, window_seconds=window_seconds)
-    finally:
-        await store.close()
 
 
 # ---------------------------------------------------------------------------
@@ -435,17 +385,19 @@ async def api_set_panel_user(
     # раньше здесь читался caller_role из session (роль на канале самой
     # панели), что позволяло ADMIN одного канала назначать роли на любом
     # другом канале, лишь бы знать его broadcaster_id (см. security-аудит,
-    # находка BFLA). Тот же паттерн, что везде в этом роутере ниже.
+    # находка BFLA). channel_store здесь не подходит: он открывает БД
+    # канала, а писать надо в каноническую MOD_DB (см. ниже).
     caller_role = await role_for_profile(request, payload.profile)
     require_role(caller_role, "ADMIN")
 
-    new_role = payload.role.upper()
-    if new_role not in _ROLE_RANK:
-        raise HTTPException(status_code=400, detail=f"Неизвестная роль: {payload.role!r}")
-    # Только OWNER может выдавать роль OWNER — иначе ADMIN мог бы сам себя
-    # повысить до высшей роли.
-    if new_role == "OWNER":
-        require_role(caller_role, "OWNER")
+    try:
+        new_role = services.resolve_panel_user_role(
+            requested_role=payload.role, caller_role=caller_role
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
     # ВСЕГДА в каноническую MOD_DB, не в mod.<payload.profile>.db — см.
     # _open_panel_users_store: ADMIN-оверрайд глобален, а panel/auth.py
@@ -465,23 +417,11 @@ async def api_set_panel_user(
 # Действия: ставят задание в очередь, которую поллит executor.py в
 # процессе бота (см. докстринг модуля). Требуют роль MODERATOR+.
 #
-# BUG-001 аудита: раньше target_user_ids принимался от клиента как есть —
-# браузер мог прислать любой список user_id под любым cluster_id, и
-# executor.py банил ровно его, никогда не сверяя со фактическим составом
-# mod_cluster_members. Это делало возможным как минимум баг ("модератор
-# видел устаревший снимок кластера, забанил не тех"), так и потенциальную
-# эксплуатацию (клиент диктует, кого банить, независимо от того, что решил
-# детектор). Теперь для BAN/TIMEOUT с указанным cluster_id сервер САМ
-# подставляет актуальный список участников из БД — то, что прислал клиент в
-# target_user_ids для такого запроса, полностью игнорируется.
+# Сами правила (BUG-001 — состав кластера берётся из БД, а не от клиента;
+# SEC-002 — лимит MAX_MANUAL_BULK_TARGETS) живут в panel/services.py, где
+# их нельзя обойти, добавив новый роут мимо них. Здесь остался только
+# HTTP-слой: разбор тела, коды ответа.
 # ---------------------------------------------------------------------------
-
-# SEC-002 аудита: без верхнего предела на размер ручного массового действия
-# один запрос мог адресовать сколь угодно много пользователей — потенциальный
-# DoS через executor (последовательные запросы к Helix) и просто риск огромной
-# ошибки одним кликом. Значение с запасом больше типичного размера кластера
-# (десятки), но не позволяет случайно/умышленно адресовать тысячи.
-MAX_MANUAL_BULK_TARGETS = 200
 
 
 class ActionRequestBody(BaseModel):
@@ -496,60 +436,29 @@ class ActionRequestBody(BaseModel):
 
 @router.post("/actions")
 async def api_enqueue_action(
-    request: Request,
-    payload: ActionRequestBody,
-    session: tuple[str, str] = Depends(require_authenticated),
+    request: Request, payload: ActionRequestBody
 ) -> dict[str, object]:
-    _global_role, actor = session
-    role = await role_for_profile(request, payload.profile)
-    require_role(role, "MODERATOR")
-
-    store = await _open_store(payload.profile)
-    try:
-        target_user_ids = payload.target_user_ids
-        if payload.cluster_id is not None and payload.action in ("BAN", "TIMEOUT"):
-            # Источник правды — БД на момент исполнения, не то, что клиент
-            # запомнил при рендере карточки кластера (тот снимок мог устареть
-            # за то время, пока модератор читал модалку подтверждения).
-            current_members = await store.get_cluster_member_ids(payload.cluster_id)
-            if not current_members:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Кластер #{payload.cluster_id} не найден или пуст — "
-                    "возможно, уже обработан или устарел",
-                )
-            target_user_ids = current_members
-
-        if len(target_user_ids) > MAX_MANUAL_BULK_TARGETS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Слишком много целей за одно действие: {len(target_user_ids)} "
-                f"(максимум {MAX_MANUAL_BULK_TARGETS})",
-            )
-
-        raw = {
-            "action": payload.action,
-            "target_user_ids": target_user_ids,
-            "message_ids": payload.message_ids,
-            "reason": payload.reason,
-            "duration_seconds": payload.duration_seconds,
-            "cluster_id": payload.cluster_id,
-        }
+    """Правила (подстановка состава кластера из БД, лимит целей, валидация
+    payload) живут в services.enqueue_moderation_action — здесь только
+    перевод доменных ошибок в HTTP-коды."""
+    async with channel_store(request, payload.profile, "MODERATOR") as (store, role, actor):
         try:
-            parse_payload(raw)  # валидируем ДО записи в очередь — понятная ошибка сразу
+            queue_id, target_count = await services.enqueue_moderation_action(
+                store,
+                action=payload.action,
+                target_user_ids=payload.target_user_ids,
+                message_ids=payload.message_ids,
+                reason=payload.reason,
+                duration_seconds=payload.duration_seconds,
+                cluster_id=payload.cluster_id,
+                requested_by=actor,
+                requested_role=role,
+            )
+        except services.ClusterNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-        queue_id = await store.enqueue_action(
-            requested_by=actor, requested_role=role, payload=raw
-        )
-        if payload.cluster_id is not None:
-            # BAN ALL/TIMEOUT ALL с этого кластера — он обработан, больше не
-            # должен маячить на главном экране как "активный".
-            await store.set_cluster_status(payload.cluster_id, "actioned")
-    finally:
-        await store.close()
-    return {"queue_id": queue_id, "status": "pending", "target_count": len(target_user_ids)}
+    return {"queue_id": queue_id, "status": "pending", "target_count": target_count}
 
 
 class ClusterDecisionRequest(BaseModel):
@@ -563,12 +472,8 @@ async def api_ignore_cluster(
     payload: ClusterDecisionRequest,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
-    require_role(await role_for_profile(request, payload.profile), "MODERATOR")
-    store = await _open_store(payload.profile)
-    try:
+    async with channel_store(request, payload.profile, "MODERATOR") as (store, _role, login):
         await store.set_cluster_status(cluster_id, "ignored")
-    finally:
-        await store.close()
     return {"cluster_id": cluster_id, "status": "ignored"}
 
 
@@ -579,12 +484,8 @@ async def api_mark_safe_cluster(
     payload: ClusterDecisionRequest,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
-    require_role(await role_for_profile(request, payload.profile), "MODERATOR")
-    store = await _open_store(payload.profile)
-    try:
+    async with channel_store(request, payload.profile, "MODERATOR") as (store, _role, login):
         await store.set_cluster_status(cluster_id, "marked_safe")
-    finally:
-        await store.close()
     return {"cluster_id": cluster_id, "status": "marked_safe"}
 
 
@@ -609,15 +510,11 @@ async def api_mark_user_safe(
     payload: MarkUserSafeRequest,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
-    _global_role, login = session
-    require_role(await role_for_profile(request, payload.profile), "MODERATOR")
-    store = await _open_store(payload.profile)
-    try:
-        await store.mark_trusted(user_id, added_by=login, reason=payload.reason)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    finally:
-        await store.close()
+    async with channel_store(request, payload.profile, "MODERATOR") as (store, _role, login):
+        try:
+            await store.mark_trusted(user_id, added_by=login, reason=payload.reason)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"user_id": user_id, "trusted": True}
 
 
@@ -628,12 +525,8 @@ async def api_unmark_user_safe(
     payload: MarkUserSafeRequest,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
-    require_role(await role_for_profile(request, payload.profile), "MODERATOR")
-    store = await _open_store(payload.profile)
-    try:
+    async with channel_store(request, payload.profile, "MODERATOR") as (store, _role, login):
         await store.unmark_trusted(user_id)
-    finally:
-        await store.close()
     return {"user_id": user_id, "trusted": False}
 
 
@@ -643,12 +536,8 @@ async def api_list_trusted(
     profile: str = "main",
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> list[dict[str, object]]:
-    require_role(await role_for_profile(request, profile), "MODERATOR")
-    store = await _open_store(profile)
-    try:
+    async with channel_store(request, profile, "MODERATOR") as (store, _role, _login):
         return await store.list_trusted()
-    finally:
-        await store.close()
 
 
 # ---------------------------------------------------------------------------
@@ -680,12 +569,8 @@ async def api_list_patterns(
 ) -> list[dict[str, object]]:
     # MODERATOR: точные пороги (min_risk_score, required_signal_names) — это
     # инструкция "как не попасться" для того, кто читает список.
-    require_role(await role_for_profile(request, profile), "MODERATOR")
-    store = await _open_store(profile)
-    try:
+    async with channel_store(request, profile, "MODERATOR") as (store, _role, _login):
         patterns = await store.list_patterns()
-    finally:
-        await store.close()
     return [
         {
             "id": p.id, "name": p.name, "description": p.description,
@@ -704,10 +589,7 @@ async def api_create_pattern(
     request: Request,
     payload: PatternRequest, session: tuple[str, str] = Depends(require_authenticated)
 ) -> dict[str, object]:
-    _global_role, login = session
-    require_role(await role_for_profile(request, payload.profile), "ADMIN")
-    store = await _open_store(payload.profile)
-    try:
+    async with channel_store(request, payload.profile, "ADMIN") as (store, _role, login):
         pattern_id = await store.create_pattern(
             PatternInput(
                 name=payload.name,
@@ -723,8 +605,6 @@ async def api_create_pattern(
                 created_by=login,
             )
         )
-    finally:
-        await store.close()
     return {"id": pattern_id}
 
 
@@ -740,12 +620,8 @@ async def api_set_pattern_enabled(
     payload: SetPatternEnabledRequest,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
-    require_role(await role_for_profile(request, payload.profile), "ADMIN")
-    store = await _open_store(payload.profile)
-    try:
+    async with channel_store(request, payload.profile, "ADMIN") as (store, _role, login):
         await store.set_pattern_enabled(pattern_id, payload.enabled)
-    finally:
-        await store.close()
     return {"id": pattern_id, "enabled": payload.enabled}
 
 
@@ -760,12 +636,8 @@ async def api_delete_pattern(
     payload: DeletePatternRequest,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
-    require_role(await role_for_profile(request, payload.profile), "ADMIN")
-    store = await _open_store(payload.profile)
-    try:
+    async with channel_store(request, payload.profile, "ADMIN") as (store, _role, login):
         await store.delete_pattern(pattern_id)
-    finally:
-        await store.close()
     return {"id": pattern_id, "deleted": True}
 
 
@@ -800,12 +672,8 @@ async def api_list_content_rules(
 ) -> list[dict[str, object]]:
     # MODERATOR: список запрещённых слов/фраз тривиально обходится, если
     # знаешь список — не публичная информация.
-    require_role(await role_for_profile(request, profile), "MODERATOR")
-    store = await _open_store(profile)
-    try:
+    async with channel_store(request, profile, "MODERATOR") as (store, _role, _login):
         rules = await store.list_content_rules()
-    finally:
-        await store.close()
     return [
         {"id": r.id, "category": r.category.value, "phrase": r.phrase, "enabled": r.enabled}
         for r in rules
@@ -818,21 +686,16 @@ async def api_add_content_rule(
     payload: ContentRuleRequest,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
-    _global_role, login = session
-    require_role(await role_for_profile(request, payload.profile), "ADMIN")
     try:
         category = ContentCategory(payload.category)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"Неизвестная категория: {payload.category}") from exc
 
-    store = await _open_store(payload.profile)
-    try:
+    async with channel_store(request, payload.profile, "ADMIN") as (store, _role, login):
         try:
             rule = await store.add_content_rule(category=category, phrase=payload.phrase, created_by=login)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-    finally:
-        await store.close()
     return {"id": rule.id, "category": rule.category.value, "phrase": rule.phrase}
 
 
@@ -848,12 +711,8 @@ async def api_set_content_rule_enabled(
     payload: SetContentRuleEnabledRequest,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
-    require_role(await role_for_profile(request, payload.profile), "ADMIN")
-    store = await _open_store(payload.profile)
-    try:
+    async with channel_store(request, payload.profile, "ADMIN") as (store, _role, login):
         await store.set_content_rule_enabled(rule_id, payload.enabled)
-    finally:
-        await store.close()
     return {"id": rule_id, "enabled": payload.enabled}
 
 
@@ -868,12 +727,8 @@ async def api_delete_content_rule(
     payload: DeleteContentRuleRequest,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
-    require_role(await role_for_profile(request, payload.profile), "ADMIN")
-    store = await _open_store(payload.profile)
-    try:
+    async with channel_store(request, payload.profile, "ADMIN") as (store, _role, login):
         await store.delete_content_rule(rule_id)
-    finally:
-        await store.close()
     return {"id": rule_id, "deleted": True}
 
 
@@ -888,12 +743,8 @@ async def api_get_content_settings(
     profile: str = "main",
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
-    require_role(await role_for_profile(request, profile), "VIEWER")
-    store = await _open_store(profile)
-    try:
+    async with channel_store(request, profile, "VIEWER") as (store, _role, _login):
         settings = await store.get_content_settings()
-    finally:
-        await store.close()
     return settings.to_dict()
 
 
@@ -903,14 +754,9 @@ async def api_set_content_moderation_enabled(
     payload: SetContentModerationEnabledRequest,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
-    _global_role, login = session
-    require_role(await role_for_profile(request, payload.profile), "ADMIN")
-    store = await _open_store(payload.profile)
-    try:
+    async with channel_store(request, payload.profile, "ADMIN") as (store, _role, login):
         await store.set_content_moderation_enabled(payload.enabled, updated_by=login)
         settings = await store.get_content_settings()
-    finally:
-        await store.close()
     return settings.to_dict()
 
 
@@ -938,12 +784,8 @@ async def api_get_autoclip_settings(
     # равно обязательна: без неё чтение создавало mod.<broadcaster_id>.db
     # для ЛЮБОГО broadcaster_id, включая канал, где у вошедшего нет вообще
     # никакой роли (_open_or_create_store создаёт файл, если его не было).
-    require_role(await role_for_profile(request, profile), "VIEWER")
-    store = await _open_or_create_store(profile)
-    try:
+    async with channel_store(request, profile, "VIEWER", create=True) as (store, _role, _login):
         settings = await store.get_autoclip_settings()
-    finally:
-        await store.close()
     return settings.to_dict()
 
 
@@ -953,14 +795,9 @@ async def api_set_autoclip_enabled(
     payload: SetAutoclipEnabledRequest,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
-    _global_role, login = session
-    require_role(await role_for_profile(request, payload.profile), "MODERATOR")
-    store = await _open_or_create_store(payload.profile)
-    try:
+    async with channel_store(request, payload.profile, "MODERATOR", create=True) as (store, _role, login):
         await store.set_autoclip_enabled(payload.enabled, updated_by=login)
         settings = await store.get_autoclip_settings()
-    finally:
-        await store.close()
     return settings.to_dict()
 
 
@@ -985,8 +822,6 @@ async def api_set_autoclip_thresholds(
     payload: SetAutoclipThresholdsRequest,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
-    _global_role, login = session
-    require_role(await role_for_profile(request, payload.profile), "MODERATOR")
 
     if payload.burst_unique_authors_threshold is not None and payload.burst_unique_authors_threshold < 1:
         raise HTTPException(status_code=400, detail="burst_unique_authors_threshold должен быть не меньше 1")
@@ -1000,8 +835,7 @@ async def api_set_autoclip_thresholds(
         if phrases is not None and any(not p.strip() for p in phrases):
             raise HTTPException(status_code=400, detail="Пустая фраза в списке недопустима")
 
-    store = await _open_or_create_store(payload.profile)
-    try:
+    async with channel_store(request, payload.profile, "MODERATOR", create=True) as (store, _role, login):
         await store.set_autoclip_thresholds(
             burst_unique_authors_threshold=payload.burst_unique_authors_threshold,
             burst_window_seconds=payload.burst_window_seconds,
@@ -1012,8 +846,6 @@ async def api_set_autoclip_thresholds(
             updated_by=login,
         )
         settings = await store.get_autoclip_settings()
-    finally:
-        await store.close()
     return settings.to_dict()
 
 
@@ -1035,8 +867,6 @@ async def api_set_autoclip_auto_scale(
     payload: SetAutoclipAutoScaleRequest,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
-    _global_role, login = session
-    require_role(await role_for_profile(request, payload.profile), "MODERATOR")
 
     if payload.enabled:
         if payload.percent is None or not (0 < payload.percent <= 1):
@@ -1046,15 +876,12 @@ async def api_set_autoclip_auto_scale(
         if payload.maximum is None or payload.maximum < payload.minimum:
             raise HTTPException(status_code=400, detail="maximum должен быть не меньше minimum")
 
-    store = await _open_or_create_store(payload.profile)
-    try:
+    async with channel_store(request, payload.profile, "MODERATOR", create=True) as (store, _role, login):
         await store.set_autoclip_auto_scale(
             enabled=payload.enabled, percent=payload.percent,
             minimum=payload.minimum, maximum=payload.maximum, updated_by=login,
         )
         settings = await store.get_autoclip_settings()
-    finally:
-        await store.close()
     return settings.to_dict()
 
 
@@ -1070,12 +897,8 @@ async def api_list_content_events(
     (см. докстринг миграции 014)."""
     # MODERATOR: конкретные логины и категория нарушения (расизм/угрозы/
     # реклама) — личные данные, не публичная лента.
-    require_role(await role_for_profile(request, profile), "MODERATOR")
-    store = await _open_store(profile)
-    try:
+    async with channel_store(request, profile, "MODERATOR") as (store, _role, _login):
         return await store.list_content_events(limit=limit)
-    finally:
-        await store.close()
 
 
 class MarkContentEventManualActionRequest(BaseModel):
@@ -1096,18 +919,11 @@ async def api_mark_content_event_manual_action(
     пометка чисто визуальная, поэтому роль та же, что у /actions (MODERATOR+),
     не строже: если модератору можно нажать TIMEOUT/BAN, ему можно и
     оставить об этом след в ленте."""
-    _global_role, actor = session
-    role = await role_for_profile(request, payload.profile)
-    require_role(role, "MODERATOR")
-
     if payload.action not in ("TIMEOUT", "BAN", "DELETE_MESSAGES"):
         raise HTTPException(status_code=400, detail=f"Неизвестное действие: {payload.action!r}")
 
-    store = await _open_store(payload.profile)
-    try:
+    async with channel_store(request, payload.profile, "MODERATOR") as (store, _role, actor):
         await store.mark_content_event_manual_action(event_id, action=payload.action, actor=actor)
-    finally:
-        await store.close()
     return {"id": event_id, "manual_action": payload.action}
 
 
@@ -1199,18 +1015,13 @@ async def api_activate_attack_mode(
     payload: ActivateAttackModeRequest,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
-    _global_role, login = session
-    require_role(await role_for_profile(request, payload.profile), "ADMIN")
     if payload.duration_seconds <= 0:
         raise HTTPException(status_code=400, detail="duration_seconds должен быть положительным")
 
-    store = await _open_store(payload.profile)
-    try:
+    async with channel_store(request, payload.profile, "ADMIN") as (store, _role, login):
         status = await store.activate_attack_mode(
             activated_by=login, duration_seconds=payload.duration_seconds
         )
-    finally:
-        await store.close()
     return status.to_dict()
 
 
@@ -1224,12 +1035,8 @@ async def api_deactivate_attack_mode(
     payload: DeactivateAttackModeRequest,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
-    require_role(await role_for_profile(request, payload.profile), "ADMIN")
-    store = await _open_store(payload.profile)
-    try:
+    async with channel_store(request, payload.profile, "ADMIN") as (store, _role, login):
         await store.deactivate_attack_mode()
-    finally:
-        await store.close()
     return {"active": False}
 
 
@@ -1239,12 +1046,8 @@ async def api_get_attack_mode(
     profile: str = "main",
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
-    require_role(await role_for_profile(request, profile), "VIEWER")
-    store = await _open_store(profile)
-    try:
+    async with channel_store(request, profile, "VIEWER") as (store, _role, _login):
         status = await store.get_active_attack_mode()
-    finally:
-        await store.close()
     if status is None:
         return {"active": False}
     return {"active": True, **status.to_dict()}
@@ -1274,18 +1077,13 @@ async def api_activate_giveaway_mode(
     payload: ActivateGiveawayModeRequest,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
-    _global_role, login = session
-    require_role(await role_for_profile(request, payload.profile), "ADMIN")
     if payload.duration_seconds <= 0:
         raise HTTPException(status_code=400, detail="duration_seconds должен быть положительным")
 
-    store = await _open_store(payload.profile)
-    try:
+    async with channel_store(request, payload.profile, "ADMIN") as (store, _role, login):
         status = await store.activate_giveaway_mode(
             activated_by=login, duration_seconds=payload.duration_seconds
         )
-    finally:
-        await store.close()
     return status.to_dict()
 
 
@@ -1299,12 +1097,8 @@ async def api_deactivate_giveaway_mode(
     payload: DeactivateGiveawayModeRequest,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
-    require_role(await role_for_profile(request, payload.profile), "ADMIN")
-    store = await _open_store(payload.profile)
-    try:
+    async with channel_store(request, payload.profile, "ADMIN") as (store, _role, login):
         await store.deactivate_giveaway_mode()
-    finally:
-        await store.close()
     return {"active": False}
 
 
@@ -1314,12 +1108,8 @@ async def api_get_giveaway_mode(
     profile: str = "main",
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
-    require_role(await role_for_profile(request, profile), "VIEWER")
-    store = await _open_store(profile)
-    try:
+    async with channel_store(request, profile, "VIEWER") as (store, _role, _login):
         status = await store.get_active_giveaway_mode()
-    finally:
-        await store.close()
     if status is None:
         return {"active": False}
     return {"active": True, **status.to_dict()}
@@ -1354,21 +1144,16 @@ async def api_set_discord_webhook(
     payload: SetDiscordWebhookRequest,
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
-    _global_role, login = session
-    require_role(await role_for_profile(request, payload.profile), "ADMIN")
     if payload.enabled and not payload.url.startswith("https://discord.com/api/webhooks/"):
         raise HTTPException(
             status_code=400,
             detail="Неверный адрес — Discord-webhook начинается с https://discord.com/api/webhooks/",
         )
 
-    store = await _open_store(payload.profile)
-    try:
+    async with channel_store(request, payload.profile, "ADMIN") as (store, _role, login):
         config = await store.set_discord_webhook(
             url=payload.url, enabled=payload.enabled, updated_by=login
         )
-    finally:
-        await store.close()
     return {**config.to_dict(), "url": _mask_webhook_url(config.url)}
 
 
@@ -1378,12 +1163,8 @@ async def api_get_discord_webhook(
     profile: str = "main",
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> dict[str, object]:
-    require_role(await role_for_profile(request, profile), "VIEWER")
-    store = await _open_store(profile)
-    try:
+    async with channel_store(request, profile, "VIEWER") as (store, _role, _login):
         config = await store.get_discord_webhook()
-    finally:
-        await store.close()
     if config is None:
         return {"configured": False}
     return {"configured": True, **config.to_dict(), "url": _mask_webhook_url(config.url)}
@@ -1403,19 +1184,15 @@ async def api_set_alert_threshold(
     """Порог confidence, выше которого новый кластер шлёт Discord-алерт —
     настраивается отдельно от самого webhook (адрес и чувствительность
     меняются независимо, см. store.set_alert_confidence_threshold)."""
-    require_role(await role_for_profile(request, payload.profile), "ADMIN")
     if not 0.0 <= payload.threshold <= 1.0:
         raise HTTPException(status_code=400, detail="Порог должен быть от 0 до 1")
 
-    store = await _open_store(payload.profile)
-    try:
+    async with channel_store(request, payload.profile, "ADMIN") as (store, _role, login):
         try:
             await store.set_alert_confidence_threshold(threshold=payload.threshold)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         config = await store.get_discord_webhook()
-    finally:
-        await store.close()
     assert config is not None
     return {**config.to_dict(), "url": _mask_webhook_url(config.url)}
 
@@ -1446,16 +1223,13 @@ async def api_record_feedback(
     request: Request,
     payload: FeedbackRequest, session: tuple[str, str] = Depends(require_authenticated)
 ) -> dict[str, object]:
-    _global_role, login = session
-    require_role(await role_for_profile(request, payload.profile), "MODERATOR")
     if payload.decision not in _VALID_FEEDBACK_DECISIONS:
         raise HTTPException(
             status_code=400,
             detail=f"decision должен быть одним из {sorted(_VALID_FEEDBACK_DECISIONS)}",
         )
 
-    store = await _open_store(payload.profile)
-    try:
+    async with channel_store(request, payload.profile, "MODERATOR") as (store, _role, login):
         feedback_id = await store.record_feedback(
             signal_name=payload.signal_name,
             moderator=login,
@@ -1465,8 +1239,6 @@ async def api_record_feedback(
             user_id=payload.user_id,
             pattern_id=payload.pattern_id,
         )
-    finally:
-        await store.close()
     return {"id": feedback_id}
 
 
@@ -1478,12 +1250,8 @@ async def api_list_feedback(
     session: tuple[str, str] = Depends(require_authenticated),
 ) -> list[dict[str, object]]:
     # MODERATOR: запись фидбека содержит user_id конкретного зрителя.
-    require_role(await role_for_profile(request, profile), "MODERATOR")
-    store = await _open_store(profile)
-    try:
+    async with channel_store(request, profile, "MODERATOR") as (store, _role, _login):
         return await store.list_feedback(limit=limit)
-    finally:
-        await store.close()
 
 
 @router.get("/stats/daily")
@@ -1496,12 +1264,8 @@ async def api_get_daily_stats(
     # Единственная VIEWER-ручка в этом файле, которую стоит оставить открытой
     # намеренно (2026-08-15): агрегированная статистика по дням без личных
     # данных — кандидат на будущий публичный экран статистики для зрителей.
-    require_role(await role_for_profile(request, profile), "VIEWER")
-    store = await _open_store(profile)
-    try:
+    async with channel_store(request, profile, "VIEWER") as (store, _role, _login):
         return await store.get_daily_stats(days=days)
-    finally:
-        await store.close()
 
 
 # ---------------------------------------------------------------------------
