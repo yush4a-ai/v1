@@ -114,6 +114,16 @@ CLIP_TOKEN_OAUTH_SCOPES = "clips:edit"
 SESSION_KEY = "panel_user"
 _STATE_TTL_SECONDS = 600  # окно на прохождение логина на Twitch
 
+# Ключ в сессии браузера, куда кладётся выданный этому браузеру state.
+# Сам по себе state в глобальном словаре доказывает только "какой-то вход
+# начинался", но не "его начал ИМЕННО этот браузер" — без второй половины
+# в cookie любой, кто узнал/подсмотрел state, мог завершить чужой флоу
+# (login CSRF на /auth/callback; на /auth/bot/callback это ещё и перезапись
+# боевого токена в .env анонимом — воспроизведено security-аудитом
+# 2026-08-17). Значение сравнивается с пришедшим в query через
+# secrets.compare_digest.
+SESSION_STATE_KEY = "panel_auth_state"
+
 router = APIRouter(prefix="/auth")
 
 # Инъекция транспорта для тестов — тот же приём, что cigilbot/twitch_api.py
@@ -174,6 +184,29 @@ def _prune_clip_states() -> None:
     cutoff = time.time() - _STATE_TTL_SECONDS
     for state in [s for s, (created, _broadcaster_id) in _pending_clip_states.items() if created < cutoff]:
         _pending_clip_states.pop(state, None)
+
+
+def _issue_state(request: Request) -> str:
+    """Новый state + его копия в сессии этого браузера (SESSION_STATE_KEY).
+
+    Одного глобального словаря мало: он отвечает на вопрос "начинался ли
+    такой вход вообще", но не "начал ли его ЭТОТ браузер". Вторая половина
+    в подписанной cookie закрывает login CSRF — см. SESSION_STATE_KEY."""
+    state = secrets.token_urlsafe(24)
+    request.session[SESSION_STATE_KEY] = state
+    return state
+
+
+def _verify_session_state(request: Request, state: str) -> None:
+    """Сверяет пришедший из Twitch state с тем, что лежит в сессии этого
+    браузера. Значение из сессии удаляется в любом случае: один state — один
+    вход, повторное использование недопустимо даже при ошибке."""
+    expected = request.session.pop(SESSION_STATE_KEY, None)
+    if not expected or not secrets.compare_digest(str(expected), state):
+        raise HTTPException(
+            status_code=400,
+            detail="state не совпадает с сессией браузера — начните вход заново",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -512,7 +545,7 @@ async def auth_login(request: Request, next: str = DEFAULT_AFTER_LOGIN) -> Redir
     request.session[SESSION_NEXT_KEY] = _safe_next(next)
 
     _prune_states()
-    state = secrets.token_urlsafe(24)
+    state = _issue_state(request)
     _pending_states[state] = time.time()
 
     params = {
@@ -534,6 +567,7 @@ async def auth_callback(request: Request, code: str = "", state: str = "", error
     if state not in _pending_states:
         raise HTTPException(status_code=400, detail="Неизвестный или истёкший state — начните вход заново")
     _pending_states.pop(state, None)
+    _verify_session_state(request, state)
 
     cfg: PanelAuthConfig = request.app.state.panel_auth_config
     if not cfg.configured:
@@ -764,7 +798,7 @@ async def auth_bot_login(request: Request) -> RedirectResponse:
         raise HTTPException(status_code=403, detail="Получение токена бота требует роль ADMIN+")
 
     _prune_bot_states()
-    state = secrets.token_urlsafe(24)
+    state = _issue_state(request)
     _pending_bot_states[state] = (time.time(), "mod")
 
     params = {
@@ -806,7 +840,7 @@ async def auth_bot_chat_login(request: Request) -> RedirectResponse:
         raise HTTPException(status_code=403, detail="Получение токена бота требует роль ADMIN+")
 
     _prune_bot_states()
-    state = secrets.token_urlsafe(24)
+    state = _issue_state(request)
     _pending_bot_states[state] = (time.time(), "chat")
 
     params = {
@@ -838,6 +872,16 @@ async def _process_bot_callback(
     if state not in _pending_bot_states:
         raise HTTPException(status_code=400, detail="Неизвестный или истёкший state — начните вход заново")
     _created_at, purpose = _pending_bot_states.pop(state)
+    # Роль проверена на /bot/login, но между login и callback ничего не
+    # связывало запрос с той же сессией: аноним, знающий state, завершал
+    # флоу и перезаписывал боевой TWITCH_MOD_* в .env (воспроизведено
+    # security-аудитом 2026-08-17). Теперь браузер обязан предъявить тот же
+    # state из своей cookie, и роль перепроверяется здесь заново — окно
+    # между двумя запросами больше не даёт эскалации.
+    _verify_session_state(request, state)
+    role, _login = require_authenticated(request)
+    if role not in ("ADMIN", "OWNER"):
+        raise HTTPException(status_code=403, detail="Получение токена бота требует роль ADMIN+")
 
     cfg: PanelAuthConfig = request.app.state.panel_auth_config
     if not cfg.configured:
@@ -947,7 +991,15 @@ async def auth_bot_callback_json(
 async def auth_bot_status(request: Request) -> dict[str, object]:
     """Есть ли уже сохранённый токен бота — панель читает .env заново на
     каждый запрос (не кеширует), чтобы отразить ручное редактирование
-    файла или обновление токена в фоне executor'ом."""
+    файла или обновление токена в фоне executor'ом.
+
+    ADMIN+, как и /bot/login: раньше роут отвечал кому угодно, включая
+    анонима без сессии, и отдавал логин аккаунта бота вместе с фактом
+    "токен настроен" — разведданные для того, кто готовит захват флоу
+    (security-аудит 2026-08-17)."""
+    role, _login = require_authenticated(request)
+    if role not in ("ADMIN", "OWNER"):
+        raise HTTPException(status_code=403, detail="Статус токена бота доступен роли ADMIN+")
     roots: PanelRoots = request.app.state.panel_roots
     env_file = roots.repo / ".env"
     values: dict[str, str] = {}
@@ -970,7 +1022,10 @@ async def auth_bot_status(request: Request) -> dict[str, object]:
 async def auth_bot_chat_status(request: Request) -> dict[str, object]:
     """Есть ли уже чат-токен (TWITCH_BOT_TOKEN/TWITCH_BOT_REFRESH_TOKEN) —
     тот же принцип, что auth_bot_status: читает .env заново на каждый
-    запрос, ничего не кеширует."""
+    запрос, ничего не кеширует. ADMIN+ по той же причине, что и там."""
+    role, _login = require_authenticated(request)
+    if role not in ("ADMIN", "OWNER"):
+        raise HTTPException(status_code=403, detail="Статус токена бота доступен роли ADMIN+")
     roots: PanelRoots = request.app.state.panel_roots
     env_file = roots.repo / ".env"
     values: dict[str, str] = {}
@@ -1042,7 +1097,7 @@ async def auth_clip_login(request: Request, profile: str) -> RedirectResponse:
         raise HTTPException(status_code=404, detail=f"Канал {profile!r} не найден в Channel Registry")
 
     _prune_clip_states()
-    state = secrets.token_urlsafe(24)
+    state = _issue_state(request)
     _pending_clip_states[state] = (time.time(), profile)
 
     params = {
@@ -1074,6 +1129,14 @@ async def _process_clip_callback(
     if state not in _pending_clip_states:
         raise HTTPException(status_code=400, detail="Неизвестный или истёкший state — начните вход заново")
     _created_at, broadcaster_id = _pending_clip_states.pop(state)
+    # Та же защита, что в _process_bot_callback: state из cookie этого
+    # браузера + перепроверка роли на завершении, а не только на /clip/login.
+    _verify_session_state(request, state)
+    role, _login = require_authenticated(request)
+    if role not in ("ADMIN", "OWNER"):
+        raise HTTPException(
+            status_code=403, detail="Получение токена для клиппинга требует роль ADMIN+"
+        )
 
     cfg: PanelAuthConfig = request.app.state.panel_auth_config
     if not cfg.configured:
@@ -1183,8 +1246,16 @@ async def auth_clip_status(request: Request, profile: str) -> dict[str, object]:
     её требуют — оставлять один незащищённый выбивался бы из общего
     инварианта "проверка прав в роутере". paths.mod_db() валидирует
     broadcaster_id (числовой Twitch ID/MAIN_PROFILE) и поднимает
-    ValueError на что угодно ещё — здесь превращаем это в честный 400."""
-    require_authenticated(request)
+    ValueError на что угодно ещё — здесь превращаем это в честный 400.
+
+    ADMIN+, как /bot/status и /bot/chat_status: все три отвечают на один
+    вопрос "настроен ли токен и на кого выпущен", и разноить им уровень
+    доступа не за что (security-аудит 2026-08-17)."""
+    role, _login = require_authenticated(request)
+    if role not in ("ADMIN", "OWNER"):
+        raise HTTPException(
+            status_code=403, detail="Статус токена клиппинга доступен роли ADMIN+"
+        )
     import paths
     from cigilbot.storage.store import ModerationStore
 

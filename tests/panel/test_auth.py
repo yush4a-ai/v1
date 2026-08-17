@@ -12,7 +12,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -142,7 +142,26 @@ def auth_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[FastAPI, 
     app.state.panel_roots = PanelRoots.all_at(tmp_path)
     app.state.moderation_store_factory = lambda: ModerationStore(str(db))
     app.include_router(auth.router)
+
+    # Статус-роуты (/bot/status, /bot/chat_status, /clip/status) требуют
+    # ADMIN+ (security-аудит 2026-08-17: раньше отвечали анониму и отдавали
+    # логин аккаунта бота). Тестам нужен способ оказаться вошедшим, не
+    # проходя весь OAuth-флоу с моками Twitch — тот же приём, что
+    # tests/panel/conftest.py::login_as для основного приложения панели.
+    @app.post("/test/set_session")
+    def _set_session(request: Request, role: str = "ADMIN", login: str = "tester") -> dict[str, str]:
+        request.session[auth.SESSION_KEY] = {
+            "login": login, "user_id": "1", "role": role, "roles": {"streamer": role},
+        }
+        return {"ok": "1"}
+
     return app, db
+
+
+def login_as(client: TestClient, role: str = "ADMIN", login: str = "tester") -> TestClient:
+    resp = client.post("/test/set_session", params={"role": role, "login": login})
+    assert resp.status_code == 200
+    return client
 
 
 class TestLoginRedirect:
@@ -553,7 +572,7 @@ class TestBotTokenCallback:
 class TestBotTokenStatus:
     def test_not_configured_by_default(self, auth_app: tuple[FastAPI, Path]) -> None:
         app, _db = auth_app
-        client = TestClient(app)
+        client = login_as(TestClient(app))
         resp = client.get("/auth/bot/status")
         assert resp.json() == {"configured": False, "bot_login": ""}
 
@@ -564,11 +583,31 @@ class TestBotTokenStatus:
             + "TWITCH_MOD_ACCESS_TOKEN=x\nTWITCH_MOD_REFRESH_TOKEN=y\nTWITCH_MOD_BOT_LOGIN=mybot\n",
             encoding="utf-8",
         )
-        client = TestClient(app)
+        client = login_as(TestClient(app))
 
         resp = client.get("/auth/bot/status")
 
         assert resp.json() == {"configured": True, "bot_login": "mybot"}
+
+    def test_anonymous_gets_401(self, auth_app: tuple[FastAPI, Path]) -> None:
+        """security-аудит 2026-08-17: раньше роут отвечал 200 кому угодно и
+        отдавал логин аккаунта бота вместе с фактом "токен настроен"."""
+        app, _db = auth_app
+        (app.state.panel_roots.repo / ".env").write_text(
+            (app.state.panel_roots.repo / ".env").read_text(encoding="utf-8")
+            + "TWITCH_MOD_ACCESS_TOKEN=x\nTWITCH_MOD_REFRESH_TOKEN=y\nTWITCH_MOD_BOT_LOGIN=secret_bot\n",
+            encoding="utf-8",
+        )
+        resp = TestClient(app).get("/auth/bot/status")
+
+        assert resp.status_code == 401
+        assert "secret_bot" not in resp.text
+
+    def test_viewer_gets_403(self, auth_app: tuple[FastAPI, Path]) -> None:
+        app, _db = auth_app
+        client = login_as(TestClient(app), role="VIEWER")
+        resp = client.get("/auth/bot/status")
+        assert resp.status_code == 403
 
 
 # Chat-токен (TWITCH_BOT_TOKEN/TWITCH_BOT_REFRESH_TOKEN, chat:read/chat:edit)
@@ -723,9 +762,15 @@ class TestBotChatTokenCallback:
 class TestBotChatTokenStatus:
     def test_not_configured_by_default(self, auth_app: tuple[FastAPI, Path]) -> None:
         app, _db = auth_app
-        client = TestClient(app)
+        client = login_as(TestClient(app))
         resp = client.get("/auth/bot/chat_status")
         assert resp.json() == {"configured": False, "bot_login": ""}
+
+    def test_anonymous_gets_401(self, auth_app: tuple[FastAPI, Path]) -> None:
+        """security-аудит 2026-08-17, тот же класс, что у /bot/status."""
+        app, _db = auth_app
+        resp = TestClient(app).get("/auth/bot/chat_status")
+        assert resp.status_code == 401
 
     def test_configured_after_env_written(self, auth_app: tuple[FastAPI, Path]) -> None:
         app, _db = auth_app
@@ -734,7 +779,7 @@ class TestBotChatTokenStatus:
             + "TWITCH_BOT_TOKEN=x\nTWITCH_BOT_REFRESH_TOKEN=y\nTWITCH_BOT_NICK=mybot\n",
             encoding="utf-8",
         )
-        client = TestClient(app)
+        client = login_as(TestClient(app))
 
         resp = client.get("/auth/bot/chat_status")
 
@@ -749,7 +794,7 @@ class TestBotChatTokenStatus:
             + "TWITCH_MOD_ACCESS_TOKEN=x\nTWITCH_MOD_REFRESH_TOKEN=y\nTWITCH_MOD_BOT_LOGIN=modbot\n",
             encoding="utf-8",
         )
-        client = TestClient(app)
+        client = login_as(TestClient(app))
 
         resp = client.get("/auth/bot/chat_status")
 
