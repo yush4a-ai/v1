@@ -112,6 +112,32 @@ async def _open_store(broadcaster_id: str) -> ModerationStore:
     return store
 
 
+async def _open_panel_users_store() -> ModerationStore:
+    """mod_panel_users — ВСЕГДА в канонической MOD_DB (mod.db профиля
+    MAIN_PROFILE), никогда в mod.<broadcaster_id>.db конкретного канала.
+
+    ADMIN — глобальный оверрайд по замыслу (см. panel/auth.py::_resolve_role
+    докстринг: "доверенный человек... ADMIN остаётся ADMIN везде"), а не
+    роль на конкретном канале. panel/auth.py::auth_callback читает роль при
+    входе из ЭТОЙ ЖЕ MOD_DB через moderation_store_factory — если
+    api_set_panel_user писал бы в mod.<payload.profile>.db (как раньше,
+    bug-аудит 2026-08-15, HIGH), назначение ADMIN на любом канале, кроме
+    MAIN_PROFILE, молча не проявлялось бы при следующем логине.
+
+    Проверка прав на запись при этом остаётся по-канальной
+    (role_for_profile(request, payload.profile) в api_set_panel_user) —
+    роль ADMIN/OWNER нужна именно на том канале, за который ручаются, а не
+    "будь ADMIN где угодно, чтобы назначать роль где угодно".
+
+    Путь строится из ROOT (переменная модуля), а не через прямой импорт
+    paths.MOD_DB — ROOT единственный, на что монкейпатчатся тесты
+    (tests/panel/conftest.py::tmp_root), готовый paths.MOD_DB остался бы
+    боевым путём на диске при тестовом прогоне."""
+    store = ModerationStore(str(ROOT / "mod.db"))
+    await store.connect()
+    return store
+
+
 async def _open_or_create_store(broadcaster_id: str) -> ModerationStore:
     """Как _open_store, но создаёт mod.<broadcaster_id>.db, если файла ещё
     нет — только для настроек автоклипа (autoclip_settings ниже). В отличие
@@ -387,9 +413,12 @@ async def api_panel_users(
 ) -> list[dict[str, object]]:
     # ADMIN, не VIEWER: список ADMIN/OWNER-логинов канала — разведочная
     # информация (см. security-аудит), нет причин показывать её ниже роли,
-    # которая и так может им управлять.
+    # которая и так может им управлять. Право на просмотр проверяется
+    # по-канально (role_for_profile(request, profile)) — profile здесь
+    # остаётся тем, за какой канал ручается вызывающий, а не тем, откуда
+    # физически читаются данные (см. _open_panel_users_store: список глобален).
     require_role(await role_for_profile(request, profile), "ADMIN")
-    store = await _open_store(profile)
+    store = await _open_panel_users_store()
     try:
         return await store.list_panel_users()
     finally:
@@ -418,7 +447,13 @@ async def api_set_panel_user(
     if new_role == "OWNER":
         require_role(caller_role, "OWNER")
 
-    store = await _open_store(payload.profile)
+    # ВСЕГДА в каноническую MOD_DB, не в mod.<payload.profile>.db — см.
+    # _open_panel_users_store: ADMIN-оверрайд глобален, а panel/auth.py
+    # читает его при входе ровно из этого файла, независимо от того, на
+    # какой канал заходит пользователь (bug-аудит 2026-08-15, HIGH:
+    # раньше запись уходила в БД конкретного канала и молча не действовала
+    # нигде, кроме payload.profile == MAIN_PROFILE).
+    store = await _open_panel_users_store()
     try:
         await store.upsert_panel_user(payload.login, new_role)
     finally:
@@ -1114,25 +1149,28 @@ async def ws_content_events(websocket: WebSocket) -> None:
         await websocket.close(code=4403)
         return
 
+    # Одно соединение на весь сеанс WS — см. тот же фикс и тот же
+    # комментарий в ws_moderation выше (bug-аудит 2026-08-15, HIGH).
+    store: ModerationStore | None = None
     try:
         while True:
-            path = _db_path(profile)
-            if not path.exists():
-                await websocket.send_text(json.dumps({"events": []}))
-                await asyncio.sleep(CONTENT_WS_POLL_INTERVAL_SECONDS)
-                continue
+            if store is None:
+                path = _db_path(profile)
+                if not path.exists():
+                    await websocket.send_text(json.dumps({"events": []}))
+                    await asyncio.sleep(CONTENT_WS_POLL_INTERVAL_SECONDS)
+                    continue
+                store = ModerationStore(str(path))
+                await store.connect()
 
-            store = ModerationStore(str(path))
-            await store.connect()
-            try:
-                events = await store.list_content_events(limit=50)
-            finally:
-                await store.close()
-
+            events = await store.list_content_events(limit=50)
             await websocket.send_text(json.dumps({"events": events}))
             await asyncio.sleep(CONTENT_WS_POLL_INTERVAL_SECONDS)
     except WebSocketDisconnect:
         pass
+    finally:
+        if store is not None:
+            await store.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1599,23 +1637,30 @@ async def ws_moderation(websocket: WebSocket) -> None:
         await websocket.close(code=4403)
         return
 
+    # Одно соединение на весь сеанс WS, не одно на тик — раньше каждый тик
+    # (раз в WS_POLL_INTERVAL_SECONDS=2 сек) открывал новый ModerationStore
+    # и заново прогонял все миграции через PRAGMA user_version, на каждую
+    # открытую вкладку панели (bug-аудит 2026-08-15, HIGH). Соединение
+    # открывается лениво: путь может не существовать в момент подключения
+    # (модерация канала ещё не запускалась) и появиться позже.
+    store: ModerationStore | None = None
     try:
         while True:
-            path = _db_path(profile)
-            if not path.exists():
-                await websocket.send_text(json.dumps({"clusters": [], "verdicts": []}))
-                await asyncio.sleep(WS_POLL_INTERVAL_SECONDS)
-                continue
+            if store is None:
+                path = _db_path(profile)
+                if not path.exists():
+                    await websocket.send_text(json.dumps({"clusters": [], "verdicts": []}))
+                    await asyncio.sleep(WS_POLL_INTERVAL_SECONDS)
+                    continue
+                store = ModerationStore(str(path))
+                await store.connect()
 
-            store = ModerationStore(str(path))
-            await store.connect()
-            try:
-                clusters = await store.get_active_clusters(limit=50)
-                verdicts = await store.get_recent_verdicts(min_risk_level=30, limit=30)
-            finally:
-                await store.close()
-
+            clusters = await store.get_active_clusters(limit=50)
+            verdicts = await store.get_recent_verdicts(min_risk_level=30, limit=30)
             await websocket.send_text(json.dumps({"clusters": clusters, "verdicts": verdicts}))
             await asyncio.sleep(WS_POLL_INTERVAL_SECONDS)
     except WebSocketDisconnect:
         pass
+    finally:
+        if store is not None:
+            await store.close()

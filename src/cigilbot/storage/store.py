@@ -350,11 +350,27 @@ class ModerationStore:
         # же риск, что уже закрыт в registry_store.py/fingerprints_store.py
         # (bug-аудит 2026-08-15, HIGH #6).
         await self._conn.execute("PRAGMA busy_timeout=5000")
+        # Схема (migrations.py) объявляет ON DELETE CASCADE у mod_signals/
+        # mod_cluster_members — без этой PRAGMA SQLite полностью игнорирует
+        # внешние ключи, включая каскад: находка попутно к ретеншену
+        # (bug-аудит 2026-08-15, HIGH #16, purge_old_records) — комментарий
+        # в схеме описывал не то, что реально происходило. Проверено на
+        # всех существующих var/cigilbot/mod.*.db PRAGMA foreign_key_check
+        # перед включением — нарушений целостности не найдено, значит
+        # включение безопасно для уже накопленных данных.
+        await self._conn.execute("PRAGMA foreign_keys=ON")
         await migrate(self._conn)
 
     async def close(self) -> None:
         if self._conn is not None:
             await self._conn.close()
+
+    async def commit(self) -> None:
+        """Явный коммит для вызывающих, которые сами объединяют несколько
+        write-методов в один commit=False (см. upsert_user и др.) — сейчас
+        только ModerationEngine.observe() (bug-аудит 2026-08-15, HIGH: было
+        до 5 отдельных commit() на одно сообщение чата)."""
+        await self._db.commit()
 
     @property
     def _db(self) -> aiosqlite.Connection:
@@ -364,7 +380,12 @@ class ModerationStore:
 
     # -- пользователи ---------------------------------------------------
 
-    async def upsert_user(self, event: ChatEvent) -> None:
+    async def upsert_user(self, event: ChatEvent, *, commit: bool = True) -> None:
+        # commit=False — только для ModerationEngine.observe(), который
+        # объединяет эту запись с save_message/save_verdict/record_content_*
+        # в один commit на сообщение чата вместо пяти (bug-аудит 2026-08-15,
+        # HIGH). Любой другой вызывающий код (тесты, скрипты) продолжает
+        # коммитить сразу, как раньше — дефолт не поменялся.
         await self._db.execute(
             """
             INSERT INTO mod_users (user_id, login, display_name, first_seen, last_seen, message_count)
@@ -377,7 +398,8 @@ class ModerationStore:
             """,
             (event.user_id, event.login, event.display_name or None, event.timestamp, event.timestamp),
         )
-        await self._db.commit()
+        if commit:
+            await self._db.commit()
 
     async def set_account_created_at(self, user_id: str, created_at: float) -> None:
         """Вызывается, когда Helix ответил на запрос возраста аккаунта —
@@ -467,7 +489,10 @@ class ModerationStore:
 
     # -- сообщения --------------------------------------------------------
 
-    async def save_message(self, event: ChatEvent, fp: MessageFingerprint) -> int:
+    async def save_message(
+        self, event: ChatEvent, fp: MessageFingerprint, *, commit: bool = True
+    ) -> int:
+        # commit=False — см. upsert_user выше, тот же принцип объединения.
         cursor = await self._db.execute(
             """
             INSERT INTO mod_messages
@@ -484,14 +509,18 @@ class ModerationStore:
                 event.message_id or None,
             ),
         )
-        await self._db.commit()
+        if commit:
+            await self._db.commit()
         if cursor.lastrowid is None:
             raise RuntimeError("INSERT в mod_messages не вернул id")
         return cursor.lastrowid
 
     # -- вердикты ------------------------------------------------------
 
-    async def save_verdict(self, verdict: Verdict, *, message_id: int | None = None) -> int:
+    async def save_verdict(
+        self, verdict: Verdict, *, message_id: int | None = None, commit: bool = True
+    ) -> int:
+        # commit=False — см. upsert_user выше, тот же принцип объединения.
         cursor = await self._db.execute(
             """
             INSERT INTO mod_verdicts
@@ -525,8 +554,51 @@ class ModerationStore:
                 ],
             )
 
-        await self._db.commit()
+        if commit:
+            await self._db.commit()
         return verdict_id
+
+    async def purge_old_records(self, *, older_than_days: float) -> tuple[int, int]:
+        """Удаляет mod_verdicts и mod_messages старше older_than_days.
+        Возвращает (verdicts_deleted, messages_deleted) — для лога
+        вызывающего кода.
+
+        bug-аудит 2026-08-15, HIGH #16: обе таблицы росли без ограничения,
+        за месяцы работы — гигабайты, деградация всех аналитических
+        запросов панели.
+
+        mod_signals удаляется ЯВНО, отдельным DELETE, до mod_verdicts —
+        схема объявляет FK ON DELETE CASCADE (migrations.py), но
+        PRAGMA foreign_keys нигде в connect() не включена, а без неё
+        SQLite полностью игнорирует внешние ключи, включая каскад:
+        комментарий в схеме описывал не то, что реально происходит.
+        Обнаружено этим же фиксом (тест на каскад падал, пока не добавили
+        явный DELETE) — отдельная, более глубокая находка, чем сам
+        ретеншен: FK CASCADE в этой БД никогда не работал, ни в проде, ни
+        в тестах, до этого момента.
+
+        mod_verdicts удаляется ПЕРЕД mod_messages — обратный порядок не
+        упал бы с ошибкой (foreign_keys всё равно выключены), но оставил
+        бы mod_verdicts.message_id висящим на удалённую строку.
+
+        mod_clusters НЕ трогается — находка называла только mod_verdicts/
+        mod_messages, а mod_clusters ссылается на неё же (cluster_id), так
+        что расширение ретеншена на неё — отдельное решение, не эта
+        находка."""
+        cutoff = time.time() - older_than_days * 86400
+        await self._db.execute(
+            "DELETE FROM mod_signals WHERE verdict_id IN "
+            "(SELECT id FROM mod_verdicts WHERE created_at < ?)",
+            (cutoff,),
+        )
+        verdicts_cursor = await self._db.execute(
+            "DELETE FROM mod_verdicts WHERE created_at < ?", (cutoff,)
+        )
+        messages_cursor = await self._db.execute(
+            "DELETE FROM mod_messages WHERE created_at < ?", (cutoff,)
+        )
+        await self._db.commit()
+        return verdicts_cursor.rowcount, messages_cursor.rowcount
 
     # -- кластеры --------------------------------------------------------
 
@@ -1740,13 +1812,19 @@ class ModerationStore:
         row = await cursor.fetchone()
         return int(row[0]) if row else 0
 
-    async def record_content_violation(self, user_id: str, category: ContentCategory) -> int:
+    async def record_content_violation(
+        self, user_id: str, category: ContentCategory, *, commit: bool = True
+    ) -> int:
         """Увеличить счётчик нарушений категории для пользователя и вернуть
         новое значение. Отдельная таблица от mod_users.prior_timeouts/
         prior_warnings (пользователь: "отдельный счётчик на категорию") —
         те поля не инкрементируются нигде в коде (проверено), а эскалация
         content-нарушений должна считаться по каждой категории независимо:
-        реклама не должна приближать бан за расизм."""
+        реклама не должна приближать бан за расизм.
+
+        commit=False — см. upsert_user выше, тот же принцип объединения.
+        get_content_violation_count ниже видит несохранённую запись без
+        проблем — это одно и то же соединение, не отдельная транзакция."""
         now = time.time()
         await self._db.execute(
             """
@@ -1758,7 +1836,8 @@ class ModerationStore:
             """,
             (user_id, category.value, now),
         )
-        await self._db.commit()
+        if commit:
+            await self._db.commit()
         return await self.get_content_violation_count(user_id, category)
 
     async def record_content_event(
@@ -1773,10 +1852,13 @@ class ModerationStore:
         prior_violations: int,
         blocked_by: str,
         enforced: bool,
+        commit: bool = True,
     ) -> int:
         """Аудит срабатывания словарного детектора — отдельно от save_verdict
         (см. докстринг миграции 014 про то, почему не mod_verdicts).
-        enforced=False в режиме наблюдателя и при любом blocked_by."""
+        enforced=False в режиме наблюдателя и при любом blocked_by.
+
+        commit=False — см. upsert_user выше, тот же принцип объединения."""
         cursor = await self._db.execute(
             """
             INSERT INTO mod_content_events
@@ -1791,7 +1873,8 @@ class ModerationStore:
         )
         if cursor.lastrowid is None:
             raise RuntimeError("INSERT в mod_content_events не вернул id")
-        await self._db.commit()
+        if commit:
+            await self._db.commit()
         return cursor.lastrowid
 
     async def list_content_events(self, *, limit: int = 50) -> list[dict[str, object]]:

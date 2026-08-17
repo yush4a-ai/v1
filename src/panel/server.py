@@ -38,7 +38,7 @@ from panel.bots_api import router as bots_router
 from panel.moderation_api import router as moderation_router
 from panel.rate_limit import limiter
 from panel.registry_api import router as registry_router
-from paths import ENV_FILE, MAIN_PROFILE, MOD_DB, MOD_VAR, PanelRoots
+from paths import MAIN_PROFILE, MOD_DB, MOD_VAR, PanelRoots
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -54,28 +54,6 @@ def db_path(profile: str) -> Path:
     return MOD_VAR / f"mod.{profile}.db" if profile != MAIN_PROFILE else MOD_DB
 
 
-# lifespan с supervisor'ом отсюда убран. Панель держала фоновую задачу,
-# которая поднимала и останавливала consumer-процессы по desired_state
-# каналов. Движок модерации теперь живёт в процессе бота и сверяется с
-# Registry сам (cigilbot/pipeline.py::ModerationHub), поэтому панели
-# следить не за чем: она по-прежнему ПИШЕТ desired_state через
-# /api/registry/channels/{id}/start|stop, но исполняет его бот.
-#
-# Побочный выигрыш: раньше падение панели останавливало restart-on-crash
-# для консьюмеров. Теперь модерация не зависит от того, открыта ли панель.
-app = FastAPI()
-
-# Лимитер по IP (panel/rate_limit.py) — до этого ничего не ограничивало
-# частоту запросов к /auth/* (OAuth-callback'и, каждый из которых бьёт по
-# Twitch API несколькими исходящими запросами) и к /api/chat_send (флуд
-# чата от имени бота модератором). app.state.limiter — соглашение slowapi:
-# SlowAPIMiddleware и _rate_limit_exceeded_handler читают лимитер отсюда,
-# а @limiter.limit(...) в auth.py/bots_api.py декорирует эндпоинты тем же
-# объектом напрямую (см. panel/rate_limit.py, см. security-аудит, находка
-# Medium).
-app.state.limiter = limiter
-
-
 async def _handle_rate_limit_exceeded(request: Request, exc: Exception) -> Response:
     # Обёртка ради типа: add_exception_handler ждёт Callable[[Request,
     # Exception], ...], а slowapi._rate_limit_exceeded_handler типизирован
@@ -85,9 +63,6 @@ async def _handle_rate_limit_exceeded(request: Request, exc: Exception) -> Respo
     # что exc всегда будет этим типом.
     assert isinstance(exc, RateLimitExceeded)
     return _rate_limit_exceeded_handler(request, exc)
-
-
-app.add_exception_handler(RateLimitExceeded, _handle_rate_limit_exceeded)
 
 
 async def _handle_bad_path_segment(request: Request, exc: Exception) -> Response:
@@ -101,67 +76,14 @@ async def _handle_bad_path_segment(request: Request, exc: Exception) -> Response
     return JSONResponse({"error": str(exc)}, status_code=400)
 
 
-app.add_exception_handler(ValueError, _handle_bad_path_segment)
-app.add_middleware(SlowAPIMiddleware)
-
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-app.include_router(moderation_router)
-app.include_router(registry_router)
-app.include_router(bots_router)
-
-
-def _read_own_env(key: str) -> str:
-    if not ENV_FILE.exists():
+def _read_own_env(key: str, env_file: Path) -> str:
+    if not env_file.exists():
         return ""
-    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+    for line in env_file.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
         if stripped.startswith(f"{key}="):
             return stripped.split("=", 1)[1]
     return ""
-
-
-# Единственный .env на весь монорепо. Раньше их было два — по одному на
-# проект, с разными значениями одних и тех же PANEL_TWITCH_* ключей, потому
-# что двум процессам на разных портах нужны были разные redirect URI. Порт
-# один — приложение Twitch одно — файл один (см. panel/paths.py).
-_panel_auth_config = load_panel_auth_config(ENV_FILE.parent)
-
-_session_secret = os.environ.get("PANEL_SESSION_SECRET", "") or _read_own_env("PANEL_SESSION_SECRET")
-if not _session_secret:
-    # Временный секрет, если вход ещё не настроен — auth_login всё равно
-    # отдаст 503 без PANEL_TWITCH_* (см. PanelAuthConfig.configured),
-    # роли/действия защищены require_role* независимо от секрета сессии.
-    _session_secret = secrets.token_hex(32)
-
-# https_only=True требует, чтобы панель реально была доступна по HTTPS
-# (прямая раздача или через прокси/туннель) — иначе браузер отказывается
-# ставить cookie вообще и вход ломается. По умолчанию выключено: панель
-# эксплуатируется по HTTP на localhost/LAN (security-аудит 2026-08-15,
-# HIGH #5) — включать явно через PANEL_SESSION_HTTPS_ONLY=true, когда
-# перед панелью действительно стоит HTTPS.
-_session_https_only = (
-    os.environ.get("PANEL_SESSION_HTTPS_ONLY", "") or _read_own_env("PANEL_SESSION_HTTPS_ONLY")
-).strip().lower() == "true"
-
-# 12 часов, не дефолтные 14 дней Starlette — роль (OWNER/MODERATOR/VIEWER)
-# пересчитывается только на новый /auth/callback, так что разжалованный на
-# самом Twitch модератор оставался бы MODERATOR в панели до истечения
-# cookie. Сессии нет server-side revocation (compromise = живёт до
-# max_age), поэтому короче — тоже смягчение того же риска, не полное
-# закрытие (security-аудит 2026-08-15, HIGH #5).
-_SESSION_MAX_AGE_SECONDS = 12 * 3600
-
-app.state.panel_auth_config = _panel_auth_config
-app.state.panel_roots = PanelRoots.default()
-app.state.moderation_store_factory = lambda: ModerationStore(str(db_path(MAIN_PROFILE)))
-app.add_middleware(
-    SessionMiddleware,
-    secret_key=_session_secret,
-    same_site="lax",
-    https_only=_session_https_only,
-    max_age=_SESSION_MAX_AGE_SECONDS,
-)
-app.include_router(auth_router)
 
 
 def _static_hash(filename: str) -> str:
@@ -179,13 +101,110 @@ def _static_hash(filename: str) -> str:
 _STATIC_VERSIONS = {name: _static_hash(name) for name in ("moderation.js",)}
 
 
-@app.get("/")
-@app.get("/moderation")
-def moderation_page() -> HTMLResponse:
-    html = (STATIC_DIR / "moderation.html").read_text(encoding="utf-8")
-    for filename, version in _STATIC_VERSIONS.items():
-        html = html.replace(f'src="/static/{filename}"', f'src="/static/{filename}?v={version}"')
-    return HTMLResponse(html)
+def create_app(roots: PanelRoots | None = None) -> FastAPI:
+    """Собирает приложение панели целиком — единственное место, где решается
+    его форма (middleware, exception handler'ы, роутеры, сессия). Раньше
+    это был код прямо на уровне модуля (`app = FastAPI()` и десяток
+    `app.add_...` под ним) — тестовое приложение в tests/panel/conftest.py
+    собиралось вручную заново, отдельным более коротким списком, и молча
+    разошлось с продакшеном: без SlowAPIMiddleware, без ValueError-
+    обработчика, без реальных настроек сессии (bug-аудит 2026-08-15, HIGH).
+    Rate limiting и 12-часовой TTL сессии из-за этого не были защищены
+    тестами вообще — регрессия "лимит перестал применяться" прошла бы
+    незамеченной. Теперь conftest.py вызывает эту же функцию.
+
+    roots=None — прод (PanelRoots.default(), сам .env лежит в roots.repo);
+    тесты передают PanelRoots.all_at(tmp_path), как раньше делали для
+    app.state.panel_roots напрямую."""
+    roots = roots or PanelRoots.default()
+    env_file = roots.repo / ".env"
+
+    # lifespan с supervisor'ом отсюда убран. Панель держала фоновую задачу,
+    # которая поднимала и останавливала consumer-процессы по desired_state
+    # каналов. Движок модерации теперь живёт в процессе бота и сверяется с
+    # Registry сам (cigilbot/pipeline.py::ModerationHub), поэтому панели
+    # следить не за чем: она по-прежнему ПИШЕТ desired_state через
+    # /api/registry/channels/{id}/start|stop, но исполняет его бот.
+    #
+    # Побочный выигрыш: раньше падение панели останавливало restart-on-crash
+    # для консьюмеров. Теперь модерация не зависит от того, открыта ли панель.
+    app = FastAPI()
+
+    # Лимитер по IP (panel/rate_limit.py) — до этого ничего не ограничивало
+    # частоту запросов к /auth/* (OAuth-callback'и, каждый из которых бьёт по
+    # Twitch API несколькими исходящими запросами) и к /api/chat_send (флуд
+    # чата от имени бота модератором). app.state.limiter — соглашение slowapi:
+    # SlowAPIMiddleware и _rate_limit_exceeded_handler читают лимитер отсюда,
+    # а @limiter.limit(...) в auth.py/bots_api.py декорирует эндпоинты тем же
+    # объектом напрямую (см. panel/rate_limit.py, см. security-аудит, находка
+    # Medium).
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _handle_rate_limit_exceeded)
+    app.add_exception_handler(ValueError, _handle_bad_path_segment)
+    app.add_middleware(SlowAPIMiddleware)
+
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    app.include_router(moderation_router)
+    app.include_router(registry_router)
+    app.include_router(bots_router)
+
+    # Единственный .env на весь монорепо. Раньше их было два — по одному на
+    # проект, с разными значениями одних и тех же PANEL_TWITCH_* ключей,
+    # потому что двум процессам на разных портах нужны были разные redirect
+    # URI. Порт один — приложение Twitch одно — файл один (см. panel/paths.py).
+    panel_auth_config = load_panel_auth_config(roots.repo)
+
+    session_secret = (
+        os.environ.get("PANEL_SESSION_SECRET", "") or _read_own_env("PANEL_SESSION_SECRET", env_file)
+    )
+    if not session_secret:
+        # Временный секрет, если вход ещё не настроен — auth_login всё равно
+        # отдаст 503 без PANEL_TWITCH_* (см. PanelAuthConfig.configured),
+        # роли/действия защищены require_role* независимо от секрета сессии.
+        session_secret = secrets.token_hex(32)
+
+    # https_only=True требует, чтобы панель реально была доступна по HTTPS
+    # (прямая раздача или через прокси/туннель) — иначе браузер отказывается
+    # ставить cookie вообще и вход ломается. По умолчанию выключено: панель
+    # эксплуатируется по HTTP на localhost/LAN (security-аудит 2026-08-15,
+    # HIGH #5) — включать явно через PANEL_SESSION_HTTPS_ONLY=true, когда
+    # перед панелью действительно стоит HTTPS.
+    session_https_only = (
+        os.environ.get("PANEL_SESSION_HTTPS_ONLY", "") or _read_own_env("PANEL_SESSION_HTTPS_ONLY", env_file)
+    ).strip().lower() == "true"
+
+    # 12 часов, не дефолтные 14 дней Starlette — роль (OWNER/MODERATOR/VIEWER)
+    # пересчитывается только на новый /auth/callback, так что разжалованный на
+    # самом Twitch модератор оставался бы MODERATOR в панели до истечения
+    # cookie. Сессии нет server-side revocation (compromise = живёт до
+    # max_age), поэтому короче — тоже смягчение того же риска, не полное
+    # закрытие (security-аудит 2026-08-15, HIGH #5).
+    session_max_age_seconds = 12 * 3600
+
+    app.state.panel_auth_config = panel_auth_config
+    app.state.panel_roots = roots
+    app.state.moderation_store_factory = lambda: ModerationStore(str(db_path(MAIN_PROFILE)))
+    app.add_middleware(
+        SessionMiddleware,
+        secret_key=session_secret,
+        same_site="lax",
+        https_only=session_https_only,
+        max_age=session_max_age_seconds,
+    )
+    app.include_router(auth_router)
+
+    @app.get("/")
+    @app.get("/moderation")
+    def moderation_page() -> HTMLResponse:
+        html = (STATIC_DIR / "moderation.html").read_text(encoding="utf-8")
+        for filename, version in _STATIC_VERSIONS.items():
+            html = html.replace(f'src="/static/{filename}"', f'src="/static/{filename}?v={version}"')
+        return HTMLResponse(html)
+
+    return app
+
+
+app = create_app()
 
 
 if __name__ == "__main__":

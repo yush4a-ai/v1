@@ -73,6 +73,24 @@ _REPEAT_RE = re.compile(r"(.)\1{2,}", re.UNICODE)
 _SPACE_RE = re.compile(r"\s+", re.UNICODE)
 _PUNCT_TRANSLATE = {ord(c): " " for c in "!?.,;:()[]{}\"'«»„“”—–-_*~`|/\\"}
 
+# Частицы, местоимения, предлоги, союзы — не несут содержательного смысла
+# сами по себе, исключены, чтобы не давать ложных совпадений между любыми
+# двумя сообщениями чата. Список короткий и русско-английский намеренно:
+# это не полноценный стоп-лист NLP-библиотеки, а минимальный фильтр для
+# самых частых служебных слов твич-чата. Живёт здесь, а не в
+# detectors/keyword_overlap.py, потому что significant_words теперь
+# считается один раз в fingerprint() и нужен ещё clustering.py — оба
+# domain-модуля, а detectors/ им становиться зависимостью не должен.
+_STOPWORDS = frozenset(
+    """
+    и а но или да нет не ни же ли бы то это тот та те эти
+    я ты он она оно мы вы они мне тебе ему ей нам вам им меня тебя его её нас вас их
+    у в на с со из от до по за над под при без для про через
+    что как когда где куда откуда почему зачем
+    the a an is are was were be to of in on at for and or but not
+    """.split()
+)
+
 
 # ---------------------------------------------------------------------------
 # Скрипты Unicode
@@ -253,14 +271,25 @@ def normalize_for_matching(text: str) -> str:
     return unify_confusables(normalize_text(text))
 
 
-def skeleton(text: str) -> str:
-    """Структурный шаблон сообщения.
+def _significant_words_from_normalized(normalized: str) -> frozenset[str]:
+    return frozenset(w for w in normalized.split() if len(w) >= 2 and w not in _STOPWORDS)
 
-    Ловит спам, в котором меняется только «начинка»: «Приз 12345» и
-    «Приз 67890» дают одинаковый скелет aaaa 99999, хотя как строки различны.
+
+def significant_words(text: str) -> frozenset[str]:
+    """Слова сообщения за вычетом стоп-слов — для сравнения по пересечению.
+
+    >= 2, не >= 3 — короче отсекало бы твич-сленг вроде "го" (зов
+    присоединиться), который как раз оказался главным связующим словом
+    в реальной self-promo кампании при калибровке (проверено прогоном:
+    12 фраз-перефразировок, "го" встречалось в 10 из 12, при пороге >=3
+    детектор пропускал сообщение целиком чаще, чем находил совпадение).
     """
+    return _significant_words_from_normalized(normalize_text(text))
+
+
+def _skeleton_from_normalized(normalized: str) -> str:
     out = []
-    for ch in normalize_text(text):
+    for ch in normalized:
         if ch.isspace():
             out.append(" ")
         elif ch.isdigit():
@@ -272,6 +301,15 @@ def skeleton(text: str) -> str:
         else:
             out.append(ch)
     return "".join(out)
+
+
+def skeleton(text: str) -> str:
+    """Структурный шаблон сообщения.
+
+    Ловит спам, в котором меняется только «начинка»: «Приз 12345» и
+    «Приз 67890» дают одинаковый скелет aaaa 99999, хотя как строки различны.
+    """
+    return _skeleton_from_normalized(normalize_text(text))
 
 
 # ---------------------------------------------------------------------------
@@ -347,14 +385,8 @@ def _shingles(text: str) -> set[str]:
     return {text[i:i + _SHINGLE_SIZE] for i in range(len(text) - _SHINGLE_SIZE + 1)}
 
 
-def minhash(text: str) -> tuple[int, ...]:
-    """Отпечаток сообщения фиксированной длины.
-
-    Доля совпавших позиций у двух отпечатков — оценка коэффициента Жаккара
-    исходных текстов. Считается один раз на сообщение, сравнение потом
-    стоит 32 сравнения целых чисел вместо посимвольного разбора.
-    """
-    shingles = _shingles(normalize_for_matching(text))
+def _minhash_from_matching(matching: str) -> tuple[int, ...]:
+    shingles = _shingles(matching)
     if not shingles:
         return tuple([0] * MINHASH_PERMUTATIONS)
 
@@ -365,6 +397,16 @@ def minhash(text: str) -> tuple[int, ...]:
     return tuple(
         min((a * base + b) % _MERSENNE for base in bases) for a, b in _COEFFS
     )
+
+
+def minhash(text: str) -> tuple[int, ...]:
+    """Отпечаток сообщения фиксированной длины.
+
+    Доля совпавших позиций у двух отпечатков — оценка коэффициента Жаккара
+    исходных текстов. Считается один раз на сообщение, сравнение потом
+    стоит 32 сравнения целых чисел вместо посимвольного разбора.
+    """
+    return _minhash_from_matching(normalize_for_matching(text))
 
 
 def similarity(a: tuple[int, ...], b: tuple[int, ...]) -> float:
@@ -399,6 +441,7 @@ class MessageFingerprint:
     scripts: ScriptProfile
     invisible_chars: tuple[str, ...]
     combining_marks: int
+    significant_words: frozenset[str]
 
     @property
     def domains(self) -> tuple[str, ...]:
@@ -417,16 +460,30 @@ class MessageFingerprint:
 
 
 def fingerprint(text: str) -> MessageFingerprint:
-    """Разобрать сообщение один раз и сохранить всё нужное."""
+    """Разобрать сообщение один раз и сохранить всё нужное.
+
+    normalize_text(text) считается здесь РОВНО ОДИН раз (bug-аудит
+    2026-08-15, HIGH #18) — раньше skeleton()/minhash()/significant_words()
+    вызывались с сырым text и каждая заново прогоняла свою копию
+    normalize_text изнутри, то есть на одно сообщение normalize_text
+    отрабатывал четыре раза подряд. matching уже был единственным полем,
+    переиспользующим normalized (unify_confusables ниже) — остальные три
+    теперь делают то же самое через приватные _..._from_normalized/
+    _minhash_from_matching, публичные skeleton()/minhash()/
+    significant_words() при этом не изменились: они по-прежнему принимают
+    сырой текст для вызывающих без готового MessageFingerprint (store.py
+    ищет паттерны по сохранённому тексту, autoclip.py сверяет фразы)."""
     normalized = normalize_text(text)
+    matching = unify_confusables(normalized)
     return MessageFingerprint(
         original=text,
         normalized=normalized,
-        matching=unify_confusables(normalized),
-        skeleton=skeleton(text),
-        minhash=minhash(text),
+        matching=matching,
+        skeleton=_skeleton_from_normalized(normalized),
+        minhash=_minhash_from_matching(matching),
         links=tuple(extract_links(text)),
         scripts=script_profile(text),
         invisible_chars=tuple(find_invisible_chars(text)),
         combining_marks=count_combining_marks(text),
+        significant_words=_significant_words_from_normalized(normalized),
     )

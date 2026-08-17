@@ -19,34 +19,9 @@ first_message/no_history).
 from __future__ import annotations
 
 from cigilbot.detectors.base import DetectionContext
-from cigilbot.domain.normalize import normalize_text
 from cigilbot.domain.types import Signal, SignalFamily
 
 name = "keyword_overlap"
-
-# Частицы, местоимения, предлоги, союзы — не несут содержательного смысла
-# сами по себе, исключены, чтобы не давать ложных совпадений между любыми
-# двумя сообщениями чата. Список короткий и русско-английский намеренно:
-# это не полноценный стоп-лист NLP-библиотеки, а минимальный фильтр для
-# самых частых служебных слов твич-чата.
-_STOPWORDS = frozenset(
-    """
-    и а но или да нет не ни же ли бы то это тот та те эти
-    я ты он она оно мы вы они мне тебе ему ей нам вам им меня тебя его её нас вас их
-    у в на с со из от до по за над под при без для про через
-    что как когда где куда откуда почему зачем
-    the a an is are was were be to of in on at for and or but not
-    """.split()
-)
-
-
-def significant_words(text: str) -> set[str]:
-    # >= 2, не >= 3 — короче отсекало бы твич-сленг вроде "го" (зов
-    # присоединиться), который как раз оказался главным связующим словом
-    # в реальной self-promo кампании при калибровке (проверено прогоном:
-    # 12 фраз-перефразировок, "го" встречалось в 10 из 12, при пороге >=3
-    # детектор пропускал сообщение целиком чаще, чем находил совпадение).
-    return {w for w in normalize_text(text).split() if len(w) >= 2 and w not in _STOPWORDS}
 
 
 def detect(ctx: DetectionContext) -> list[Signal]:
@@ -54,7 +29,7 @@ def detect(ctx: DetectionContext) -> list[Signal]:
     if not cfg.enabled:
         return []
 
-    words = significant_words(ctx.event.text)
+    words = ctx.fingerprint.significant_words
     if len(words) < cfg.min_significant_words:
         return []
 
@@ -66,7 +41,7 @@ def detect(ctx: DetectionContext) -> list[Signal]:
     matched_logins: set[str] = set()
     best_overlap = 0.0
     for entry in others:
-        other_words = significant_words(entry.event.text)
+        other_words = entry.fingerprint.significant_words
         if len(other_words) < cfg.min_significant_words:
             continue
         # Jaccard по множествам слов — не Дайс и не пересечение/минимум:

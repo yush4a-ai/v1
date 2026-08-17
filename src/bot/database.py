@@ -136,6 +136,17 @@ class Database:
         rows = await cursor.fetchall()
         return [(row["username"], row["content"]) for row in reversed(rows)]
 
+    async def purge_old_messages(self, *, older_than_days: float) -> int:
+        """Удаляет recent_messages старше older_than_days — bug-аудит
+        2026-08-15, HIGH #16: таблица росла без ограничения. Возвращает
+        число удалённых строк, для лога вызывающего кода."""
+        cutoff = time.time() - older_than_days * 86400
+        cursor = await self._conn.execute(
+            "DELETE FROM recent_messages WHERE created_at < ?", (cutoff,)
+        )
+        await self._conn.commit()
+        return cursor.rowcount
+
     async def pop_pending_panel_messages(self) -> list[tuple[int, str, str]]:
         """Сообщения из панели, ещё не отправленные в чат — вычитывается
         циклом main.py::_poll_panel_outbox. Не удаляет строки (в отличие

@@ -390,3 +390,44 @@ class TestRetryAndRateLimit:
         with pytest.raises(HelixError):
             await client.get_users(logins=["a"])
         await client.close()
+
+    async def test_ratelimit_reset_header_ignored_on_5xx(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Регрессия на bug-аудит 2026-08-15 (HIGH #11): Ratelimit-Reset
+        валиден только для 429 (превышен лимит запросов) — раньше
+        применялся и к 5xx одинаково, хотя заголовок для внутренней ошибки
+        сервера Twitch семантически не при чём и мог раздуть задержку до
+        60 сек НА КАЖДУЮ попытку. При последовательном исполнении батча
+        банов (_run_per_target, executor.py) это растягивало задание на
+        часы, что превышало STUCK_ACTION_TIMEOUT_SECONDS и провоцировало
+        задвоенное исполнение через reclaim_stuck_actions.
+
+        far_future — заголовок, который увеличил бы задержку на порядки,
+        если бы код (ошибочно) всё ещё учитывал его на 5xx."""
+        import time
+
+        far_future = str(time.time() + 3600)
+        sleep_calls: list[float] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+
+        monkeypatch.setattr("cigilbot.integrations.twitch_api.asyncio.sleep", fake_sleep)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "oauth2/token" in str(request.url):
+                return token_handler(request)
+            return httpx.Response(
+                500, text="internal error", headers={"Ratelimit-Reset": far_future}
+            )
+
+        client = HelixClient(
+            "cid", "csecret", transport=httpx.MockTransport(handler),
+            max_requests_per_second=1000.0, backoff_base_seconds=1.0,
+        )
+        with pytest.raises(HelixError):
+            await client.get_users(logins=["a"])
+        await client.close()
+
+        # Экспоненциальный backoff (backoff_base_seconds=1.0): 1, 2, 4 —
+        # ни одна попытка не должна была вырасти до ~3600 сек из заголовка.
+        assert all(delay < 10.0 for delay in sleep_calls)

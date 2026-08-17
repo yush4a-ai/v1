@@ -9,11 +9,22 @@ app_client — анонимный TestClient (без сессии, как тол
 Это эквивалент результата panel/auth.py::auth_callback после успешного
 входа, без похода на настоящий Twitch.
 
+app_client собирается через panel.server.create_app(), а не вручную
+(bug-аудит 2026-08-15, HIGH) — раньше тестовое приложение строилось здесь
+отдельным, более коротким списком app.add_...() и молча разошлось с
+продакшеном: без SlowAPIMiddleware, без ValueError-обработчика, без
+реальных настроек сессии. Rate limiting (весь panel/rate_limit.py) и
+12-часовой TTL сессии из-за этого не были защищены тестами вообще.
+create_app(roots) собирает ТУ ЖЕ форму приложения, что и продакшен —
+разница только в путях (roots указывает на tmp-папку).
+
 ROOT подменён на временную папку: свой registry.db (один канал с
 DEFAULT_TEST_CHANNEL/DEFAULT_TEST_BROADCASTER_ID) и своя mod.<broadcaster_id>.db
 с применёнными миграциями, изолированные от настоящего проекта — источник
 правды сменился с .env.<profile> на Channel Registry (см.
-docs/master-plan.html, направление 00).
+docs/master-plan.html, направление 00). bots_api.ROOT/VAR подменены тем же
+приёмом — create_app() теперь подключает и bots_router, а не только
+moderation_router, как раньше здесь вручную.
 """
 
 from __future__ import annotations
@@ -21,15 +32,16 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from fastapi import FastAPI, Request
+from fastapi import Request
 from fastapi.testclient import TestClient
-from starlette.middleware.sessions import SessionMiddleware
 
+import panel.bots_api as bots_api
 import panel.moderation_api as moderation_api
 import panel.registry_api as registry_api
 from cigilbot.storage.registry_store import RegistryStore
 from cigilbot.storage.store import ModerationStore
 from panel.auth import SESSION_KEY, _list_profile_channels
+from panel.server import create_app
 from paths import PanelRoots
 
 # Канал тестового профиля — нужен для по-канальных ролей (role_for_profile
@@ -57,14 +69,18 @@ async def tmp_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         broadcaster_id=DEFAULT_TEST_BROADCASTER_ID, login=DEFAULT_TEST_CHANNEL, registered_by="manual"
     )
     await registry.close()
-    # Три разных корня, в проде все разные, в тесте все в одной tmp-папке:
+    # Разные корни, в проде все разные, в тесте все в одной tmp-папке:
     #   ROOT        — состояние модерации (mod.*.db), var/cigilbot
     #   SRC_ROOT    — исходники (config/moderation.yml), корень проекта
     #   REGISTRY_DB — единственный реестр каналов, var/registry.db
+    #   bots_api.ROOT/VAR — исходники/состояние экрана "Боты" (create_app()
+    #   теперь подключает и bots_router, не только moderation_router).
     monkeypatch.setattr(moderation_api, "ROOT", tmp_path)
     monkeypatch.setattr(moderation_api, "SRC_ROOT", tmp_path)
     monkeypatch.setattr(moderation_api, "REGISTRY_DB", tmp_path / "registry.db")
     monkeypatch.setattr(registry_api, "REGISTRY_DB", tmp_path / "registry.db")
+    monkeypatch.setattr(bots_api, "ROOT", tmp_path)
+    monkeypatch.setattr(bots_api, "VAR", tmp_path)
     return tmp_path
 
 
@@ -79,16 +95,13 @@ async def db_path(tmp_root: Path) -> Path:
 
 @pytest.fixture
 def app_client(db_path: Path, tmp_root: Path) -> TestClient:
-    app = FastAPI()
-    app.add_middleware(SessionMiddleware, secret_key="test-secret-not-for-prod")
-    app.include_router(moderation_api.router)
-    # role_for_profile (panel/auth.py) читает app.state.panel_roots, чтобы
-    # найти канал по broadcaster_id через Registry — без него тест получил
-    # бы VIEWER независимо от того, что записал login_as (см. DEFAULT_TEST_CHANNEL).
+    # create_app() — та же форма приложения, что и продакшен (server.py):
+    # SlowAPIMiddleware, ValueError-обработчик, реальные настройки сессии,
+    # все роутеры (bug-аудит 2026-08-15, HIGH — см. докстринг файла).
     #
     # all_at: в проде корни разные — исходники и .env в корне проекта,
     # registry.db в var/ — а здесь оба указывают в одну tmp-папку.
-    app.state.panel_roots = PanelRoots.all_at(tmp_root)
+    app = create_app(PanelRoots.all_at(tmp_root))
 
     @app.post("/test/set_session")
     async def _set_session(request: Request, role: str, login: str = "test_user") -> dict[str, str]:

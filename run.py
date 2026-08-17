@@ -172,6 +172,17 @@ async def _run_all(main: object, *, bot_only: bool) -> None:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         await bot.close()
+        # bot.close() гасит только IRC-соединение (twitchio) — движки
+        # модерации/автоклипа держат свои задачи, БД-соединения и
+        # httpx-клиенты отдельно и без явной остановки переживают процесс
+        # до сборки мусора: панель после Ctrl+C продолжает показывать
+        # канал как активный (process_status в registry.db не обновлён),
+        # а httpx-клиенты остаются висеть открытыми (bug-аудит 2026-08-15,
+        # HIGH #3). moderation_hub.stop()/autoclip_hub.stop() уже
+        # идемпотентны к "start() не вызывался" (AUTOCLIP_ENABLED=false и
+        # т.п.) — оба хаба сами проверяют, что останавливать нечего.
+        await main.moderation_hub.stop()  # type: ignore[attr-defined]
+        await main.autoclip_hub.stop()  # type: ignore[attr-defined]
 
 
 def main_entry() -> None:

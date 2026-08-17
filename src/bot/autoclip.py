@@ -184,6 +184,7 @@ def _apply_auto_scale(config: AutoclipChannelConfig, *, viewer_count: int | None
     )
     return AutoclipChannelConfig(
         enabled=config.enabled, cooldown_seconds=config.cooldown_seconds,
+        capture_delay_seconds=config.capture_delay_seconds,
         burst=burst, keyword=config.keyword, voice=config.voice,
     )
 
@@ -422,6 +423,13 @@ class AutoclipHub:
         # Twitch принимает клип только от токена, принадлежащего именно
         # этому broadcaster'у/его модератору.
         self._clip_token_managers: dict[str, ClipTokenManager] = {}
+        # broadcaster_id -> соединение для чтения mod_autoclip_settings —
+        # раньше _read_settings открывало новый ModerationStore (полная
+        # прогонка миграций) на каждый канал на каждом reconcile-тике
+        # (RECONCILE_INTERVAL_SECONDS=10 сек), bug-аудит 2026-08-15, HIGH.
+        # Держится открытым между тиками, тем же приёмом, что
+        # _clip_token_managers — закрывается в _stop_channel/stop().
+        self._settings_stores: dict[str, ModerationStore] = {}
         self._client_id = ""
         self._client_secret = ""
         self._helix_client: HelixClient | None = None
@@ -481,6 +489,9 @@ class AutoclipHub:
         for manager in self._clip_token_managers.values():
             await manager.close()
         self._clip_token_managers.clear()
+        for store in self._settings_stores.values():
+            await store.close()
+        self._settings_stores.clear()
         if self._helix_client is not None:
             await self._helix_client.close()
             self._helix_client = None
@@ -622,16 +633,29 @@ class AutoclipHub:
         """Настройки канала из mod_autoclip_settings — пустые (все поля
         None) при сбое чтения (БД ещё не создана, диск недоступен), не
         исключение: временная недоступность не должна валить reconcile-цикл
-        для остальных каналов."""
-        store = ModerationStore(str(paths.mod_db(broadcaster_id)))
+        для остальных каналов.
+
+        Соединение из self._settings_stores переиспользуется между тиками
+        (см. докстринг поля в __init__) — при сбое чтения (например, файл
+        БД временно недоступен) кэш сбрасывается, чтобы следующий тик
+        начал с чистого соединения, а не повторял ошибку на протухшем."""
+        store = self._settings_stores.get(broadcaster_id)
+        if store is None:
+            store = ModerationStore(str(paths.mod_db(broadcaster_id)))
+            try:
+                await store.connect()
+            except Exception:
+                log.exception("Не удалось открыть БД настроек автоклипа канала %s", broadcaster_id)
+                return AutoclipSettings(enabled=None, updated_by="", updated_at=0.0)
+            self._settings_stores[broadcaster_id] = store
+
         try:
-            await store.connect()
             return await store.get_autoclip_settings()
         except Exception:
             log.exception("Не удалось прочитать настройки автоклипа канала %s", broadcaster_id)
-            return AutoclipSettings(enabled=None, updated_by="", updated_at=0.0)
-        finally:
+            self._settings_stores.pop(broadcaster_id, None)
             await store.close()
+            return AutoclipSettings(enabled=None, updated_by="", updated_at=0.0)
 
     async def _start_channel(self, *, broadcaster_id: str, login: str) -> None:
         assert self._helix_client is not None
@@ -684,4 +708,7 @@ class AutoclipHub:
         manager = self._clip_token_managers.pop(broadcaster_id, None)
         if manager is not None:
             await manager.close()
+        store = self._settings_stores.pop(broadcaster_id, None)
+        if store is not None:
+            await store.close()
         log.info("Автоклип канала остановлен (broadcaster_id=%s)", broadcaster_id)

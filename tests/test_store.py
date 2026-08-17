@@ -262,6 +262,78 @@ class TestSaveVerdict:
         assert row == (pattern_id,)
 
 
+class TestPurgeOldRecords:
+    """bug-аудит 2026-08-15, HIGH #16: mod_messages/mod_verdicts росли без
+    ретеншена — гигабайты за месяцы работы, деградация аналитических
+    запросов панели. purge_old_records — фикс, вызывается периодически из
+    ChannelPipeline._poll_retention."""
+
+    async def test_deletes_records_older_than_cutoff(
+        self, store: ModerationStore, event_factory: EventFactory
+    ) -> None:
+        now = time.time()
+        old_event = event_factory(user_id="1", login="old_user", timestamp=now - 40 * 86400)
+        old_msg_id = await store.save_message(old_event, fingerprint(old_event.text))
+        await store.save_verdict(
+            Verdict(
+                user_id="1", login="old_user", risk_score=10, confidence=0.1, signals=(),
+                recommended_action=Action.NOTHING, reason="old", timestamp=now - 40 * 86400,
+            ),
+            message_id=old_msg_id,
+        )
+
+        recent_event = event_factory(user_id="2", login="recent_user", timestamp=now - 1 * 86400)
+        recent_msg_id = await store.save_message(recent_event, fingerprint(recent_event.text))
+        await store.save_verdict(
+            Verdict(
+                user_id="2", login="recent_user", risk_score=10, confidence=0.1, signals=(),
+                recommended_action=Action.NOTHING, reason="recent", timestamp=now - 1 * 86400,
+            ),
+            message_id=recent_msg_id,
+        )
+
+        verdicts_deleted, messages_deleted = await store.purge_old_records(older_than_days=30.0)
+        assert verdicts_deleted == 1
+        assert messages_deleted == 1
+
+        cursor = await store._db.execute("SELECT COUNT(*) FROM mod_messages")
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == 1
+
+        cursor = await store._db.execute("SELECT COUNT(*) FROM mod_verdicts")
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == 1
+
+    async def test_signals_cascade_deleted_with_verdict(
+        self, store: ModerationStore, event_factory: EventFactory
+    ) -> None:
+        now = time.time()
+        event = event_factory(user_id="1", login="old_user", timestamp=now - 40 * 86400)
+        msg_id = await store.save_message(event, fingerprint(event.text))
+        verdict_id = await store.save_verdict(
+            Verdict(
+                user_id="1", login="old_user", risk_score=10, confidence=0.1,
+                signals=(make_signal("new_account"),),
+                recommended_action=Action.NOTHING, reason="old", timestamp=now - 40 * 86400,
+            ),
+            message_id=msg_id,
+        )
+
+        await store.purge_old_records(older_than_days=30.0)
+
+        cursor = await store._db.execute(
+            "SELECT COUNT(*) FROM mod_signals WHERE verdict_id = ?", (verdict_id,)
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == 0
+
+    async def test_nothing_to_delete_returns_zero(self, store: ModerationStore) -> None:
+        assert await store.purge_old_records(older_than_days=30.0) == (0, 0)
+
+
 class TestGetRecentVerdicts:
     async def test_includes_signal_names(self, store: ModerationStore) -> None:
         signals = (make_signal("new_account"), make_signal("first_message"))

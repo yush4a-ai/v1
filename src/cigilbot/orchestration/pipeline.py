@@ -89,6 +89,16 @@ QUEUE_MAXSIZE = 10_000
 # Как часто сверять желаемое состояние каналов с фактическим.
 RECONCILE_INTERVAL_SECONDS = 10.0
 
+# Ретеншен mod_messages/mod_verdicts (bug-аудит 2026-08-15, HIGH #16) — обе
+# таблицы росли неограниченно, за месяцы работы деградировали все
+# аналитические запросы панели. Тот же принцип "проверять периодически, не
+# спать интервал целиком", что DIGEST_CHECK_INTERVAL_SECONDS — DELETE WHERE
+# created_at < cutoff идемпотентен, повторный вызов на уже почищенных
+# данных просто ничего не находит, поэтому не нужно хранить "когда чистили
+# в последний раз" отдельным полем в БД, в отличие от digest.
+RETENTION_CHECK_INTERVAL_SECONDS = 60 * 60
+RETENTION_DAYS = 30.0
+
 
 class ChannelPipeline:
     """Один канал: движок, очередь и фоновые задачи вокруг них.
@@ -154,6 +164,7 @@ class ChannelPipeline:
             asyncio.create_task(self._poll_action_queue(), name=f"mod-actions-{self.broadcaster_id}"),
             asyncio.create_task(self._poll_account_age(), name=f"mod-age-{self.broadcaster_id}"),
             asyncio.create_task(self._poll_digest(), name=f"mod-digest-{self.broadcaster_id}"),
+            asyncio.create_task(self._poll_retention(), name=f"mod-retention-{self.broadcaster_id}"),
         ]
         log.info(
             "Модерация канала запущена (broadcaster_id=%s, канал=%s, SHADOW)",
@@ -197,6 +208,14 @@ class ChannelPipeline:
         self._tasks = []
         await self.store.close()
         await self.fingerprint_store.close()
+        # helix_client/account_age_client создаются в _setup_twitch_clients
+        # только когда PANEL_TWITCH_CLIENT_ID/SECRET заданы — без этой
+        # проверки stop() без предшествующего start() (например, повторный
+        # вызов) падал бы на None.close().
+        if self.helix_client is not None:
+            await self.helix_client.close()
+        if self.account_age_client is not None:
+            await self.account_age_client.close()
         log.info("Модерация канала остановлена (broadcaster_id=%s)", self.broadcaster_id)
 
     # -- вход --------------------------------------------------------------
@@ -420,6 +439,28 @@ class ChannelPipeline:
             except Exception:
                 log.exception("Сбой ежедневного digest в Discord (канал %s)", self.channel)
             await asyncio.sleep(DIGEST_CHECK_INTERVAL_SECONDS)
+
+    async def _poll_retention(self) -> None:
+        """Чистит mod_verdicts/mod_messages старше RETENTION_DAYS раз в
+        RETENTION_CHECK_INTERVAL_SECONDS (bug-аудит 2026-08-15, HIGH #16).
+
+        В отличие от _poll_digest, не хранит "когда чистили в последний
+        раз" — DELETE WHERE created_at < cutoff идемпотентен, повторный
+        вызов на уже почищенных данных просто ничего не находит, поэтому
+        проверка на каждом тике не требует отдельного состояния в БД."""
+        while True:
+            try:
+                verdicts_deleted, messages_deleted = await self.store.purge_old_records(
+                    older_than_days=RETENTION_DAYS
+                )
+                if verdicts_deleted or messages_deleted:
+                    log.info(
+                        "Ретеншен канала %s: удалено вердиктов=%d, сообщений=%d (старше %.0f дней)",
+                        self.channel, verdicts_deleted, messages_deleted, RETENTION_DAYS,
+                    )
+            except Exception:
+                log.exception("Сбой ретеншена БД модерации (канал %s)", self.channel)
+            await asyncio.sleep(RETENTION_CHECK_INTERVAL_SECONDS)
 
 
 class ModerationHub:

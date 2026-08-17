@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+import paths
 from cigilbot.integrations import bot_process_control as bpc
 
 
@@ -31,7 +32,7 @@ def _isolated_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(bpc, "BOT_PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(bpc, "BOT_VENV_PYTHON", tmp_path / "fake_python.exe")
     (tmp_path / "fake_python.exe").write_text("", encoding="utf-8")
-    monkeypatch.setattr(bpc.paths, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(paths, "ensure_dirs", lambda: None)
 
 
 class _FakeProc:
@@ -63,9 +64,8 @@ class TestPidLock:
         bpc.LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
         bpc.LOCK_FILE.write_text("", encoding="utf-8")  # эмулирует чужой активный лок
 
-        with pytest.raises(TimeoutError):
-            with bpc._pid_lock():
-                pass  # не должны сюда попасть
+        with pytest.raises(TimeoutError), bpc._pid_lock():
+            pass  # не должны сюда попасть
 
     def test_stale_lock_is_reclaimed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Лок-файл старше _LOCK_STALE_SECONDS считается брошенным
@@ -96,10 +96,13 @@ class TestStartBot:
     def test_idempotent_when_already_running(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Повторный start_bot() на уже запущенный процесс не порождает
         второй main.py — возвращает существующий pid, Popen не вызывается."""
-        popen_calls = []
-        monkeypatch.setattr(
-            subprocess, "Popen", lambda *a, **kw: popen_calls.append(1) or _FakeProc(4242)
-        )
+        popen_calls: list[int] = []
+
+        def fake_popen(*a: object, **kw: object) -> _FakeProc:
+            popen_calls.append(1)
+            return _FakeProc(4242)
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
         monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _TasklistAlive(4242))
 
         first_pid = bpc.start_bot()
@@ -136,12 +139,13 @@ class TestStopBot:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         bpc.PID_FILE.write_text("4242", encoding="ascii")
-        run_calls = []
-        monkeypatch.setattr(
-            subprocess,
-            "run",
-            lambda *a, **kw: run_calls.append(a) or _TasklistAlive(4242),
-        )
+        run_calls: list[tuple[object, ...]] = []
+
+        def fake_run(*a: object, **kw: object) -> _TasklistAlive:
+            run_calls.append(a)
+            return _TasklistAlive(4242)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
 
         bpc.stop_bot()
 

@@ -535,7 +535,7 @@ class TestPanelUserRoles:
         assert resp.status_code == 403
 
     async def test_admin_can_grant_moderator(
-        self, app_client: TestClient, store: ModerationStore
+        self, app_client: TestClient, tmp_root: Path
     ) -> None:
         login_as(app_client, "ADMIN")
         resp = app_client.post(
@@ -545,7 +545,17 @@ class TestPanelUserRoles:
         assert resp.status_code == 200
         assert resp.json() == {"login": "mod1", "role": "MODERATOR"}
 
-        role = await store.get_panel_role("mod1")
+        # mod.db — каноническая БД (см. moderation_api.py::_open_panel_users_store),
+        # НЕ mod.<DEFAULT_TEST_BROADCASTER_ID>.db (та фикстура store совпадала
+        # с mod.db только случайно, потому что DEFAULT_TEST_BROADCASTER_ID
+        # == "main" == MAIN_PROFILE — см. класс ниже, где broadcaster_id
+        # реально отличается).
+        canonical_store = ModerationStore(str(tmp_root / "mod.db"))
+        await canonical_store.connect()
+        try:
+            role = await canonical_store.get_panel_role("mod1")
+        finally:
+            await canonical_store.close()
         assert role == "MODERATOR"
 
     async def test_admin_cannot_grant_owner(self, app_client: TestClient) -> None:
@@ -571,6 +581,47 @@ class TestPanelUserRoles:
             json={"login": "mod1", "role": "SUPERADMIN"},
         )
         assert resp.status_code == 400
+
+    async def test_admin_override_on_other_channel_lands_in_canonical_db(
+        self, app_client: TestClient, tmp_root: Path
+    ) -> None:
+        """Регрессия на bug-аудит 2026-08-15 (HIGH): назначение роли с
+        payload.profile != MAIN_PROFILE раньше писалось в
+        mod.<broadcaster_id>.db того канала, а panel/auth.py::auth_callback
+        при входе всегда читает роль из ОДНОЙ канонической mod.db —
+        назначение молча не действовало нигде, кроме payload.profile == "main".
+        DEFAULT_TEST_BROADCASTER_ID совпадает с MAIN_PROFILE, поэтому
+        остальные тесты этого класса не могли поймать этот класс ошибки —
+        здесь канал явно другой ("other")."""
+        registry = RegistryStore(str(tmp_root / "registry.db"))
+        await registry.connect()
+        await registry.upsert_channel(broadcaster_id="other", login="other_channel")
+        await registry.close()
+        other_store = ModerationStore(str(tmp_root / "mod.other.db"))
+        await other_store.connect()
+        await other_store.close()
+
+        login_as(app_client, "OWNER")
+        resp = app_client.post(
+            "/api/moderation/panel_users",
+            json={"profile": "other", "login": "mod1", "role": "ADMIN"},
+        )
+        assert resp.status_code == 200
+
+        canonical_store = ModerationStore(str(tmp_root / "mod.db"))
+        await canonical_store.connect()
+        try:
+            assert await canonical_store.get_panel_role("mod1") == "ADMIN"
+        finally:
+            await canonical_store.close()
+
+        # Не должно было уйти в mod.other.db — та же проверка "от противного".
+        other_store = ModerationStore(str(tmp_root / "mod.other.db"))
+        await other_store.connect()
+        try:
+            assert await other_store.get_panel_role("mod1") is None
+        finally:
+            await other_store.close()
 
 
 class TestAuditEndpoint:

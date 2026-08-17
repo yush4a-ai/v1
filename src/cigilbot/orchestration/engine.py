@@ -458,7 +458,7 @@ class ModerationEngine:
         user = await self._get_or_create_user(event)
 
         if self._store is not None:
-            await self._store.upsert_user(event)
+            await self._store.upsert_user(event, commit=False)
 
         signals, own_cluster = self._run_detection_and_clustering(
             event, fp, user, channel_context
@@ -658,12 +658,22 @@ class ModerationEngine:
         event: ChatEvent,
         fp: MessageFingerprint,
     ) -> int | None:
+        # upsert_user (уже записан выше в observe(), commit=False) +
+        # save_message + save_verdict — один commit на все три вместо трёх
+        # отдельных (bug-аудит 2026-08-15, HIGH: было до 5 commit() на
+        # сообщение чата, включая ещё content-путь ниже в _check_content).
+        # Раньше каждый метод коммитил сам — потеря атомарности здесь
+        # приемлема: сбой посреди этих трёх (редкий случай — уже
+        # логируется и глотается) теряет всю пачку разом, а не одну
+        # запись, но это одна logical unit "разобрали одно сообщение", не
+        # три независимых события.
         store = self._store
         if store is None:
             return None
         try:
-            message_id = await store.save_message(event, fp)
-            await store.save_verdict(verdict, message_id=message_id)
+            message_id = await store.save_message(event, fp, commit=False)
+            await store.save_verdict(verdict, message_id=message_id, commit=False)
+            await store.commit()
         except Exception:
             # Сбой записи аудита не должен ронять обработку чата — движок
             # уже посчитал вердикт, потерять стоит запись, а не сообщение.
@@ -704,8 +714,16 @@ class ModerationEngine:
             # нарушений в режиме наблюдения не было. Не растёт только для
             # privileged/protected: для них это не нарушение вовсе, а не
             # нарушение, которое решили не наказывать.
+            # commit=False на обеих + один commit в конце — та же оптимизация,
+            # что в _persist выше (bug-аудит 2026-08-15, HIGH), отдельным
+            # вторым commit'ом на сообщение, не первым: этот путь срабатывает
+            # только при реальном совпадении словарного фильтра, а не на
+            # каждое сообщение, и зависит от message_id, уже сохранённого
+            # первой группой в _persist.
             if decision.blocked_by not in ("privileged_user", "trusted_or_marked_safe"):
-                await self._store.record_content_violation(event.user_id, match.category)
+                await self._store.record_content_violation(
+                    event.user_id, match.category, commit=False
+                )
             await self._store.record_content_event(
                 user_id=event.user_id,
                 login=event.login,
@@ -716,7 +734,9 @@ class ModerationEngine:
                 prior_violations=decision.prior_violations,
                 blocked_by=decision.blocked_by,
                 enforced=False,
+                commit=False,
             )
+            await self._store.commit()
         except Exception:
             # Тот же принцип, что _persist: сбой аудита content-детектора не
             # должен ронять обработку чата.

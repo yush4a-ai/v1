@@ -21,7 +21,11 @@ from bot.voice_queue import VoiceQueue
 # Обычный импорт: пакеты лежат в одном корне. Пока bot/ и cigilbot/ были
 # разными каталогами под apps/, здесь стояла вставка пути в sys.path, а
 # импорт приходилось уводить вниз под неё с noqa: E402.
-from cigilbot.orchestration.pipeline import ModerationHub
+from cigilbot.orchestration.pipeline import (
+    RETENTION_CHECK_INTERVAL_SECONDS,
+    RETENTION_DAYS,
+    ModerationHub,
+)
 from cigilbot.storage.registry_store import RegistryStore
 
 cfg = load_config()
@@ -335,6 +339,23 @@ class ChatBot(commands.Bot):
             self._voice_task = asyncio.create_task(self._poll_voice_queue())
 
         self._panel_outbox_task = asyncio.create_task(self._poll_panel_outbox())
+        self._retention_task = asyncio.create_task(self._poll_retention())
+
+    async def _poll_retention(self) -> None:
+        """Чистит recent_messages старше RETENTION_DAYS раз в
+        RETENTION_CHECK_INTERVAL_SECONDS — та же находка и те же константы,
+        что cigilbot/orchestration/pipeline.py::_poll_retention для
+        mod_verdicts/mod_messages (bug-аудит 2026-08-15, HIGH #16), только
+        для recent_messages в bot.db, отдельной от mod.<broadcaster_id>.db
+        Cigilbot."""
+        while True:
+            try:
+                deleted = await db.purge_old_messages(older_than_days=RETENTION_DAYS)
+                if deleted:
+                    log.info("Ретеншен recent_messages: удалено %d записей (старше %.0f дней)", deleted, RETENTION_DAYS)
+            except Exception:
+                log.exception("Сбой ретеншена recent_messages")
+            await asyncio.sleep(RETENTION_CHECK_INTERVAL_SECONDS)
 
     async def _poll_voice_queue(self) -> None:
         log.info("Слежу за голосовыми сообщениями (файл %s)", voice_queue.path)

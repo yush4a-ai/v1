@@ -520,6 +520,48 @@ _MIGRATION_021_AUTOCLIP_CAPTURE_DELAY = """
 ALTER TABLE mod_autoclip_settings ADD COLUMN capture_delay_seconds REAL;
 """
 
+# mod_actions.cluster_id теряет REFERENCES mod_clusters(id) — этот столбец
+# аудиторская метка ("это действие было по такому-то кластеру"), а не живая
+# ссылка, обязанная указывать на существующую строку. request.cluster_id
+# приходит из payload, поставленного панелью в очередь заранее; исполнение
+# в executor.py и запись аудита случаются позже, к этому моменту кластер
+# мог уже быть заархивирован/удалён — тот же принцип, что чат-лог не
+# обязан ломаться, если человек, о котором он говорит, потом удалил
+# аккаунт. Найдено включением PRAGMA foreign_keys=ON (миграция ретеншена,
+# bug-аудит 2026-08-15, HIGH #16, purge_old_records) — раньше FK в этой БД
+# полностью игнорировались SQLite, ошибка не проявлялась никогда: ни
+# record_action_audit с произвольным cluster_id в тестах, ни (потенциально)
+# в проде на архивированных кластерах.
+#
+# Пересоздание таблицы, не ALTER TABLE — SQLite не умеет снимать
+# REFERENCES с колонки через plain ALTER TABLE (тот же паттерн, что
+# миграция 018 для NOT NULL).
+_MIGRATION_022_ACTIONS_CLUSTER_ID_SOFT_REF = """
+CREATE TABLE mod_actions_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at REAL NOT NULL,
+    actor TEXT NOT NULL,
+    actor_role TEXT NOT NULL,
+    action TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    cluster_id INTEGER,
+    pattern_id INTEGER,
+    reason TEXT,
+    confirmation TEXT NOT NULL,
+    succeeded INTEGER NOT NULL DEFAULT 0,
+    failed INTEGER NOT NULL DEFAULT 0,
+    details_json TEXT
+);
+INSERT INTO mod_actions_new
+    SELECT id, created_at, actor, actor_role, action, scope, cluster_id, pattern_id,
+           reason, confirmation, succeeded, failed, details_json
+    FROM mod_actions;
+DROP TABLE mod_actions;
+ALTER TABLE mod_actions_new RENAME TO mod_actions;
+CREATE INDEX IF NOT EXISTS idx_mod_actions_created_at ON mod_actions(created_at);
+CREATE INDEX IF NOT EXISTS idx_mod_actions_actor ON mod_actions(actor);
+"""
+
 MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, _MIGRATION_001_CORE_AUDIT),
     (2, _MIGRATION_002_ACTIONS),
@@ -542,6 +584,7 @@ MIGRATIONS: tuple[tuple[int, str], ...] = (
     (19, _MIGRATION_019_AUTOCLIP_AUTO_SCALE),
     (20, _MIGRATION_020_CLIP_TOKEN),
     (21, _MIGRATION_021_AUTOCLIP_CAPTURE_DELAY),
+    (22, _MIGRATION_022_ACTIONS_CLUSTER_ID_SOFT_REF),
 )
 
 

@@ -59,6 +59,12 @@ from paths import (
 
 log = logging.getLogger("panel.bots")
 
+# Та же иерархия, что panel/moderation_api.py::_ROLE_RANK и panel/auth.py —
+# продублирована здесь намеренно (не импортирована оттуда), тем же приёмом,
+# что и в остальных роутерах панели: избегает цикла server.py -> bots_api.py
+# -> auth.py -> обратно в server.py.
+_ROLE_RANK = {"VIEWER": 0, "MODERATOR": 1, "ADMIN": 2, "OWNER": 3}
+
 # ROOT — корень проекта: .env.<profile>, prompts/, main.py.
 # VAR — рабочее состояние бота: bot.db, usage.json, логи, pid.
 #
@@ -592,7 +598,7 @@ def index():
 
 
 @router.get("/api/profiles")
-def api_profiles(session: tuple[str, str] = require_role_min("VIEWER")):
+def api_profiles(session: tuple[str, str] = require_role_min("OWNER")):
     # Модерационные профили (is_moderation_only) не показываются в списке
     # "Боты" — они управляются через раздел "Модерация" (панель на 8766),
     # у них нет LLM-функций (Chat/Brain/Prompt), которые эта карточка
@@ -603,7 +609,7 @@ def api_profiles(session: tuple[str, str] = require_role_min("VIEWER")):
 
 @router.get("/api/deepseek_balance")
 async def api_deepseek_balance(
-    profile: str = MAIN_PROFILE, session: tuple[str, str] = require_role_min("VIEWER")
+    profile: str = MAIN_PROFILE, session: tuple[str, str] = require_role_min("OWNER")
 ):
     api_key = read_env(profile).get("DEEPSEEK_API_KEY", "")
     balance = await fetch_deepseek_balance(api_key)
@@ -612,7 +618,7 @@ async def api_deepseek_balance(
 
 @router.get("/api/channel_status")
 async def api_channel_status(
-    profile: str = MAIN_PROFILE, session: tuple[str, str] = require_role_min("VIEWER")
+    profile: str = MAIN_PROFILE, session: tuple[str, str] = require_role_min("OWNER")
 ):
     channel = read_env(profile).get("TWITCH_CHANNEL", "").strip()
     status = await fetch_channel_live(channel)
@@ -621,7 +627,7 @@ async def api_channel_status(
 
 @router.post("/api/prompt/preview")
 async def api_prompt_preview(
-    payload: PromptPreviewRequest, session: tuple[str, str] = require_role_min("ADMIN")
+    payload: PromptPreviewRequest, session: tuple[str, str] = require_role_min("OWNER")
 ):
     """Тестовый прогон промта: реальный вызов DeepSeek с текстом из
     редактора, БЕЗ публикации в Twitch-чат и без записи в БД бота. Позволяет
@@ -733,7 +739,7 @@ async def api_add_channel(payload: dict, session: tuple[str, str] = require_role
 @router.post("/api/start")
 def api_start(
     payload: StartStopRequest = StartStopRequest(),
-    session: tuple[str, str] = require_role_min("ADMIN"),
+    session: tuple[str, str] = require_role_min("OWNER"),
 ):
     # Тело запроса (Pydantic), не query-параметр функции — FastAPI резолвит
     # голый `profile: str` как query-параметр на POST, и такой запрос можно
@@ -749,7 +755,7 @@ def api_start(
 @router.post("/api/stop")
 def api_stop(
     payload: StartStopRequest = StartStopRequest(),
-    session: tuple[str, str] = require_role_min("ADMIN"),
+    session: tuple[str, str] = require_role_min("OWNER"),
 ):
     stop_profile(payload.profile)
     return JSONResponse({"status": get_profile_status(payload.profile)})
@@ -804,19 +810,19 @@ def _push_prompt_history(profile: str, personality: str) -> None:
 
 @router.get("/api/prompt/history")
 def api_prompt_history(
-    profile: str = MAIN_PROFILE, session: tuple[str, str] = require_role_min("VIEWER")
+    profile: str = MAIN_PROFILE, session: tuple[str, str] = require_role_min("OWNER")
 ):
     return JSONResponse(_load_prompt_history(profile))
 
 
 @router.get("/api/channel_history")
-def api_channel_history(session: tuple[str, str] = require_role_min("VIEWER")):
+def api_channel_history(session: tuple[str, str] = require_role_min("OWNER")):
     return JSONResponse(_load_channel_history())
 
 
 @router.post("/api/switch_channel")
 def api_switch_channel(
-    payload: SwitchChannelRequest, session: tuple[str, str] = require_role_min("ADMIN")
+    payload: SwitchChannelRequest, session: tuple[str, str] = require_role_min("OWNER")
 ):
     # JSON body, не query-параметры — см. комментарий у api_start (security-
     # аудит 2026-08-15, MEDIUM #14).
@@ -838,7 +844,7 @@ def api_switch_channel(
 
 
 @router.get("/api/prompts")
-def api_list_prompts(session: tuple[str, str] = require_role_min("VIEWER")):
+def api_list_prompts(session: tuple[str, str] = require_role_min("OWNER")):
     if not PROMPTS_DIR.exists():
         return JSONResponse([])
     names = sorted(p.stem for p in PROMPTS_DIR.glob("*.txt"))
@@ -847,13 +853,13 @@ def api_list_prompts(session: tuple[str, str] = require_role_min("VIEWER")):
 
 @router.get("/api/prompt/current")
 def api_get_current_prompt(
-    profile: str = MAIN_PROFILE, session: tuple[str, str] = require_role_min("VIEWER")
+    profile: str = MAIN_PROFILE, session: tuple[str, str] = require_role_min("OWNER")
 ):
     return JSONResponse({"personality": read_env(profile).get("BOT_PERSONALITY", "")})
 
 
 @router.get("/api/prompt/{name}")
-def api_get_prompt(name: str, session: tuple[str, str] = require_role_min("VIEWER")):
+def api_get_prompt(name: str, session: tuple[str, str] = require_role_min("OWNER")):
     # FastAPI/Starlette запрещает только литеральный "/" в сегменте пути —
     # "\" (разделитель пути на Windows) проходит нетронутым, поэтому
     # traversal через name="..\\..\\Windows\\win.ini" без этой проверки
@@ -867,7 +873,7 @@ def api_get_prompt(name: str, session: tuple[str, str] = require_role_min("VIEWE
 
 @router.post("/api/prompt/save")
 async def api_save_prompt(
-    payload: SavePromptRequest, session: tuple[str, str] = require_role_min("ADMIN")
+    payload: SavePromptRequest, session: tuple[str, str] = require_role_min("OWNER")
 ):
     """Сохраняет текст как именованный промт в prompts/ (не применяет его)."""
     name = re.sub(r"[^a-z0-9\-]", "", payload.name.lower().replace(" ", "-"))
@@ -881,7 +887,7 @@ async def api_save_prompt(
 
 @router.post("/api/prompt/apply")
 async def api_apply_prompt(
-    payload: ApplyPromptRequest, session: tuple[str, str] = require_role_min("ADMIN")
+    payload: ApplyPromptRequest, session: tuple[str, str] = require_role_min("OWNER")
 ):
     """Применяет текст как текущий BOT_PERSONALITY и перезапускает чат-бота,
     если он был запущен — иначе новый характер не подхватится (личность
@@ -917,7 +923,7 @@ async def api_apply_prompt(
 
 @router.post("/api/voice_settings")
 def api_voice_settings(
-    payload: VoiceSettingsRequest, session: tuple[str, str] = require_role_min("ADMIN")
+    payload: VoiceSettingsRequest, session: tuple[str, str] = require_role_min("OWNER")
 ):
     write_env_values(payload.profile, {
         "VOICE_SILENCE_THRESHOLD": str(payload.voice_silence_threshold),
@@ -942,7 +948,7 @@ def api_voice_settings(
 
 @router.post("/api/streamer_context")
 def api_streamer_context(
-    payload: StreamerContextRequest, session: tuple[str, str] = require_role_min("ADMIN")
+    payload: StreamerContextRequest, session: tuple[str, str] = require_role_min("OWNER")
 ):
     write_env_values(payload.profile, {
         "STREAMER_NAME": payload.streamer_name.strip() or "стример",
@@ -964,7 +970,7 @@ def api_streamer_context(
 
 @router.get("/api/viewers")
 def api_viewers(
-    profile: str = MAIN_PROFILE, session: tuple[str, str] = require_role_min("VIEWER")
+    profile: str = MAIN_PROFILE, session: tuple[str, str] = require_role_min("OWNER")
 ):
     path = db_path(profile)
     if not path.exists():
@@ -993,7 +999,7 @@ def _all_bot_nicks() -> set[str]:
 
 @router.get("/api/chat_feed")
 def api_chat_feed(
-    profile: str = MAIN_PROFILE, session: tuple[str, str] = require_role_min("VIEWER")
+    profile: str = MAIN_PROFILE, session: tuple[str, str] = require_role_min("OWNER")
 ):
     """Живая лента: кто что написал/сказал — читаем из recent_messages,
     а не из логов, там уже готовая структура автор/текст."""
@@ -1028,7 +1034,7 @@ def api_chat_feed(
 
 @router.post("/api/viewers/note")
 def api_set_viewer_note(
-    payload: SetNoteRequest, session: tuple[str, str] = require_role_min("MODERATOR")
+    payload: SetNoteRequest, session: tuple[str, str] = require_role_min("OWNER")
 ):
     path = db_path(payload.profile)
     if not path.exists():
@@ -1050,7 +1056,7 @@ def api_set_viewer_note(
 def api_send_chat_message(
     request: Request,
     payload: SendChatMessageRequest,
-    session: tuple[str, str] = require_role_min("MODERATOR"),
+    session: tuple[str, str] = require_role_min("OWNER"),
 ):
     """Ставит сообщение в очередь panel_outbox (bot.db) — сам процесс бота
     вычитывает её раз в секунду (main.py::_poll_panel_outbox) и отправляет
@@ -1097,8 +1103,21 @@ def api_send_chat_message(
 async def ws_logs(websocket: WebSocket):
     from panel.auth import SESSION_KEY
 
-    if websocket.session.get(SESSION_KEY) is None:
+    # Раньше здесь проверялось только "залогинен ли вообще" — любой VIEWER
+    # (роль выдаётся автоматически всем, кто прошёл /auth/login) мог
+    # стримить в реальном времени чужие логи бота: чат, ники, ответы
+    # DeepSeek (bug-аудит 2026-08-15, HIGH). Весь этот роутер теперь
+    # OWNER-only (см. require_role_min("OWNER") на остальных роутах файла) —
+    # экран ботов не предназначен для модераторов, это разовая настройка
+    # оператора, — так что здесь тот же порог, а не по-канальный
+    # role_for_profile.
+    user = websocket.session.get(SESSION_KEY)
+    if user is None:
         await websocket.close(code=4401)
+        return
+    role = str(user.get("role", "VIEWER"))
+    if _ROLE_RANK[role] < _ROLE_RANK["OWNER"]:
+        await websocket.close(code=4403)
         return
 
     await websocket.accept()

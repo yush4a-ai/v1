@@ -25,7 +25,6 @@ Detectors в cigilbot/detectors/ оценивают ОДНО сообщение.
 
 from __future__ import annotations
 
-from cigilbot.detectors.keyword_overlap import significant_words
 from cigilbot.domain.confidence import confidence as compute_confidence
 from cigilbot.domain.config import ClusterConfig, KeywordOverlapConfig, ModerationConfig
 from cigilbot.domain.normalize import MessageFingerprint, similarity
@@ -108,8 +107,8 @@ def _has_edge(
     # отдельных сообщений (проверено прогоном: 12 перефразировок одной
     # self-promo фразы растянуто на 90 сек — 0 кластеров без этой ветки).
     if kw_cfg.enabled:
-        words_a = significant_words(a.original)
-        words_b = significant_words(b.original)
+        words_a = a.significant_words
+        words_b = b.significant_words
         if len(words_a) >= kw_cfg.min_significant_words and len(words_b) >= kw_cfg.min_significant_words:
             union = words_a | words_b
             if union and len(words_a & words_b) / len(union) >= kw_cfg.overlap_threshold:

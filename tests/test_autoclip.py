@@ -198,6 +198,48 @@ class TestChannelAutoclipCooldown:
 
         assert len(clip_calls) == 1
 
+    async def test_failed_clip_does_not_set_cooldown(self, tmp_path: Path) -> None:
+        """Регрессия на bug-аудит 2026-08-15 (CRITICAL #2, исправлено в
+        цикле 1): _create_clip раньше выставлял кулдаун даже когда Helix
+        вернул неудачу (стрим офлайн, истёкший scope, транзиентная ошибка)
+        — следующий genuine-триггер молча терялся на весь cooldown_seconds
+        без единого сигнала оператору. Фикс уже в проде (bot/autoclip.py::
+        _create_clip, ветка else), но не был защищён тестом от регрессии —
+        см. handoff.md, пункт 7 плана. Первый триггер получает 400 от
+        Helix (success=False) -> второй триггер должен всё равно вызвать
+        Helix, а не быть молча отброшен _in_cooldown()."""
+        clip_calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            clip_calls.append(str(request.url))
+            # 400, не 500/429 — HelixClient._request ретраит 5xx/429
+            # внутри ОДНОГО create_clip() (см. twitch_api.py, MAX_RETRIES),
+            # с 500 первый же триггер тихо "самоисцелился" бы повтором и
+            # get success=True, не проверив то, что нужно этому тесту:
+            # 400 не ретраится — create_clip() возвращает success=False
+            # сразу, ровно как настоящий "истёкший scope"/невалидный запрос.
+            if len(clip_calls) == 1:
+                return httpx.Response(400, text="bad request")
+            return httpx.Response(202, json={"data": [{"id": "c1", "edit_url": "http://x/c1"}]})
+
+        autoclip = ChannelAutoclip(
+            channel="chan", broadcaster_id="1",
+            config=make_config(keyword_phrases=("клип",), cooldown_seconds=300.0),
+            clip_token_manager=make_clip_token_manager(tmp_path), helix_client=make_helix(handler),
+        )
+        autoclip.start()
+        try:
+            autoclip.submit_chat_message(author_id="a", text="клип", timestamp=0.0)
+            await _drain(autoclip)
+            autoclip.submit_chat_message(author_id="b", text="клип", timestamp=10.0)
+            await _drain(autoclip)
+        finally:
+            await autoclip.stop()
+
+        # Оба сообщения дошли до Helix — кулдаун не выставился после
+        # неудачи первого, второй триггер не был отброшен _in_cooldown().
+        assert len(clip_calls) == 2
+
     async def test_voice_command_bypasses_cooldown(self, tmp_path: Path) -> None:
         clip_calls: list[str] = []
 

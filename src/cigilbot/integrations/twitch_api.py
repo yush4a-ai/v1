@@ -213,11 +213,26 @@ class HelixClient:
                 continue
 
             if resp.status_code == 429 or resp.status_code >= 500:
-                retry_after = resp.headers.get("Ratelimit-Reset")
                 delay = self._backoff_base * (2**attempt)
-                if retry_after is not None:
-                    with contextlib.suppress(ValueError):
-                        delay = max(delay, float(retry_after) - time.time())
+                # Ratelimit-Reset — момент сброса счётчика запросов, валиден
+                # только для 429 (превышен лимит). Раньше применялся и к
+                # 5xx одинаково (bug-аудит 2026-08-15, HIGH #11) — заголовок
+                # для 5xx семантически не при чём (внутренняя ошибка сервера
+                # Twitch, не про рейт-лимит), но мог содержать устаревшее
+                # значение из предыдущего ответа и раздувать задержку до
+                # 60 сек НА КАЖДУЮ попытку. _run_per_target исполняет цели
+                # строго последовательно — при кластере в 40 человек и
+                # временно нездоровом Helix (несколько 5xx подряд) это
+                # растягивало батч банов на часы, что превышает
+                # STUCK_ACTION_TIMEOUT_SECONDS=120.0 и провоцирует
+                # reclaim_stuck_actions вернуть задание в pending посреди
+                # ещё живого исполнения (executor.py) — задвоенный аудит,
+                # задвоенная эскалация прогрессивных таймаутов.
+                if resp.status_code == 429:
+                    retry_after = resp.headers.get("Ratelimit-Reset")
+                    if retry_after is not None:
+                        with contextlib.suppress(ValueError):
+                            delay = max(delay, float(retry_after) - time.time())
                 log.warning(
                     "Helix %s %s -> %d, повтор через %.1f сек (попытка %d/%d)",
                     method, path, resp.status_code, delay, attempt + 1, MAX_RETRIES,
