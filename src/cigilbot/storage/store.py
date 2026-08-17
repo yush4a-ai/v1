@@ -555,17 +555,27 @@ class ModerationStore:
             raise RuntimeError("INSERT в mod_verdicts не вернул id")
         verdict_id = cursor.lastrowid
 
+        # bug-аудит 2026-08-15, MEDIUM: без явного rollback здесь сбой
+        # INSERT в mod_signals оставлял транзакцию открытой на соединении —
+        # не закоммиченной, но и не откаченной. Следующий вызов save_verdict
+        # с commit=True на том же соединении (upsert_user использует тот же
+        # принцип объединения) закоммитил бы заодно и эти частичные данные:
+        # "вердикт без сигналов" в БД, хотя verdict.signals был непустым.
         if verdict.signals:
-            await self._db.executemany(
-                """
-                INSERT INTO mod_signals (verdict_id, name, family, weight, value, evidence)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (verdict_id, s.name, s.family.value, s.weight, s.value, s.evidence)
-                    for s in verdict.signals
-                ],
-            )
+            try:
+                await self._db.executemany(
+                    """
+                    INSERT INTO mod_signals (verdict_id, name, family, weight, value, evidence)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (verdict_id, s.name, s.family.value, s.weight, s.value, s.evidence)
+                        for s in verdict.signals
+                    ],
+                )
+            except Exception:
+                await self._db.rollback()
+                raise
 
         if commit:
             await self._db.commit()
@@ -581,18 +591,20 @@ class ModerationStore:
         запросов панели.
 
         mod_signals удаляется ЯВНО, отдельным DELETE, до mod_verdicts —
-        схема объявляет FK ON DELETE CASCADE (migrations.py), но
-        PRAGMA foreign_keys нигде в connect() не включена, а без неё
-        SQLite полностью игнорирует внешние ключи, включая каскад:
-        комментарий в схеме описывал не то, что реально происходит.
-        Обнаружено этим же фиксом (тест на каскад падал, пока не добавили
-        явный DELETE) — отдельная, более глубокая находка, чем сам
-        ретеншен: FK CASCADE в этой БД никогда не работал, ни в проде, ни
-        в тестах, до этого момента.
+        схема объявляет FK ON DELETE CASCADE (migrations.py). На момент
+        находки PRAGMA foreign_keys нигде в connect() не была включена, и
+        без неё SQLite полностью игнорировал внешние ключи, включая
+        каскад — комментарий в схеме описывал не то, что реально
+        происходило. Обнаружено этим же фиксом (тест на каскад падал, пока
+        не добавили явный DELETE). PRAGMA foreign_keys=ON включена позже
+        (см. connect()) — явный DELETE оставлен: он не вредит при
+        включённом каскаде (DELETE по уже удалённым строкам просто ничего
+        не находит) и не создаёт зависимости от PRAGMA для корректности
+        ретеншена.
 
-        mod_verdicts удаляется ПЕРЕД mod_messages — обратный порядок не
-        упал бы с ошибкой (foreign_keys всё равно выключены), но оставил
-        бы mod_verdicts.message_id висящим на удалённую строку.
+        mod_verdicts удаляется ПЕРЕД mod_messages — с включённым каскадом
+        порядок уже не критичен, но оставлен как есть: явный порядок
+        читается однозначно, а неявная зависимость от PRAGMA — нет.
 
         mod_clusters НЕ трогается — находка называла только mod_verdicts/
         mod_messages, а mod_clusters ссылается на неё же (cluster_id), так
@@ -648,16 +660,23 @@ class ModerationStore:
             raise RuntimeError("INSERT в mod_clusters не вернул id")
         cluster_id = cursor.lastrowid
 
-        await self._db.executemany(
-            """
-            INSERT OR IGNORE INTO mod_cluster_members (cluster_id, user_id, login, joined_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            [
-                (cluster_id, uid, login, cluster.created_at)
-                for uid, login in zip(cluster.user_ids, cluster.logins, strict=True)
-            ],
-        )
+        # Тот же принцип, что в save_verdict выше (bug-аудит 2026-08-15,
+        # MEDIUM) — без rollback сбой второй вставки оставлял бы открытую
+        # транзакцию, которую закоммитил бы следующий несвязанный вызов.
+        try:
+            await self._db.executemany(
+                """
+                INSERT OR IGNORE INTO mod_cluster_members (cluster_id, user_id, login, joined_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (cluster_id, uid, login, cluster.created_at)
+                    for uid, login in zip(cluster.user_ids, cluster.logins, strict=True)
+                ],
+            )
+        except Exception:
+            await self._db.rollback()
+            raise
         await self._db.commit()
         return cluster_id
 
@@ -706,31 +725,38 @@ class ModerationStore:
             return new_id, True
 
         existing_id = int(row[0])
-        await self._db.execute(
-            """
-            UPDATE mod_clusters
-            SET size = ?, risk_score = ?, confidence = ?, similarity_score = ?,
-                arrival_window_sec = ?, first_message_ratio = ?, new_account_ratio = ?,
-                shared_domains = ?, pattern_id = ?
-            WHERE id = ?
-            """,
-            (
-                cluster.size, cluster.risk_score, cluster.confidence, cluster.similarity_score,
-                cluster.arrival_window_sec, cluster.first_message_ratio, cluster.new_account_ratio,
-                json.dumps(list(cluster.shared_domains)) if cluster.shared_domains else None,
-                cluster.pattern_id, existing_id,
-            ),
-        )
-        await self._db.executemany(
-            """
-            INSERT OR IGNORE INTO mod_cluster_members (cluster_id, user_id, login, joined_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            [
-                (existing_id, uid, login, cluster.created_at)
-                for uid, login in zip(cluster.user_ids, cluster.logins, strict=True)
-            ],
-        )
+        # Тот же принцип, что в save_verdict/save_cluster (bug-аудит
+        # 2026-08-15, MEDIUM) — UPDATE и executemany вместе одной
+        # транзакцией, откат при сбое любого из двух шагов.
+        try:
+            await self._db.execute(
+                """
+                UPDATE mod_clusters
+                SET size = ?, risk_score = ?, confidence = ?, similarity_score = ?,
+                    arrival_window_sec = ?, first_message_ratio = ?, new_account_ratio = ?,
+                    shared_domains = ?, pattern_id = ?
+                WHERE id = ?
+                """,
+                (
+                    cluster.size, cluster.risk_score, cluster.confidence, cluster.similarity_score,
+                    cluster.arrival_window_sec, cluster.first_message_ratio, cluster.new_account_ratio,
+                    json.dumps(list(cluster.shared_domains)) if cluster.shared_domains else None,
+                    cluster.pattern_id, existing_id,
+                ),
+            )
+            await self._db.executemany(
+                """
+                INSERT OR IGNORE INTO mod_cluster_members (cluster_id, user_id, login, joined_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (existing_id, uid, login, cluster.created_at)
+                    for uid, login in zip(cluster.user_ids, cluster.logins, strict=True)
+                ],
+            )
+        except Exception:
+            await self._db.rollback()
+            raise
         await self._db.commit()
         return existing_id, False
 

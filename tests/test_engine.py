@@ -951,6 +951,86 @@ class TestNewClusterAlert:
 
         assert sent == []
 
+    async def test_task_reference_is_kept_and_cleaned_up(
+        self, tmp_path: Path, event_factory: EventFactory, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """bug-аудит 2026-08-15, MEDIUM: asyncio.create_task() без
+        сохранённой ссылки держится только слабой ссылкой event loop'а —
+        GC мог собрать задачу до завершения. Проверяем, что движок держит
+        задачу в _alert_tasks, пока она не завершится, и убирает из набора
+        сама после завершения (через add_done_callback), а не растит набор
+        без ограничения.
+
+        Вызывает _notify_new_cluster() напрямую (не через волну observe()),
+        потому что при волне из 20 сообщений задача успевает выполниться
+        целиком за последующие await engine.observe(...) — сам факт
+        удержания ссылки от этого не менее реален, но проверить его нужно
+        до того, как задача сама себя уберёт."""
+        released = asyncio.Event()
+
+        async def slow_send_cluster_alert(webhook, cluster, *, channel, transport=None):  # type: ignore[no-untyped-def]
+            await released.wait()
+
+        monkeypatch.setattr("cigilbot.orchestration.engine.send_cluster_alert", slow_send_cluster_alert)
+
+        store = ModerationStore(str(tmp_path / "mod.db"))
+        await store.connect()
+        await store.set_discord_webhook(
+            url="https://discord.com/api/webhooks/1/abc", enabled=True, updated_by="test"
+        )
+        await store.set_alert_confidence_threshold(threshold=0.0)
+        engine = make_engine(store=store)
+
+        cluster = ClusterInfo(
+            cluster_id=1, user_ids=("1", "2"), logins=("a", "b"), similarity_score=0.9,
+            arrival_window_sec=10.0, first_message_ratio=1.0, new_account_ratio=1.0,
+            shared_domains=(), signals=(), risk_score=90, confidence=0.9,
+            created_at=time.time(),
+        )
+        engine._notify_new_cluster(cluster)  # noqa: SLF001 — прямой вызов, не через observe()
+        await asyncio.sleep(0)  # даём задаче стартовать и дойти до released.wait()
+
+        assert len(engine._alert_tasks) == 1  # noqa: SLF001 — задача поставлена и ещё не завершилась
+        pending_task = next(iter(engine._alert_tasks))  # noqa: SLF001
+
+        released.set()
+        await pending_task  # дожидаемся самой задачи, а не гадаем числом sleep(0)
+
+        assert engine._alert_tasks == set()  # noqa: SLF001 — done_callback убрал её сама
+
+    async def test_cancel_pending_alerts_stops_task_before_store_close(
+        self, tmp_path: Path, event_factory: EventFactory, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """cancel_pending_alerts() — то, что ChannelPipeline.stop() зовёт
+        перед закрытием store: задача, поставленная непосредственно перед
+        остановкой канала, не должна успеть дописать в уже закрытое
+        соединение."""
+        started = asyncio.Event()
+
+        async def slow_send_cluster_alert(webhook, cluster, *, channel, transport=None):  # type: ignore[no-untyped-def]
+            started.set()
+            await asyncio.sleep(10)  # никогда не завершится сама — только через cancel
+
+        monkeypatch.setattr("cigilbot.orchestration.engine.send_cluster_alert", slow_send_cluster_alert)
+
+        store = ModerationStore(str(tmp_path / "mod.db"))
+        await store.connect()
+        await store.set_discord_webhook(
+            url="https://discord.com/api/webhooks/1/abc", enabled=True, updated_by="test"
+        )
+        await store.set_alert_confidence_threshold(threshold=0.0)
+        engine = make_engine(store=store)
+
+        await _form_bot_wave(engine, event_factory, wave=0, now=time.time())
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+        assert len(engine._alert_tasks) == 1  # noqa: SLF001
+
+        engine.cancel_pending_alerts()
+        await asyncio.sleep(0)
+
+        assert all(t.cancelled() or t.done() for t in engine._alert_tasks)
+        await store.close()
+
 
 class TestAlertConfidenceFilter:
     """Порог confidence настраивается per-channel (webhook.
@@ -1028,6 +1108,7 @@ class TestEscalation:
 
         async def fake_send_escalation(webhook, *, channel, cluster_count, window_hours, transport=None):  # type: ignore[no-untyped-def]
             escalations.append(cluster_count)
+            return True  # доставлено — иначе mark_escalation_sent() не вызовется и cooldown не сработает
 
         monkeypatch.setattr("cigilbot.orchestration.engine.send_cluster_alert", _noop_alert)
         monkeypatch.setattr("cigilbot.orchestration.engine.send_escalation", fake_send_escalation)
@@ -1053,6 +1134,7 @@ class TestEscalation:
 
         async def fake_send_escalation(webhook, *, channel, cluster_count, window_hours, transport=None):  # type: ignore[no-untyped-def]
             escalations.append(cluster_count)
+            return True  # доставлено — иначе mark_escalation_sent() не вызовется и cooldown не сработает
 
         monkeypatch.setattr("cigilbot.orchestration.engine.send_cluster_alert", _noop_alert)
         monkeypatch.setattr("cigilbot.orchestration.engine.send_escalation", fake_send_escalation)
@@ -1078,6 +1160,7 @@ class TestEscalation:
 
         async def fake_send_escalation(webhook, *, channel, cluster_count, window_hours, transport=None):  # type: ignore[no-untyped-def]
             escalations.append(cluster_count)
+            return True  # доставлено — иначе mark_escalation_sent() не вызовется и cooldown не сработает
 
         monkeypatch.setattr("cigilbot.orchestration.engine.send_cluster_alert", _noop_alert)
         monkeypatch.setattr("cigilbot.orchestration.engine.send_escalation", fake_send_escalation)
@@ -1098,6 +1181,42 @@ class TestEscalation:
             await asyncio.sleep(0)
 
         assert len(escalations) == 1
+
+    async def test_failed_delivery_does_not_start_cooldown(
+        self, tmp_path: Path, event_factory: EventFactory, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """bug-аудит 2026-08-15, MEDIUM: раньше mark_escalation_sent()
+        ставился безусловно — сбой доставки Discord (429/сеть) откладывал
+        следующую попытку на ESCALATION_WINDOW_SECONDS, теряя алерт про
+        волну, которая его и вызвала. Теперь при неудаче cooldown не
+        стартует, и следующая волна сверх порога шлёт эскалацию снова."""
+        escalations: list[int] = []
+
+        async def failing_send_escalation(webhook, *, channel, cluster_count, window_hours, transport=None):  # type: ignore[no-untyped-def]
+            escalations.append(cluster_count)
+            return False  # имитирует 429/сбой сети
+
+        monkeypatch.setattr("cigilbot.orchestration.engine.send_cluster_alert", _noop_alert)
+        monkeypatch.setattr("cigilbot.orchestration.engine.send_escalation", failing_send_escalation)
+
+        store = ModerationStore(str(tmp_path / "mod.db"))
+        await store.connect()
+        await store.set_discord_webhook(
+            url="https://discord.com/api/webhooks/1/abc", enabled=True, updated_by="test"
+        )
+        engine = make_engine(store=store)
+
+        now = time.time()
+        for wave in range(ESCALATION_CLUSTER_THRESHOLD + 1):
+            await _form_bot_wave(engine, event_factory, wave=wave, now=now + wave * 100)
+            await asyncio.sleep(0)
+
+        # Обе волны сверх порога вызвали попытку отправки — ни одна не
+        # "закэшировалась" как отправленная, раз доставка всегда падала.
+        assert len(escalations) == 2
+        webhook = await store.get_discord_webhook()
+        assert webhook is not None
+        assert webhook.last_escalation_sent_at is None
 
 
 async def _noop_alert(webhook, cluster, *, channel, transport=None):  # type: ignore[no-untyped-def]

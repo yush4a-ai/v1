@@ -192,9 +192,25 @@ class ModerationEngine:
         # ModerationHub читает раз в тик и раздаёт снимок каждому движку
         # через sync_known_bad_actors().
         self._known_bad_actor_ids: frozenset[str] = frozenset()
+        # Ссылки на задачи Discord-алертов, поставленные _notify_new_cluster
+        # — asyncio.create_task() без сохранённой ссылки держится только
+        # слабой ссылкой event loop'а, GC мог собрать задачу до завершения
+        # (bug-аудит 2026-08-15, MEDIUM). discard-колбэк убирает завершённую
+        # задачу из набора сам — без этого self._alert_tasks рос бы без
+        # ограничения на весь срок жизни канала.
+        self._alert_tasks: set[asyncio.Task[None]] = set()
 
     def sync_known_bad_actors(self, user_ids: frozenset[str]) -> None:
         self._known_bad_actor_ids = user_ids
+
+    def cancel_pending_alerts(self) -> None:
+        """Отменяет ещё не завершённые задачи Discord-алертов — зовётся
+        ChannelPipeline.stop() перед закрытием store: без этого задача,
+        поставленная в фон непосредственно перед остановкой канала, могла
+        дописать в уже закрытое aiosqlite-соединение (необработанный
+        ValueError после stop())."""
+        for task in self._alert_tasks:
+            task.cancel()
 
     async def reload_content_rules(self) -> None:
         """Перечитывает включённые правила словаря из store. Вызывается
@@ -379,7 +395,9 @@ class ModerationEngine:
         в БД сравнивать не с чем."""
         if self._store is None:
             return
-        asyncio.create_task(self._send_new_cluster_alert(cluster))
+        task = asyncio.create_task(self._send_new_cluster_alert(cluster))
+        self._alert_tasks.add(task)
+        task.add_done_callback(self._alert_tasks.discard)
 
     async def _send_new_cluster_alert(self, cluster: ClusterInfo) -> None:
         assert self._store is not None
@@ -421,13 +439,18 @@ class ModerationEngine:
         count = await self._store.count_recent_new_clusters(since=now - ESCALATION_WINDOW_SECONDS)
         if count < ESCALATION_CLUSTER_THRESHOLD:
             return
-        await send_escalation(
+        delivered = await send_escalation(
             webhook,
             channel=self._channel_profile.channel,
             cluster_count=count,
             window_hours=ESCALATION_WINDOW_SECONDS / 3600,
         )
-        await self._store.mark_escalation_sent(sent_at=now)
+        # Только при реальной доставке (см. докстринг send_escalation) —
+        # иначе Discord 429/сбой сети откладывал бы следующую попытку на
+        # ESCALATION_WINDOW_SECONDS, теряя алерт ровно про волну, которая
+        # его и вызвала (bug-аудит 2026-08-15, MEDIUM).
+        if delivered:
+            await self._store.mark_escalation_sent(sent_at=now)
 
     async def observe(
         self, event: ChatEvent, *, channel_context: ChannelContext | None = None

@@ -219,6 +219,12 @@ class ChannelPipeline:
         # ожидаем и не является сбоем остановки.
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks = []
+        # Задача Discord-алерта могла быть поставлена в фон непосредственно
+        # перед stop() (engine.py::_notify_new_cluster) — без отмены она
+        # дописала бы в store после его close() ниже (bug-аудит 2026-08-15,
+        # MEDIUM).
+        if self.engine is not None:
+            self.engine.cancel_pending_alerts()
         await self.store.close()
         await self.fingerprint_store.close()
         # helix_client/account_age_client создаются в _setup_twitch_clients
@@ -444,11 +450,17 @@ class ChannelPipeline:
                         stats = await self.store.get_digest_stats(since=since)
                         moderator_stats = await self.store.get_moderator_activity_stats(since=since)
                         hours = (now - since) / 3600
-                        await send_digest(
+                        delivered = await send_digest(
                             webhook, stats, channel=self.channel, hours=hours,
                             moderator_stats=moderator_stats,
                         )
-                        await self.store.mark_digest_sent(sent_at=now)
+                        # Метка "отправлено" — только при реальной доставке
+                        # (см. докстринг send_digest). Иначе Discord 429/сбой
+                        # сети откладывал бы следующую попытку на сутки,
+                        # теряя ровно то, ради чего digest существует
+                        # (bug-аудит 2026-08-15, MEDIUM).
+                        if delivered:
+                            await self.store.mark_digest_sent(sent_at=now)
             except Exception:
                 log.exception("Сбой ежедневного digest в Discord (канал %s)", self.channel)
             await asyncio.sleep(DIGEST_CHECK_INTERVAL_SECONDS)

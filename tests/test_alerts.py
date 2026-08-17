@@ -248,7 +248,7 @@ class TestSendDigest:
             return httpx.Response(204)
 
         webhook = make_webhook(url="https://discord.com/api/webhooks/1/abc")
-        await send_digest(
+        delivered = await send_digest(
             webhook,
             make_digest_stats(),
             channel="paverpapa",
@@ -258,6 +258,7 @@ class TestSendDigest:
 
         assert len(calls) == 1
         assert str(calls[0].url) == "https://discord.com/api/webhooks/1/abc"
+        assert delivered is True
 
     async def test_disabled_webhook_sends_nothing(self) -> None:
         calls: list[httpx.Request] = []
@@ -267,20 +268,40 @@ class TestSendDigest:
             return httpx.Response(204)
 
         webhook = make_webhook(enabled=False)
-        await send_digest(
+        delivered = await send_digest(
             webhook, make_digest_stats(), channel="x", hours=24, transport=httpx.MockTransport(handler)
         )
 
         assert calls == []
+        # enabled=False — не сбой, это осознанное выключение: True значит
+        # "период учтён", не "письмо доставлено" (см. докстринг send_digest).
+        assert delivered is True
 
     async def test_network_failure_does_not_raise(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             raise httpx.ConnectError("no route to host")
 
         webhook = make_webhook()
-        await send_digest(
+        delivered = await send_digest(
             webhook, make_digest_stats(), channel="x", hours=24, transport=httpx.MockTransport(handler)
         )
+
+        assert delivered is False
+
+    async def test_discord_error_response_returns_false(self) -> None:
+        """bug-аудит 2026-08-15, MEDIUM: раньше вызывающий код не мог
+        отличить успех от провала — mark_digest_sent() ставился безусловно,
+        и 429 от Discord (обычное дело при лимите ~5 запросов/2 сек)
+        откладывал следующую попытку на сутки."""
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(429, json={"message": "rate limited"})
+
+        webhook = make_webhook()
+        delivered = await send_digest(
+            webhook, make_digest_stats(), channel="x", hours=24, transport=httpx.MockTransport(handler)
+        )
+
+        assert delivered is False
 
     async def test_includes_moderator_embed_when_activity_present(self) -> None:
         captured: list[dict[str, object]] = []
@@ -360,7 +381,7 @@ class TestSendEscalation:
             return httpx.Response(204)
 
         webhook = make_webhook(url="https://discord.com/api/webhooks/1/abc")
-        await send_escalation(
+        delivered = await send_escalation(
             webhook,
             channel="paverpapa",
             cluster_count=4,
@@ -370,6 +391,7 @@ class TestSendEscalation:
 
         assert len(calls) == 1
         assert str(calls[0].url) == "https://discord.com/api/webhooks/1/abc"
+        assert delivered is True
 
     async def test_disabled_webhook_sends_nothing(self) -> None:
         calls: list[httpx.Request] = []
@@ -379,20 +401,37 @@ class TestSendEscalation:
             return httpx.Response(204)
 
         webhook = make_webhook(enabled=False)
-        await send_escalation(
+        delivered = await send_escalation(
             webhook, channel="x", cluster_count=4, window_hours=1, transport=httpx.MockTransport(handler)
         )
 
         assert calls == []
+        assert delivered is True
 
     async def test_network_failure_does_not_raise(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             raise httpx.ConnectError("no route to host")
 
         webhook = make_webhook()
-        await send_escalation(
+        delivered = await send_escalation(
             webhook, channel="x", cluster_count=4, window_hours=1, transport=httpx.MockTransport(handler)
         )
+
+        assert delivered is False
+
+    async def test_discord_error_response_returns_false(self) -> None:
+        """bug-аудит 2026-08-15, MEDIUM: без возврата статуса
+        mark_escalation_sent() ставился безусловно — сбой доставки терял
+        алерт ровно про волну атак, которая его вызвала."""
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, text="internal error")
+
+        webhook = make_webhook()
+        delivered = await send_escalation(
+            webhook, channel="x", cluster_count=4, window_hours=1, transport=httpx.MockTransport(handler)
+        )
+
+        assert delivered is False
 
 
 class TestSendClusterAlert:

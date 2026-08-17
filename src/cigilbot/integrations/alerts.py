@@ -139,18 +139,27 @@ async def send_digest(
     hours: float,
     moderator_stats: ModeratorActivityStats | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
-) -> None:
+) -> bool:
     """Отправляет ежедневную сводку. Тот же контракт, что
     send_cluster_alert(): молчит на выключенном webhook, глотает сбои сети —
     вызывающий код (pipeline.py) не должен падать из-за недоступного
     Discord.
+
+    Возвращает True только при реально успешной доставке — вызывающий код
+    (pipeline.py) должен звать mark_digest_sent() исключительно в этом
+    случае: Discord регулярно отдаёт 429 (лимит ~5 запросов/2 сек на
+    webhook), и раньше метка "отправлено" ставилась безусловно — при сбое
+    следующая попытка откладывалась на сутки, теряя ровно то, ради чего
+    существует digest (bug-аудит 2026-08-15, MEDIUM). webhook.enabled=False
+    — не сбой, это осознанное выключение оператором, и это True (нечего
+    было отправлять — метка помечает "период учтён", не "письмо доставлено").
 
     moderator_stats — опционально (пользователь 2026-08-13): второй embed
     в том же сообщении, только если за период было хотя бы одно ручное
     действие — total==0 значит модераторы не вмешивались, отдельный embed
     с одними нулями не добавляет ценности рядом со сводкой бота."""
     if not webhook.enabled:
-        return
+        return True
     embeds = [build_digest_embed(stats, channel=channel, hours=hours)]
     if moderator_stats is not None and (
         moderator_stats.total_timeouts or moderator_stats.total_bans or moderator_stats.total_deletes
@@ -163,6 +172,8 @@ async def send_digest(
             resp.raise_for_status()
     except Exception:
         log.exception("Не удалось отправить ежедневный digest в Discord (канал %s)", channel)
+        return False
+    return True
 
 
 def build_escalation_embed(*, channel: str, cluster_count: int, window_hours: float) -> dict[str, object]:
@@ -188,11 +199,15 @@ async def send_escalation(
     cluster_count: int,
     window_hours: float,
     transport: httpx.AsyncBaseTransport | None = None,
-) -> None:
+) -> bool:
     """Отправляет алерт эскалации. Тот же контракт, что send_cluster_alert():
-    молчит на выключенном webhook, глотает сбои сети."""
+    молчит на выключенном webhook, глотает сбои сети.
+
+    Возвращает True только при реально успешной доставке — см. докстринг
+    send_digest про то, почему это важно для mark_escalation_sent()
+    (bug-аудит 2026-08-15, MEDIUM)."""
     if not webhook.enabled:
-        return
+        return True
     payload = {
         "embeds": [
             build_escalation_embed(channel=channel, cluster_count=cluster_count, window_hours=window_hours)
@@ -204,6 +219,8 @@ async def send_escalation(
             resp.raise_for_status()
     except Exception:
         log.exception("Не удалось отправить эскалацию в Discord (канал %s)", channel)
+        return False
+    return True
 
 
 async def send_cluster_alert(

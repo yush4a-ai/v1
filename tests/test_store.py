@@ -248,6 +248,47 @@ class TestSaveVerdict:
         verdict_id = await store.save_verdict(verdict)
         assert verdict_id > 0
 
+    async def test_signals_insert_failure_rolls_back_verdict(
+        self, store: ModerationStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """bug-аудит 2026-08-15, MEDIUM: без явного rollback сбой второй
+        вставки (mod_signals) оставлял транзакцию открытой на соединении —
+        следующий save_verdict(commit=True) на том же соединении закоммитил
+        бы заодно и эти частичные данные, "вердикт без сигналов" вместо
+        честного отката."""
+        real_executemany = store._db.executemany
+
+        async def failing_executemany(sql, params):  # type: ignore[no-untyped-def]
+            if "mod_signals" in sql:
+                raise RuntimeError("симулированный сбой записи сигналов")
+            return await real_executemany(sql, params)
+
+        monkeypatch.setattr(store._db, "executemany", failing_executemany)
+
+        verdict = Verdict(
+            user_id="1", login="bot1", risk_score=90, confidence=0.9,
+            signals=(make_signal("new_account"),), recommended_action=Action.BAN,
+            reason="test", timestamp=time.time(),
+        )
+
+        with pytest.raises(RuntimeError, match="симулированный сбой"):
+            await store.save_verdict(verdict)
+
+        # Транзакция должна быть откачена, а не висеть открытой — следующая
+        # НЕСВЯЗАННАЯ запись на том же соединении не должна протащить с
+        # собой частичный INSERT в mod_verdicts из упавшего вызова выше.
+        monkeypatch.undo()
+        other = Verdict(
+            user_id="2", login="user2", risk_score=0, confidence=0.0, signals=(),
+            recommended_action=Action.NOTHING, reason="clean", timestamp=time.time(),
+        )
+        await store.save_verdict(other)
+
+        cursor = await store._db.execute("SELECT COUNT(*) FROM mod_verdicts WHERE login = 'bot1'")
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == 0, "частичный вердикт без сигналов не должен был закоммититься"
+
     async def test_pattern_id_persisted(self, store: ModerationStore) -> None:
         pattern_id = await store.create_pattern(make_pattern_input())
         verdict = Verdict(
