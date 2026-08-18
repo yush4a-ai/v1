@@ -268,18 +268,6 @@ async def api_clusters(
         return await store.get_active_clusters(limit=limit)
 
 
-@router.get("/verdicts")
-async def api_verdicts(
-    request: Request,
-    profile: str = "main",
-    min_risk: int = 30,
-    limit: int = 100,
-    session: tuple[str, str] = Depends(require_authenticated),
-) -> list[dict[str, object]]:
-    async with channel_store(request, profile, "MODERATOR") as (store, _role, _login):
-        return await store.get_recent_verdicts(min_risk_level=min_risk, limit=limit)
-
-
 @router.get("/audit")
 async def api_audit(
     request: Request,

@@ -136,13 +136,11 @@ class TestExtractLinks:
 class TestScriptProfile:
     def test_pure_cyrillic(self) -> None:
         profile = script_profile("привет всем в чате")
-        assert profile.dominant == "cyrillic"
         assert not profile.has_mixed_words
 
     def test_pure_latin_is_normal_for_ru_channel(self) -> None:
         # латиница сама по себе не аномалия: ники, "gg", "pog", транслит
         profile = script_profile("gg wp nice game")
-        assert profile.dominant == "latin"
         assert not profile.has_mixed_words
         assert not profile.has_confusables
 
@@ -163,11 +161,9 @@ class TestScriptProfile:
     def test_emoji_counted_separately_from_letters(self) -> None:
         profile = script_profile("привет 😀😀")
         assert profile.emoji_count == 2
-        assert profile.dominant == "cyrillic"
 
     def test_empty_text(self) -> None:
         profile = script_profile("")
-        assert profile.dominant == "none"
         assert profile.total_letters == 0
 
 

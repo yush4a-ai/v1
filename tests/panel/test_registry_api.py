@@ -1,5 +1,5 @@
 """Тесты panel/registry_api.py: sync_channel (внешний вход, токен-guard) и
-управление каналом (start/stop/reset_crash) через реестр.
+управление каналом (start/stop) через реестр.
 
 До этой правки (test-coverage-аудит 2026-08-15, HIGH #7) ни один из этих
 роутов не имел ни одного теста — sync_channel единственный внешний HTTP-вход
@@ -172,7 +172,7 @@ class TestSyncChannel:
 
 
 class TestChannelLifecycle:
-    """start/stop/reset_crash — desired_state, исполняет бот отдельно
+    """start/stop — desired_state, исполняет бот отдельно
     (ModerationHub на следующем тике сверки), не эти хендлеры."""
 
     async def test_start_sets_desired_state_running(
@@ -216,23 +216,3 @@ class TestChannelLifecycle:
         resp = _authed_client(app, role="MODERATOR").post("/api/registry/channels/1/start")
         assert resp.status_code == 403
 
-    async def test_reset_crash_clears_restart_count(
-        self, registry_app: tuple[FastAPI, Path]
-    ) -> None:
-        app, db = registry_app
-        registry = RegistryStore(str(db))
-        await registry.connect()
-        await registry.upsert_channel(broadcaster_id="1", login="streamer", registered_by="manual")
-        await registry.close()
-
-        resp = _authed_client(app).post("/api/registry/channels/1/reset_crash")
-
-        assert resp.status_code == 200
-        assert resp.json()["restart_count"] == 0
-
-    def test_reset_crash_unknown_channel_returns_404(
-        self, registry_app: tuple[FastAPI, Path]
-    ) -> None:
-        app, _db = registry_app
-        resp = _authed_client(app).post("/api/registry/channels/does-not-exist/reset_crash")
-        assert resp.status_code == 404

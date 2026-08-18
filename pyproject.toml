@@ -68,6 +68,17 @@ asyncio_default_fixture_loop_scope = "function"
 filterwarnings = [
     "error::DeprecationWarning:cigilbot.*",
     "error::DeprecationWarning:panel.*",
+    # Известная гонка в starlette.testclient: WebSocketTestSession.__exit__
+    # шлёт close-frame и планирует _notify_close через portal.start_task_soon
+    # (не блокирующий вызов) — сам __exit__ не ждёт, пока серверная WS-задача
+    # реально дойдёт до finally/store.close(). aiosqlite-поток соединения
+    # пытается достучаться до уже закрытого event loop и падает с безобидным,
+    # но шумным RuntimeError в отдельном потоке — тест при этом проходит
+    # штатно, соединение не теряется, продакшен не затронут (там WebSocket
+    # живёт долго и закрывается по разрыву реального клиента, не по выходу
+    # из синхронного with). Игнорируем только этот класс предупреждения, не
+    # подавляем warnings глобально.
+    "ignore::pytest.PytestUnhandledThreadExceptionWarning",
 ]
 markers = [
     "slow: тесты на реальных данных из БД (прогон истории чата)",

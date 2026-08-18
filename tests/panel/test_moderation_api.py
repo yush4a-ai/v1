@@ -12,6 +12,7 @@ WebSocket не тестируется здесь TestClient'ом на посто
 
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
 
@@ -21,13 +22,10 @@ from starlette.websockets import WebSocketDisconnect
 
 from cigilbot.domain.normalize import fingerprint
 from cigilbot.domain.types import (
-    Action,
     ChatEvent,
     ClusterInfo,
-    Mode,
     Signal,
     SignalFamily,
-    Verdict,
 )
 from cigilbot.storage.registry_store import RegistryStore
 from cigilbot.storage.store import ModerationStore, PatternInput
@@ -61,29 +59,9 @@ def make_cluster(**overrides: object) -> ClusterInfo:
     return ClusterInfo(**defaults)  # type: ignore[arg-type]
 
 
-def make_verdict(**overrides: object) -> Verdict:
-    defaults: dict[str, object] = {
-        "user_id": "1",
-        "login": "bot1",
-        "risk_score": 70,
-        "confidence": 0.85,
-        "signals": (),
-        "recommended_action": Action.TIMEOUT,
-        "reason": "тестовый вердикт",
-        "timestamp": time.time(),
-        "mode": Mode.SHADOW,
-    }
-    defaults.update(overrides)
-    return Verdict(**defaults)  # type: ignore[arg-type]
-
-
 class TestReadEndpointsRequireLogin:
     async def test_clusters_without_session_401(self, app_client: TestClient) -> None:
         resp = app_client.get("/api/moderation/clusters")
-        assert resp.status_code == 401
-
-    async def test_verdicts_without_session_401(self, app_client: TestClient) -> None:
-        resp = app_client.get("/api/moderation/verdicts")
         assert resp.status_code == 401
 
     async def test_audit_without_session_401(self, app_client: TestClient) -> None:
@@ -207,36 +185,6 @@ class TestUsersEndpoint:
         data = resp.json()
         assert len(data) == 1
         assert data[0]["login"] == "alice"
-
-
-class TestVerdictsEndpoint:
-    async def test_filters_by_min_risk(
-        self, app_client: TestClient, store: ModerationStore
-    ) -> None:
-        await store.save_verdict(make_verdict(risk_score=10))
-        await store.save_verdict(make_verdict(risk_score=50))
-        login_as(app_client, "MODERATOR")
-
-        resp = app_client.get("/api/moderation/verdicts?min_risk=30")
-
-        data = resp.json()
-        assert len(data) == 1
-        assert data[0]["risk_score"] == 50
-
-    async def test_includes_signal_names(
-        self, app_client: TestClient, store: ModerationStore
-    ) -> None:
-        signal = Signal(
-            name="exact_duplicate", family=SignalFamily.CONTENT,
-            weight=25, value=1.0, evidence="test",
-        )
-        await store.save_verdict(make_verdict(risk_score=60, signals=(signal,)))
-        login_as(app_client, "MODERATOR")
-
-        resp = app_client.get("/api/moderation/verdicts?min_risk=30")
-
-        data = resp.json()
-        assert data[0]["signal_names"] == ["exact_duplicate"]
 
 
 class TestRolesAndPermissions:
@@ -1475,16 +1423,31 @@ class TestContentWebSocket:
             data = ws.receive_json()
         assert data["events"] == []
 
-    async def test_sends_recorded_event(
-        self, app_client: TestClient, store: ModerationStore
-    ) -> None:
+    def test_sends_recorded_event(self, app_client: TestClient, db_path: Path) -> None:
+        # Синхронный тест (не async def) с asyncio.run() для подготовки
+        # данных — тот же приём, что test_auth.py::test_admin_override_from_
+        # mod_panel_users. async def тест, вызывающий синхронный
+        # TestClient.websocket_connect() внутри себя, создавал deadlock:
+        # pytest-asyncio уже держит event loop этого потока, а
+        # websocket_connect() пытается синхронно поднять свой anyio-portal
+        # поверх — конфликт двух loop в одном потоке, тест зависал
+        # бесконечно (воспроизведено изолированным прогоном, unittest
+        # timeout не срабатывал, потому что deadlock — не долгое вычисление).
+        # asyncio.run() создаёт и полностью закрывает свой loop ДО перехода
+        # к синхронной части, а не одновременно с ней.
         from cigilbot.domain.types import ContentCategory
 
-        await store.record_content_event(
-            user_id="1", login="viewer1", message_id=None, category=ContentCategory.RACISM,
-            matched_phrase="слово", action="OBSERVE", prior_violations=0,
-            blocked_by="content_moderation_disabled", enforced=False,
-        )
+        async def seed() -> None:
+            store = ModerationStore(str(db_path))
+            await store.connect()
+            await store.record_content_event(
+                user_id="1", login="viewer1", message_id=None, category=ContentCategory.RACISM,
+                matched_phrase="слово", action="OBSERVE", prior_violations=0,
+                blocked_by="content_moderation_disabled", enforced=False,
+            )
+            await store.close()
+
+        asyncio.run(seed())
 
         login_as(app_client, "MODERATOR")
         with app_client.websocket_connect("/api/moderation/content_ws") as ws:

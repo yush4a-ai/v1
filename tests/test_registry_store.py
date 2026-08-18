@@ -168,26 +168,6 @@ class TestUpdateProcessState:
         assert record.pid is None
 
 
-class TestResetCrash:
-    async def test_resets_restart_count_and_status(self, store: RegistryStore) -> None:
-        await store.upsert_channel(broadcaster_id="1", login="alpha")
-        await store.update_process_state("1", process_status="crashed", increment_restart_count=True)
-        await store.update_process_state("1", process_status="crashed", increment_restart_count=True)
-
-        await store.reset_crash("1")
-
-        record = await store.get_channel("1")
-        assert record is not None
-        assert record.restart_count == 0
-        assert record.process_status == "stopped"
-
-    async def test_unknown_broadcaster_id_is_a_noop(self, store: RegistryStore) -> None:
-        # UPDATE на несуществующий broadcaster_id не создаёт строку и не
-        # падает — тот же принцип, что set_desired_state/update_process_state.
-        await store.reset_crash("nonexistent")
-        assert await store.get_channel("nonexistent") is None
-
-
 class TestConnectionLifecycle:
     async def test_using_store_before_connect_raises(self, tmp_path: Path) -> None:
         store = RegistryStore(str(tmp_path / "unconnected.db"))

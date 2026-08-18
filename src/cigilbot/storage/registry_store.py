@@ -150,7 +150,7 @@ class RegistryStore:
         last_exit_code: int | None = None,
         increment_restart_count: bool = False,
     ) -> None:
-        """Пишет ТОЛЬКО supervisor.py — единственный писатель process_status.
+        """Пишет ТОЛЬКО ModerationHub — единственный писатель process_status.
 
         Панель/API никогда не вызывает этот метод напрямую (см. докстринг
         ChannelRecord.desired_state vs process_status в registry_migrations.py).
@@ -174,11 +174,4 @@ class RegistryStore:
                 """,
                 (process_status, pid, last_exit_code, time.time(), broadcaster_id),
             )
-        await self._db.commit()
-
-    async def reset_crash(self, broadcaster_id: str) -> None:
-        await self._db.execute(
-            "UPDATE channels SET restart_count = 0, process_status = 'stopped' WHERE broadcaster_id = ?",
-            (broadcaster_id,),
-        )
         await self._db.commit()

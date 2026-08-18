@@ -37,17 +37,11 @@ class SlidingWindow:
         self._max_age = max_age_seconds
         self._entries: deque[WindowEntry] = deque()
         self._by_user: dict[str, deque[WindowEntry]] = defaultdict(deque)
-        # Момент, с которого пользователь непрерывно присутствует в окне —
-        # НЕ первое сообщение вообще (это ChatEvent.is_first_message из тегов
-        # Twitch), а начало текущей "серии" активности. Сбрасывается, если
-        # пользователь пропадает из окна дольше max_age.
-        self._streak_start: dict[str, float] = {}
 
     def add(self, event: ChatEvent, fp: MessageFingerprint) -> None:
         entry = WindowEntry(event=event, fingerprint=fp)
         self._entries.append(entry)
         self._by_user[event.user_id].append(entry)
-        self._streak_start.setdefault(event.user_id, event.timestamp)
         self._prune(event.timestamp)
 
     def _prune(self, now: float) -> None:
@@ -61,7 +55,6 @@ class SlidingWindow:
                 uq.popleft()
             if not uq:
                 del self._by_user[old.event.user_id]
-                self._streak_start.pop(old.event.user_id, None)
 
     @staticmethod
     def _slice_from_right(entries: deque[WindowEntry], cutoff: float) -> list[WindowEntry]:
@@ -112,20 +105,6 @@ class SlidingWindow:
 
     def unique_chatters(self, seconds: float, now: float | None = None) -> set[str]:
         return {e.event.user_id for e in self.recent(seconds, now)}
-
-    def streak_start(self, user_id: str) -> float | None:
-        """С какого момента пользователь непрерывно активен в окне."""
-        return self._streak_start.get(user_id)
-
-    def recent_arrivals(self, seconds: float, now: float | None = None) -> dict[str, float]:
-        """user_id -> момент начала серии, для тех, кто начал недавно.
-
-        Используется кластеризацией: много пользователей, чья серия
-        началась в одном узком интервале — признак синхронного появления.
-        """
-        now = time.time() if now is None else now
-        cutoff = now - seconds
-        return {uid: ts for uid, ts in self._streak_start.items() if ts >= cutoff}
 
     def __len__(self) -> int:
         return len(self._entries)

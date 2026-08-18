@@ -43,9 +43,9 @@ from paths import ENV_FILE, REGISTRY_DB
 router = APIRouter(prefix="/api/registry")
 
 # Иерархия ролей — тот же принцип, что moderation_api.py::_ROLE_RANK.
-# Управление supervisor-процессами (start/stop/reset_crash) — операционное
-# действие уровня инстанса, не модерация конкретного канала, поэтому
-# требует общую роль сессии (require_authenticated), не role_for_profile.
+# Управление процессами (start/stop) — операционное действие уровня
+# инстанса, не модерация конкретного канала, поэтому требует общую роль
+# сессии (require_authenticated), не role_for_profile.
 _ROLE_RANK = {"VIEWER": 0, "MODERATOR": 1, "ADMIN": 2, "OWNER": 3}
 
 
@@ -197,30 +197,6 @@ async def stop_channel(
         record = await _get_or_404(registry, broadcaster_id)
         await registry.set_desired_state(broadcaster_id, "stopped")
         record = await registry.get_channel(broadcaster_id)  # type: ignore[assignment]
-    finally:
-        await registry.close()
-    return _channel_status_dict(record)
-
-
-@router.post("/channels/{broadcaster_id}/reset_crash")
-async def reset_crash(
-    broadcaster_id: str, session: tuple[str, str] = Depends(require_authenticated)
-) -> dict[str, object]:
-    """Ручной выход из process_status='crashed' после того как оператор
-    поправил проблему — обнуляет restart_count, supervisor снова начнёт
-    пытаться поднять процесс на следующем тике, если desired_state='running'."""
-    role, _ = session
-    _require_role(role, "ADMIN")
-
-    registry = RegistryStore(str(REGISTRY_DB))
-    await registry.connect()
-    try:
-        await _get_or_404(registry, broadcaster_id)
-        await registry.reset_crash(broadcaster_id)
-        # Перечитываем через _get_or_404, а не сырым get_channel: тот отдаёт
-        # ChannelRecord | None, и None ушёл бы в _channel_status_dict падением
-        # на атрибуте вместо честного 404.
-        record = await _get_or_404(registry, broadcaster_id)
     finally:
         await registry.close()
     return _channel_status_dict(record)

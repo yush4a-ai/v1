@@ -114,16 +114,6 @@ class ScriptProfile:
     confusable_words: tuple[str, ...]
 
     @property
-    def dominant(self) -> str:
-        if self.total_letters == 0:
-            return "none"
-        if self.cyrillic >= self.latin and self.cyrillic >= self.other:
-            return "cyrillic"
-        if self.latin >= self.other:
-            return "latin"
-        return "other"
-
-    @property
     def has_mixed_words(self) -> bool:
         return bool(self.mixed_words)
 

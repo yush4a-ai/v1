@@ -63,17 +63,6 @@ class TestPruning:
         assert window.user_message_count("alice", 60, now=10.0) == 0
         assert window.user_message_count("bob", 60, now=10.0) == 1
 
-    def test_streak_start_cleared_when_user_fully_pruned(
-        self, event_factory: EventFactory
-    ) -> None:
-        window = SlidingWindow(max_age_seconds=5.0)
-        add(window, event_factory, user_id="alice", timestamp=0.0)
-        assert window.streak_start("alice") == 0.0
-
-        add(window, event_factory, user_id="bob", timestamp=10.0)
-        assert window.streak_start("alice") is None
-
-
 class TestPerUserQueries:
     def test_user_message_count_within_window(self, event_factory: EventFactory) -> None:
         window = SlidingWindow()
@@ -134,34 +123,3 @@ class TestUniqueChatters:
         assert window.unique_chatters(60, now=1.0) == {"alice", "bob"}
 
 
-class TestArrivals:
-    def test_recent_arrivals_within_window(self, event_factory: EventFactory) -> None:
-        window = SlidingWindow(max_age_seconds=200.0)
-        add(window, event_factory, user_id="a1", timestamp=0.0)
-        add(window, event_factory, user_id="a2", timestamp=1.0)
-        add(window, event_factory, user_id="a3", timestamp=50.0)
-
-        # на момент t=51 (сразу после a3) 10-секундное окно включает только
-        # a3 — a1/a2 появились 50+ секунд назад и уже вне интервала
-        arrivals = window.recent_arrivals(10.0, now=51.0)
-        assert set(arrivals) == {"a3"}
-
-    def test_streak_start_does_not_move_on_repeat_messages(
-        self, event_factory: EventFactory
-    ) -> None:
-        window = SlidingWindow()
-        add(window, event_factory, user_id="alice", timestamp=0.0)
-        add(window, event_factory, user_id="alice", timestamp=5.0)
-        add(window, event_factory, user_id="alice", timestamp=10.0)
-
-        # серия началась в t=0 и не сбрасывается, пока пользователь остаётся в окне
-        assert window.streak_start("alice") == 0.0
-
-    def test_mass_simultaneous_arrival_detected(self, event_factory: EventFactory) -> None:
-        """Сценарий из ТЗ: много новых пользователей появляется почти одновременно."""
-        window = SlidingWindow()
-        for i in range(17):
-            add(window, event_factory, user_id=f"bot{i}", timestamp=100.0 + i * 0.3)
-
-        arrivals = window.recent_arrivals(10.0, now=105.0)
-        assert len(arrivals) == 17
