@@ -16,6 +16,7 @@ engine.py (этап 5) читает отсюда UserState перед оценк
 from __future__ import annotations
 
 import json
+import secrets
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -805,12 +806,28 @@ class ModerationStore:
             for row in rows
         ]
 
-    async def mark_action_started(self, queue_id: int) -> None:
-        await self._db.execute(
-            "UPDATE mod_action_queue SET status = 'running', started_at = ? WHERE id = ?",
-            (time.time(), queue_id),
+    async def mark_action_started(self, queue_id: int) -> str | None:
+        """Берёт задание в работу и выдаёт ему lease_token — случайную
+        строку, которую вызывающий (executor.py) обязан передавать во все
+        последующие update_action_progress()/complete_action() по этому
+        заданию.
+
+        CAS через WHERE status = 'pending': если задание уже кем-то взято
+        (гонка между get_pending_actions() и этим вызовом, либо задание
+        реклеймлено и подхвачено раньше) — UPDATE находит 0 строк, метод
+        возвращает None, вызывающий код пропускает задание, не пытаясь
+        исполнить то, что уже исполняет кто-то другой (bug-аудит
+        2026-08-18, race condition в reclaim_stuck_actions)."""
+        token = secrets.token_urlsafe(16)
+        cursor = await self._db.execute(
+            "UPDATE mod_action_queue SET status = 'running', started_at = ?, lease_token = ? "
+            "WHERE id = ? AND status = 'pending'",
+            (time.time(), token, queue_id),
         )
         await self._db.commit()
+        if cursor.rowcount != 1:
+            return None
+        return token
 
     async def reclaim_stuck_actions(self, *, timeout_seconds: float) -> int:
         """BUG-003 аудита: если бот падает/перезапускается между
@@ -822,34 +839,70 @@ class ModerationStore:
 
         Возвращает такие задания обратно в 'pending', если с started_at
         прошло больше timeout_seconds — process_pending() подхватит их на
-        следующем цикле и попробует снова. Безопасно с точки зрения
-        повторного исполнения: ban_user()/timeout_user() в Twitch Helix
-        идемпотентны (повторный бан уже забаненного просто не меняет
-        состояние или возвращает ту же ошибку, не банит "дважды сильнее") —
-        см. cigilbot/twitch_api.py. Возвращает число реклеймленных
-        заданий (для логирования вызывающим кодом)."""
+        следующем цикле и попробует снова.
+
+        lease_token обнуляется тем же UPDATE (bug-аудит 2026-08-18):
+        started_at — это единственный сигнал "исполнитель мог умереть", не
+        доказательство, что он действительно мёртв — если старый процесс
+        всё ещё физически жив (завис, но не убит) и продолжает исполнять
+        задание под старым токеном, его последующие update_action_progress()/
+        complete_action() будут сверяться со СБРОШЕННЫМ токеном, не найдут
+        совпадения (WHERE lease_token = ?) и тихо ничего не применят —
+        вместо того чтобы затереть прогресс/результат нового исполнителя,
+        которому это задание досталось повторно. ban_user()/timeout_user()
+        сами по себе в Twitch Helix при этом всё равно могут выполниться
+        дважды (внешний вызов, это не устранить на уровне БД) — но
+        задвоенный аудит и задвоенный инкремент prior_timeouts для TIMEOUT
+        становятся невозможны, потому что оба пишутся под lease_token.
+
+        Возвращает число реклеймленных заданий (для логирования вызывающим
+        кодом)."""
         cutoff = time.time() - timeout_seconds
         cursor = await self._db.execute(
-            "UPDATE mod_action_queue SET status = 'pending', started_at = NULL "
+            "UPDATE mod_action_queue SET status = 'pending', started_at = NULL, lease_token = NULL "
             "WHERE status = 'running' AND started_at IS NOT NULL AND started_at < ?",
             (cutoff,),
         )
         await self._db.commit()
         return cursor.rowcount if cursor.rowcount is not None and cursor.rowcount > 0 else 0
 
-    async def update_action_progress(self, queue_id: int, done: int, total: int) -> None:
+    async def update_action_progress(
+        self, queue_id: int, done: int, total: int, *, lease_token: str
+    ) -> None:
+        """lease_token обязателен — см. докстринг mark_action_started про то,
+        почему это не опционально: без сверки токена реклеймленное задание,
+        которое исполняет одновременно два "исполнителя" (старый зомби-
+        процесс + новый, забравший задание после реклейма), могло бы
+        затирать прогресс друг друга вперемешку.
+
+        Обновляет started_at — heartbeat (bug-аудит 2026-08-18): задание,
+        реально продвигающееся по целям, не должно считаться "зависшим"
+        только потому, что целей много и Helix отвечает медленно (обычный
+        случай при кластере в 40+ человек и временных 5xx, см. комментарий
+        в twitch_api.py про растягивание батча). Каждый успешный апдейт
+        доказывает, что исполнитель жив ПРЯМО СЕЙЧАС, отодвигая cutoff
+        reclaim_stuck_actions на STUCK_ACTION_TIMEOUT_SECONDS вперёд —
+        застрять теперь может только задание, переставшее прогрессировать
+        (реальный признак упавшего процесса), а не просто долгое."""
         await self._db.execute(
-            "UPDATE mod_action_queue SET progress_done = ?, progress_total = ? WHERE id = ?",
-            (done, total, queue_id),
+            "UPDATE mod_action_queue SET progress_done = ?, progress_total = ?, started_at = ? "
+            "WHERE id = ? AND lease_token = ?",
+            (done, total, time.time(), queue_id, lease_token),
         )
         await self._db.commit()
 
     async def complete_action(
-        self, queue_id: int, *, status: str, result: dict[str, Any]
+        self, queue_id: int, *, status: str, result: dict[str, Any], lease_token: str
     ) -> None:
+        """lease_token обязателен — см. update_action_progress/
+        mark_action_started. Если задание уже реклеймлено (токен сброшен)
+        или досталось другому исполнителю (токен другой), этот UPDATE
+        находит 0 строк и не применяется — результат зомби-исполнителя не
+        перезаписывает то, что уже сделал/делает актуальный."""
         await self._db.execute(
-            "UPDATE mod_action_queue SET status = ?, finished_at = ?, result_json = ? WHERE id = ?",
-            (status, time.time(), json.dumps(result), queue_id),
+            "UPDATE mod_action_queue SET status = ?, finished_at = ?, result_json = ? "
+            "WHERE id = ? AND lease_token = ?",
+            (status, time.time(), json.dumps(result), queue_id, lease_token),
         )
         await self._db.commit()
 

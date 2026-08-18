@@ -243,7 +243,16 @@ class ActionExecutor:
         actor: str,
         actor_role: str,
         queue_id: int | None = None,
+        lease_token: str | None = None,
     ) -> ExecutionOutcome:
+        """lease_token обязателен, если задан queue_id — см. докстринг
+        store.mark_action_started() про то, зачем: без него прогресс/
+        результат этого исполнения нечем отличить от прогресса/результата
+        другого исполнителя, которому то же задание могло достаться
+        повторно после реклейма (bug-аудит 2026-08-18)."""
+        if queue_id is not None and lease_token is None:
+            raise ValueError("lease_token обязателен при queue_id")
+
         call: Callable[[str], Awaitable[ActionResult]]
         target_ids: tuple[str, ...]
 
@@ -264,7 +273,9 @@ class ActionExecutor:
                 message_id=mid,
             )
 
-        outcome = await self._run_per_target(target_ids, call, queue_id=queue_id)
+        outcome = await self._run_per_target(
+            target_ids, call, queue_id=queue_id, lease_token=lease_token
+        )
 
         await self._store.record_action_audit(
             actor=actor,
@@ -286,6 +297,7 @@ class ActionExecutor:
         call: Callable[[str], Awaitable[ActionResult]],
         *,
         queue_id: int | None,
+        lease_token: str | None,
     ) -> ExecutionOutcome:
         succeeded: list[str] = []
         failed: list[tuple[str, str]] = []
@@ -313,7 +325,15 @@ class ActionExecutor:
                     failed.append((target_id, result.error))
 
             if queue_id is not None:
-                await self._store.update_action_progress(queue_id, i + 1, total)
+                assert lease_token is not None  # проверено в execute()
+                # Тот же lease_token на каждый прогресс-апдейт (bug-аудит
+                # 2026-08-18) — store.update_action_progress() заодно
+                # продлевает started_at (heartbeat): реально прогрессирующее
+                # задание не должно реклеймиться только потому, что целей
+                # много.
+                await self._store.update_action_progress(
+                    queue_id, i + 1, total, lease_token=lease_token
+                )
 
         return ExecutionOutcome(succeeded=tuple(succeeded), failed=tuple(failed))
 
@@ -349,23 +369,38 @@ async def process_pending(
     items: list[QueueItem] = await store.get_pending_actions(limit=limit)
 
     for item in items:
-        await store.mark_action_started(item.id)
+        # None — задание уже забрал кто-то другой между get_pending_actions()
+        # и этим вызовом (CAS через WHERE status='pending' внутри
+        # mark_action_started, bug-аудит 2026-08-18): пропускаем, не пытаясь
+        # исполнить то, что уже исполняется. Внутри одного процесса это не
+        # достижимо (process_pending вызывается строго последовательно из
+        # одного _poll_action_queue на канал), но store.py не должен
+        # полагаться на это — гонка возможна между двумя процессами бота,
+        # работающими с одной mod.<id>.db.
+        lease_token = await store.mark_action_started(item.id)
+        if lease_token is None:
+            log.warning("Задание #%d уже взято другим исполнителем, пропущено", item.id)
+            continue
 
         try:
             request = parse_payload(item.payload)
         except ValueError as exc:
             log.error("Некорректное задание в очереди #%d: %s", item.id, exc)
-            await store.complete_action(item.id, status="failed", result={"error": str(exc)})
+            await store.complete_action(
+                item.id, status="failed", result={"error": str(exc)}, lease_token=lease_token
+            )
             continue
 
         try:
             outcome = await executor.execute(
-                request, actor=item.requested_by, actor_role=item.requested_role, queue_id=item.id
+                request, actor=item.requested_by, actor_role=item.requested_role,
+                queue_id=item.id, lease_token=lease_token,
             )
         except Exception:
             log.exception("Сбой исполнения задания #%d", item.id)
             await store.complete_action(
-                item.id, status="failed", result={"error": "внутренняя ошибка исполнителя"}
+                item.id, status="failed", result={"error": "внутренняя ошибка исполнителя"},
+                lease_token=lease_token,
             )
             continue
 
@@ -374,6 +409,7 @@ async def process_pending(
             item.id,
             status="completed",
             result={"succeeded": list(outcome.succeeded), "failed": list(outcome.failed)},
+            lease_token=lease_token,
         )
 
     return len(items)

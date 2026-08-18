@@ -1091,7 +1091,9 @@ class TestActionQueue:
         qid = await store.enqueue_action(
             requested_by="mod1", requested_role="MODERATOR", payload={"action": "BAN"}
         )
-        await store.update_action_progress(qid, 3, 10)
+        token = await store.mark_action_started(qid)
+        assert token is not None
+        await store.update_action_progress(qid, 3, 10, lease_token=token)
 
         cursor = await store._db.execute(  # noqa: SLF001
             "SELECT progress_done, progress_total FROM mod_action_queue WHERE id = ?", (qid,)
@@ -1104,7 +1106,11 @@ class TestActionQueue:
         qid = await store.enqueue_action(
             requested_by="mod1", requested_role="MODERATOR", payload={"action": "BAN"}
         )
-        await store.complete_action(qid, status="completed", result={"succeeded": ["1"], "failed": []})
+        token = await store.mark_action_started(qid)
+        assert token is not None
+        await store.complete_action(
+            qid, status="completed", result={"succeeded": ["1"], "failed": []}, lease_token=token
+        )
 
         cursor = await store._db.execute(  # noqa: SLF001
             "SELECT status, result_json FROM mod_action_queue WHERE id = ?", (qid,)
@@ -1121,11 +1127,14 @@ class TestReclaimStuckActions:
     посреди исполнения), должно возвращаться в 'pending', чтобы process_pending()
     подобрал его снова, а не оставлял висеть в аудите навсегда."""
 
-    async def _make_stuck(self, store: ModerationStore, *, age_seconds: float) -> int:
+    async def _make_stuck(
+        self, store: ModerationStore, *, age_seconds: float
+    ) -> tuple[int, str]:
         qid = await store.enqueue_action(
             requested_by="mod1", requested_role="MODERATOR", payload={"action": "BAN"}
         )
-        await store.mark_action_started(qid)
+        token = await store.mark_action_started(qid)
+        assert token is not None
         # mark_action_started() всегда ставит time.time() — "состариваем"
         # запись напрямую, публичного API для этого нет и не должно быть.
         await store._db.execute(  # noqa: SLF001
@@ -1133,7 +1142,7 @@ class TestReclaimStuckActions:
             (time.time() - age_seconds, qid),
         )
         await store._db.commit()  # noqa: SLF001
-        return qid
+        return qid, token
 
     async def test_recent_running_action_not_reclaimed(self, store: ModerationStore) -> None:
         await self._make_stuck(store, age_seconds=1.0)
@@ -1143,7 +1152,7 @@ class TestReclaimStuckActions:
         assert reclaimed == 0
 
     async def test_old_running_action_reclaimed_to_pending(self, store: ModerationStore) -> None:
-        qid = await self._make_stuck(store, age_seconds=300.0)
+        qid, _token = await self._make_stuck(store, age_seconds=300.0)
 
         reclaimed = await store.reclaim_stuck_actions(timeout_seconds=120.0)
 
@@ -1163,15 +1172,15 @@ class TestReclaimStuckActions:
         assert [i.id for i in items] == [qid]
 
     async def test_completed_actions_not_touched(self, store: ModerationStore) -> None:
-        qid = await self._make_stuck(store, age_seconds=300.0)
-        await store.complete_action(qid, status="completed", result={})
+        qid, token = await self._make_stuck(store, age_seconds=300.0)
+        await store.complete_action(qid, status="completed", result={}, lease_token=token)
 
         reclaimed = await store.reclaim_stuck_actions(timeout_seconds=120.0)
 
         assert reclaimed == 0
 
     async def test_reclaimed_action_clears_started_at(self, store: ModerationStore) -> None:
-        qid = await self._make_stuck(store, age_seconds=300.0)
+        qid, _token = await self._make_stuck(store, age_seconds=300.0)
 
         await store.reclaim_stuck_actions(timeout_seconds=120.0)
 

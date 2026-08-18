@@ -1,0 +1,1021 @@
+<title>CigilBot Readiness Audit</title>
+<style>
+@font-face {
+  font-family: 'JBMono';
+  src: local('JetBrains Mono'), local('Consolas'), local('Menlo');
+}
+
+:root {
+  --bg: #f7f5f0;
+  --bg-raised: #ffffff;
+  --bg-sunken: #eeece4;
+  --ink: #1c1a16;
+  --ink-soft: #55524a;
+  --ink-faint: #8a867a;
+  --line: #ddd8cc;
+  --line-soft: #e8e4d8;
+  --accent: #a8641f;
+  --accent-soft: #f0e0cc;
+  --accent-ink: #6b3f13;
+
+  --done: #2f7a4f;
+  --done-bg: #e3f0e6;
+  --partial: #a67c00;
+  --partial-bg: #f5ecd0;
+  --notdone: #b3392c;
+  --notdone-bg: #f6e2df;
+  --risk: #b05a1e;
+  --risk-bg: #f6e7d6;
+
+  --mono: 'JBMono', 'JetBrains Mono', ui-monospace, 'SF Mono', Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #14120f;
+    --bg-raised: #1c1914;
+    --bg-sunken: #100e0b;
+    --ink: #eee8dc;
+    --ink-soft: #b3ac9c;
+    --ink-faint: #766f60;
+    --line: #332e24;
+    --line-soft: #2a2620;
+    --accent: #d99a4e;
+    --accent-soft: #3a2a15;
+    --accent-ink: #f0be82;
+
+    --done: #6fbf8b;
+    --done-bg: #1a2e20;
+    --partial: #d9b34e;
+    --partial-bg: #33280f;
+    --notdone: #e08376;
+    --notdone-bg: #33201c;
+    --risk: #e0a05e;
+    --risk-bg: #332310;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #14120f;
+  --bg-raised: #1c1914;
+  --bg-sunken: #100e0b;
+  --ink: #eee8dc;
+  --ink-soft: #b3ac9c;
+  --ink-faint: #766f60;
+  --line: #332e24;
+  --line-soft: #2a2620;
+  --accent: #d99a4e;
+  --accent-soft: #3a2a15;
+  --accent-ink: #f0be82;
+
+  --done: #6fbf8b;
+  --done-bg: #1a2e20;
+  --partial: #d9b34e;
+  --partial-bg: #33280f;
+  --notdone: #e08376;
+  --notdone-bg: #33201c;
+  --risk: #e0a05e;
+  --risk-bg: #332310;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 16px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+.wrap {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 0 32px 120px;
+}
+
+/* ---------- Header ---------- */
+
+header.hero {
+  padding: 72px 0 40px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 48px;
+}
+
+.eyebrow {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin: 0 0 18px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.eyebrow::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  background: var(--accent);
+  display: inline-block;
+}
+
+h1 {
+  font-size: clamp(32px, 4.4vw, 46px);
+  line-height: 1.08;
+  letter-spacing: -0.015em;
+  margin: 0 0 16px;
+  text-wrap: balance;
+  font-weight: 650;
+}
+
+.hero-sub {
+  color: var(--ink-soft);
+  font-size: 17px;
+  max-width: 62ch;
+  margin: 0 0 28px;
+}
+
+.hero-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 28px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--ink-faint);
+}
+
+.hero-meta strong { color: var(--ink-soft); font-weight: 500; }
+
+/* ---------- Verdict block ---------- */
+
+.verdict {
+  display: flex;
+  gap: 28px;
+  align-items: flex-start;
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--partial);
+  padding: 28px 32px;
+  margin: 40px 0 56px;
+}
+
+.verdict-badge {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 14px 22px;
+  background: var(--partial-bg);
+  color: var(--partial);
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+.verdict-badge .icon { font-size: 26px; line-height: 1; }
+
+.verdict-text h2 {
+  margin: 0 0 10px;
+  font-size: 20px;
+}
+
+.verdict-text p {
+  margin: 0 0 10px;
+  color: var(--ink-soft);
+}
+
+.verdict-text p:last-child { margin-bottom: 0; }
+
+/* ---------- Layout: sidebar + content ---------- */
+
+.layout {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  gap: 56px;
+  align-items: start;
+}
+
+nav.toc {
+  position: sticky;
+  top: 32px;
+  font-size: 13.5px;
+  border-left: 1px solid var(--line);
+  padding-left: 18px;
+}
+
+nav.toc .toc-label {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  margin-bottom: 14px;
+}
+
+nav.toc ol {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+nav.toc a {
+  display: block;
+  color: var(--ink-soft);
+  text-decoration: none;
+  padding: 5px 0;
+  border-bottom: 1px solid transparent;
+}
+
+nav.toc a:hover { color: var(--accent); }
+
+nav.toc .num {
+  font-family: var(--mono);
+  color: var(--ink-faint);
+  margin-right: 6px;
+}
+
+main { min-width: 0; }
+
+/* ---------- Sections ---------- */
+
+section.card {
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  padding: 36px 40px;
+  margin-bottom: 28px;
+  scroll-margin-top: 24px;
+}
+
+.card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  flex-wrap: wrap;
+  margin-bottom: 22px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.card-head h2 {
+  margin: 0;
+  font-size: 23px;
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.card-head h2 .idx {
+  font-family: var(--mono);
+  color: var(--ink-faint);
+  font-size: 15px;
+  font-weight: 400;
+}
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  padding: 6px 12px;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+
+.status.done { background: var(--done-bg); color: var(--done); border-color: color-mix(in srgb, var(--done) 30%, transparent); }
+.status.partial { background: var(--partial-bg); color: var(--partial); border-color: color-mix(in srgb, var(--partial) 30%, transparent); }
+.status.notdone { background: var(--notdone-bg); color: var(--notdone); border-color: color-mix(in srgb, var(--notdone) 30%, transparent); }
+.status.risk { background: var(--risk-bg); color: var(--risk); border-color: color-mix(in srgb, var(--risk) 30%, transparent); }
+
+section.card > p.lede {
+  color: var(--ink-soft);
+  font-size: 15.5px;
+  margin: 0 0 22px;
+}
+
+h3.sub {
+  font-size: 15.5px;
+  font-weight: 650;
+  margin: 28px 0 12px;
+  color: var(--ink);
+}
+h3.sub:first-child { margin-top: 0; }
+
+.finding {
+  border: 1px solid var(--line-soft);
+  border-left: 3px solid var(--line);
+  padding: 16px 20px;
+  margin-bottom: 12px;
+  background: var(--bg-sunken);
+}
+
+.finding.done { border-left-color: var(--done); }
+.finding.partial { border-left-color: var(--partial); }
+.finding.notdone { border-left-color: var(--notdone); }
+.finding.risk { border-left-color: var(--risk); }
+
+.finding-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+
+.finding-head .chip {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  padding: 2px 7px;
+}
+.chip.done { background: var(--done-bg); color: var(--done); }
+.chip.partial { background: var(--partial-bg); color: var(--partial); }
+.chip.notdone { background: var(--notdone-bg); color: var(--notdone); }
+.chip.risk { background: var(--risk-bg); color: var(--risk); }
+
+.finding-head strong { font-size: 14.5px; }
+
+.finding p { margin: 6px 0; color: var(--ink-soft); font-size: 14.5px; }
+.finding p:last-child { margin-bottom: 0; }
+
+code, .loc {
+  font-family: var(--mono);
+  font-size: 0.86em;
+  background: var(--bg-sunken);
+  padding: 1px 6px;
+  color: var(--accent-ink);
+  white-space: nowrap;
+}
+
+.finding .loc { display: inline-block; margin: 2px 4px 2px 0; }
+
+/* ---------- Tables ---------- */
+
+.tablewrap {
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  margin: 8px 0 20px;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 13.5px;
+  min-width: 640px;
+}
+
+thead th {
+  text-align: left;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  background: var(--bg-sunken);
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+  position: sticky;
+  top: 0;
+}
+
+tbody td {
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--line-soft);
+  vertical-align: top;
+  color: var(--ink-soft);
+}
+
+tbody tr:last-child td { border-bottom: none; }
+tbody tr:hover { background: var(--bg-sunken); }
+
+td.pathcell { font-family: var(--mono); font-size: 12.5px; color: var(--ink); white-space: nowrap; }
+td strong { color: var(--ink); }
+
+.tag {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 2px 7px;
+  white-space: nowrap;
+}
+.tag.yes { background: var(--done-bg); color: var(--done); }
+.tag.no { background: var(--notdone-bg); color: var(--notdone); }
+.tag.na { background: var(--bg-sunken); color: var(--ink-faint); }
+
+/* ---------- Priority lists ---------- */
+
+.priogrid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 20px;
+  margin-top: 8px;
+}
+
+@media (max-width: 720px) { .priogrid { grid-template-columns: 1fr; } }
+
+.priobox {
+  border: 1px solid var(--line);
+  border-top: 4px solid var(--line);
+}
+
+.priobox.critical { border-top-color: var(--notdone); }
+.priobox.high { border-top-color: var(--risk); }
+.priobox.medium { border-top-color: var(--partial); }
+.priobox.low { border-top-color: var(--ink-faint); }
+
+.priobox-head {
+  padding: 14px 18px;
+  font-family: var(--mono);
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  border-bottom: 1px solid var(--line-soft);
+  display: flex;
+  justify-content: space-between;
+}
+
+.priobox.critical .priobox-head { color: var(--notdone); }
+.priobox.high .priobox-head { color: var(--risk); }
+.priobox.medium .priobox-head { color: var(--partial); }
+.priobox.low .priobox-head { color: var(--ink-faint); }
+
+.priobox ul {
+  margin: 0;
+  padding: 14px 18px 16px 34px;
+  font-size: 13.5px;
+  color: var(--ink-soft);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.priobox li::marker { color: var(--ink-faint); font-family: var(--mono); font-size: 12px; }
+.priobox code { font-size: 0.82em; }
+
+/* ---------- Summary table (final) ---------- */
+
+.summary-table td.status-cell, .summary-table th.status-cell { text-align: center; }
+
+/* ---------- Q&A closing ---------- */
+
+.qa {
+  display: grid;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.qa-item {
+  padding: 16px 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+.qa-item:last-child { border-bottom: none; }
+
+.qa-item .q {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 6px;
+}
+
+.qa-item .a { color: var(--ink-soft); font-size: 14.5px; }
+.qa-item .a strong { color: var(--ink); }
+
+footer {
+  margin-top: 56px;
+  padding-top: 24px;
+  border-top: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+</style>
+
+<div class="wrap">
+
+<header class="hero">
+  <p class="eyebrow">CigilBot &middot; Инженерный аудит</p>
+  <h1>Готовность к масштабированию функций</h1>
+  <p class="hero-sub">Полный технический обзор десяти областей системы — от слоя хранения до прав доступа — построенный на фактах из кода, а не на предположениях. Каждый вывод привязан к файлу и строке.</p>
+  <div class="hero-meta">
+    <span><strong>Дата:</strong> 2026-08-18</span>
+    <span><strong>Коммит:</strong> <code>01faf23</code></span>
+    <span><strong>Тестов:</strong> 1121/1121</span>
+    <span><strong>Режим:</strong> только чтение, код не менялся</span>
+  </div>
+</header>
+
+<div class="verdict">
+  <div class="verdict-badge">
+    <span class="icon">&#9679;</span>
+    <span>READY<br>WITH CONDITIONS</span>
+  </div>
+  <div class="verdict-text">
+    <h2>Фундамент устойчив, но три зоны требуют внимания до масштабирования</h2>
+    <p><strong>Ядро системы — хранилище, авторизация, изоляция каналов — уже прошло два полных цикла аудита и точечные проверки сегодня: 20+ находок закрыто, включая три с уровнем security (login CSRF, анонимный доступ к боевому токену, утечка секрета в тестах).</strong> Архитектура выдерживает рост числа каналов линейно, без квадратичных циклов, и падение одного канала не задевает остальные.</p>
+    <p>Но три области ещё не получили такого же внимания: Clip Engine не сохраняет результат создания клипа вообще (только лог), Executor допускает повторное исполнение задания через race condition в reclaim-логике, а треть MEDIUM-находок из прошлого цикла остаётся открытой. Ни одна из них не блокирует текущую работу — но каждая создаст более дорогой инцидент по мере роста нагрузки.</p>
+  </div>
+</div>
+
+<div class="layout">
+
+<nav class="toc">
+  <div class="toc-label">Разделы</div>
+  <ol>
+    <li><a href="#s1"><span class="num">01</span>ModerationStore</a></li>
+    <li><a href="#s2"><span class="num">02</span>moderation_api.py</a></li>
+    <li><a href="#s3"><span class="num">03</span>auth.py</a></li>
+    <li><a href="#s4"><span class="num">04</span>Multi-Channel</a></li>
+    <li><a href="#s5"><span class="num">05</span>SQLite</a></li>
+    <li><a href="#s6"><span class="num">06</span>Executor / Pipelines</a></li>
+    <li><a href="#s7"><span class="num">07</span>Clip Engine</a></li>
+    <li><a href="#s8"><span class="num">08</span>Discord Alerts</a></li>
+    <li><a href="#s9"><span class="num">09</span>Permissions</a></li>
+    <li><a href="#s10"><span class="num">10</span>Dead Code</a></li>
+    <li><a href="#summary"><span class="num">&mdash;</span>Сводка</a></li>
+    <li><a href="#priorities"><span class="num">&mdash;</span>Приоритеты</a></li>
+    <li><a href="#verdict-full"><span class="num">&mdash;</span>Вердикт</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ============ 1. ModerationStore ============ -->
+<section class="card" id="s1">
+  <div class="card-head">
+    <h2><span class="idx">01</span>ModerationStore</h2>
+    <span class="status partial">&#9679; PARTIAL</span>
+  </div>
+  <p class="lede">2072 строки, 86 методов, 14 доменов в одном классе &mdash; God Class, находка подтверждена в обоих циклах аудита. Аудирован полностью 2026-08-17 включая карту зависимостей; часть найденного исправлена, само разделение &mdash; нет.</p>
+
+  <h3 class="sub">Что проверено и исправлено сегодня</h3>
+  <div class="finding done">
+    <div class="finding-head"><span class="chip done">FIXED</span><strong>SQL-дубль между count_recent_new_clusters и get_digest_stats</strong></div>
+    <p>Идентичный запрос <code>SELECT COUNT(*) FROM mod_clusters WHERE created_at &gt;= ?</code> дублировался в двух методах. <span class="loc">store.py:1420, 1451</span> &rarr; второй теперь вызывает первый.</p>
+  </div>
+  <div class="finding done">
+    <div class="finding-head"><span class="chip done">FIXED</span><strong>row_factory мутировалась в 16 методах без сброса</strong></div>
+    <p>Скрытый side-effect на общем соединении &mdash; порядок вызовов молча влиял на тип возврата соседнего метода. Работало по совпадению (aiosqlite.Row поддерживает и позиционный доступ), не по контракту. Вынесено один раз в <span class="loc">connect()</span>.</p>
+  </div>
+  <div class="finding done">
+    <div class="finding-head"><span class="chip done">FIXED</span><strong>Нет rollback при частичном сбое многошаговой записи</strong></div>
+    <p><code>save_verdict</code>, <code>save_cluster</code>, <code>upsert_cluster_by_members_ex</code> &mdash; INSERT/UPDATE + executemany без явного отката. Сбой второго шага оставлял транзакцию открытой; следующий несвязанный commit на том же соединении закоммитил бы частичные данные. Обёрнуто в try/except с rollback().</p>
+  </div>
+  <div class="finding done">
+    <div class="finding-head"><span class="chip done">FIXED</span><strong>increment_daily_stats &mdash; вызывался нигде, таблица всегда пустая</strong></div>
+    <p>Панель &laquo;Статистика&raquo; и CLI-отчёт показывали нули. Метод удалён, <code>get_daily_stats</code> переписан на прямой подсчёт по существующим таблицам &mdash; тем же принципом, что уже был у get_digest_stats.</p>
+  </div>
+
+  <h3 class="sub">Не исправлено &mdash; архитектурный долг</h3>
+  <div class="finding partial">
+    <div class="finding-head"><span class="chip partial">OPEN</span><strong>86 методов на 14 несвязанных доменов в одном классе</strong></div>
+    <p>Карта зависимостей построена: ни один потребитель не использует больше половины доменов &mdash; <code>executor.py</code> трогает 2 (actions + users), <code>autoclip.py</code> &mdash; 1, <code>clip_token.py</code> &mdash; 1. Границы для разреза на репозитории (UsersRepo, ClusterRepo, PatternRepo, AutoclipRepo, ContentRepo) видны де-факто, физически не разделено &mdash; отложено пользователем.</p>
+  </div>
+  <div class="finding partial">
+    <div class="finding-head"><span class="chip partial">OPEN</span><strong>Singleton-паттерн WHERE id = 1 &mdash; 13 повторов на 5 таблицах</strong></div>
+    <p>mod_attack_mode, mod_giveaway_mode, mod_discord_webhook, mod_content_settings, mod_autoclip_settings, mod_clip_token &mdash; каждая со своим ad-hoc набором геттеров/сеттеров вместо общего паттерна.</p>
+  </div>
+  <div class="finding partial">
+    <div class="finding-head"><span class="chip partial">OPEN</span><strong>Мёртвые методы</strong></div>
+    <p><code>is_trusted</code> (вытеснен list_trusted), <code>upsert_cluster_by_members</code> без _ex (обёртка, прод зовёт _ex-вариант напрямую) &mdash; живы только в тестах.</p>
+  </div>
+
+  <h3 class="sub">Не найдено</h3>
+  <div class="finding done">
+    <p>Больших методов нет &mdash; медиана 19 строк, максимум 61. Скрытых validation/cache-слоёв внутри storage сверх ожидаемого не обнаружено, кроме двух мест, где SQL сам решает бизнес-правило (get_digest_stats считает &laquo;подозрительное&raquo; через <code>recommended_action IN (...)</code> прямо в запросе, find_paste_wave содержит детекторную логику) &mdash; MEDIUM, не критично.</p>
+  </div>
+</section>
+
+<!-- ============ 2. moderation_api.py ============ -->
+<section class="card" id="s2">
+  <div class="card-head">
+    <h2><span class="idx">02</span>moderation_api.py</h2>
+    <span class="status done">&#9679; DONE</span>
+  </div>
+  <p class="lede">1430 строк (было 1666), 48 эндпоинтов. Полный построчный аудит 2026-08-17, находки исправлены и закоммичены.</p>
+
+  <div class="finding done">
+    <div class="finding-head"><span class="chip done">FIXED</span><strong>45 повторов &laquo;роль + store + close&raquo; &rarr; 39 роутов на channel_store()</strong></div>
+    <p>Один <code>asynccontextmanager</code> вместо ручной связки role_for_profile &rarr; require_role &rarr; _open_store &rarr; try/finally close, повторявшейся вручную. Именно на пропуске одного из этих шагов уже случались оба задокументированных инцидента &mdash; BOLA (WebSocket проверял только факт входа) и BFLA (роль бралась из сессии вместо канала). Теперь пропустить проверку нельзя, не получив store. <span class="loc">moderation_api.py:157-191</span></p>
+  </div>
+  <div class="finding done">
+    <div class="finding-head"><span class="chip done">FIXED</span><strong>Бизнес-логика вынесена в panel/services.py</strong></div>
+    <p>enqueue_moderation_action (подстановка состава кластера из БД, лимит целей &mdash; BUG-001/SEC-002 старого аудита), resolve_panel_user_role, build_overview. Слой не знает про FastAPI, поднимает ValueError/LookupError вместо HTTPException. api_enqueue_action: 61 строка &rarr; 24. api_overview: 98 строк оркестрации &rarr; 6.</p>
+  </div>
+  <div class="finding done">
+    <p>Остались вне channel_store намеренно: _open_panel_users_store (пишет в другую БД &mdash; каноническую MOD_DB, не БД канала), WS-роуты (держат соединение весь сеанс), api_overview (обходит все каналы разом, права проверены один раз на входе &mdash; _open_store_unchecked с явным именем).</p>
+  </div>
+
+  <h3 class="sub">Остаточное (не тронуто, дизайн-решение)</h3>
+  <div class="finding risk">
+    <div class="finding-head"><span class="chip risk">RISK</span><strong>Соединения панели без пула</strong></div>
+    <p>6 разных мест создают новый ModerationStore и прогоняют connect()+migrate() заново на каждый REST-запрос. WS-циклы уже открывают соединение один раз на сеанс (закрыто в цикле 2) &mdash; обычные REST-запросы всё ещё нет.</p>
+  </div>
+</section>
+
+<!-- ============ 3. auth.py ============ -->
+<section class="card" id="s3">
+  <div class="card-head">
+    <h2><span class="idx">03</span>auth.py</h2>
+    <span class="status done">&#9679; DONE</span>
+  </div>
+  <p class="lede">1277 строк, 14 роутов, 4 независимых OAuth-флоу. Отдельный security review 2026-08-17 &mdash; три находки, каждая воспроизведена эксплойт-тестом до фикса.</p>
+
+  <div class="finding done">
+    <div class="finding-head"><span class="chip done">FIXED</span><strong>Аноним завершал bot-token флоу и перезаписывал боевой .env</strong></div>
+    <p>Роль ADMIN+ проверялась только на /bot/login. Между login и callback запрос ни с чем не связывался: <code>GET /auth/bot/callback.json?state=...</code> без единой cookie возвращал 200 и писал TWITCH_MOD_ACCESS_TOKEN в .env. Воспроизведено: аноним &rarr; 200, токен перезаписан. Теперь callback перепроверяет роль и требует state из cookie того же браузера.</p>
+  </div>
+  <div class="finding done">
+    <div class="finding-head"><span class="chip done">FIXED</span><strong>Login CSRF &mdash; state не привязан к браузеру</strong></div>
+    <p>state лежал только в глобальном словаре процесса. Браузер B завершал callback чужим state браузера A и оказывался залогинен как victim с ролью OWNER. Воспроизведено: 307 redirect, /auth/me показывает чужую личность. Добавлены SESSION_STATE_KEY, _issue_state(), _verify_session_state() через secrets.compare_digest.</p>
+  </div>
+  <div class="finding done">
+    <div class="finding-head"><span class="chip done">FIXED</span><strong>/bot/status, /bot/chat_status отвечали анониму</strong></div>
+    <p>Отдавали логин аккаунта бота вместе с фактом &laquo;токен настроен&raquo; &mdash; разведданные для захвата флоу выше. Подняты до ADMIN+, как /bot/login.</p>
+  </div>
+
+  <h3 class="sub">Роли и сценарии &mdash; проверено сегодняшней разведкой</h3>
+  <p style="color:var(--ink-soft); font-size:14.5px;">Полная per-endpoint таблица &mdash; в разделе 09 Permissions. Ключевой вывод: путь, которым VIEWER мог бы вызвать MODERATOR+-действие в обход проверки, <strong>не найден</strong> &mdash; везде проверка либо через channel_store (store недостижим без прохождения require_role), либо явный require_role перед мутацией.</p>
+
+  <h3 class="sub">Не тронуто (архитектура, не безопасность)</h3>
+  <div class="finding partial">
+    <div class="finding-head"><span class="chip partial">OPEN</span><strong>5 смешанных концернов в одном файле</strong></div>
+    <p>Вход человека, bot-токен, clip-токен, резолвинг ролей, объединение моделей каналов. Bot/clip флоу зеркально дублируют друг друга на уровне HTTP-роутов.</p>
+  </div>
+</section>
+
+<!-- ============ 4. Multi-Channel State ============ -->
+<section class="card" id="s4">
+  <div class="card-head">
+    <h2><span class="idx">04</span>Multi-Channel State</h2>
+    <span class="status risk">&#9679; RISK</span>
+  </div>
+  <p class="lede">Разведка проведена сегодня по pipeline.py целиком. Изоляция каналов подтверждена, ресурсный профиль на канал подсчитан точно, узких мест масштабирования по числу каналов не найдено &mdash; но ни один тест не проверял поведение на реалистичном N.</p>
+
+  <h3 class="sub">Ресурсы на канал &mdash; точный подсчёт</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Ресурс</th><th>На канал</th><th>На хаб</th><th>Итого на N каналов</th></tr></thead>
+      <tbody>
+        <tr><td>asyncio.Task</td><td>6 (consume_queue, poll_state_sync, poll_action_queue, poll_account_age, poll_digest, poll_retention)</td><td>2 (reconcile_loop, sync_fingerprints_loop)</td><td>6N + 2, плюс переменное число alert-task</td></tr>
+        <tr><td>aiosqlite-соединения</td><td>2 (store + fingerprint_store)</td><td>2 (registry + fingerprints)</td><td>2N + 2, плюс bot.db</td></tr>
+        <tr><td>httpx-клиенты</td><td>до 2 (account_age, helix)</td><td>0 (mod_token_manager общий с 2026-08-17)</td><td>до 2N</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="finding done">
+    <div class="finding-head"><span class="chip done">CONFIRMED</span><strong>Изоляция сбоя одного канала &mdash; подтверждена кодом</strong></div>
+    <p>Каждый из 6 фоновых циклов канала обёрнут в собственный try/except внутри while True (разные asyncio.Task, разные closure &mdash; физически не могут распространить исключение). _start_channel()/_stop_channel() в ModerationHub тоже в try/except: падение одного канала не роняет процесс, не мешает остальным, помечается process_status="crashed" в registry.db. <span class="loc">pipeline.py:671-707</span></p>
+  </div>
+  <div class="finding done">
+    <div class="finding-head"><span class="chip done">CONFIRMED</span><strong>Нет O(N&sup2;) по числу каналов</strong></div>
+    <p>_reconcile() &mdash; O(N), один проход по текущим пайплайнам + один по желаемым. _sync_fingerprints() &mdash; O(N), один тик на весь хаб, снимок раздаётся одним объектом, не пересчитывается на канал.</p>
+  </div>
+  <div class="finding done">
+    <div class="finding-head"><span class="chip done">CONFIRMED</span><strong>Недоступность Twitch API не блокирует чат/модерацию</strong></div>
+    <p>При отсутствии PANEL_TWITCH_CLIENT_ID/SECRET оба HTTP-клиента остаются None, зависимые циклы (poll_account_age, poll_action_queue) выходят сразу без блокировки. Детекторы, кластеризация, вердикты, запись в БД работают штатно &mdash; только очередь действий копится, но не исполняется.</p>
+  </div>
+
+  <h3 class="sub">Не проверено / потенциальный риск</h3>
+  <div class="finding risk">
+    <div class="finding-head"><span class="chip risk">GAP</span><strong>Утечка соединения при сбое ChannelPipeline.start() посередине</strong></div>
+    <p>_start_channel() оборачивает pipeline.start() в try/except, но при падении <strong>pipeline.stop() не вызывается</strong>. Если store.connect()/fingerprint_store.connect() уже открыли соединение, а код дальше упадёт &mdash; открытое соединение не закрывается явно, ждёт сборщик мусора. Практический риск низкий (единственная реалистичная точка падения &mdash; migrate() внутри самого connect(), которая произошла бы до возврата), но структурной защиты (try/finally в start()) нет. <span class="loc">pipeline.py:671-695</span></p>
+  </div>
+  <div class="finding partial">
+    <div class="finding-head"><span class="chip partial">NOT TESTED</span><strong>10/100/500/1000 каналов &mdash; только статический анализ, не нагрузочный тест</strong></div>
+    <p>Формула ресурсов линейна и подтверждена кодом, но ни разу не проверена на реальном N &gt; десятка. При 500 каналах: ~3000 asyncio.Task, ~1000 открытых SQLite-соединений одновременно в одном процессе &mdash; в пределах теоретических возможностей CPython/aiosqlite, но фактическое поведение ОС (лимит файловых дескрипторов, GIL-контекст переключений) не измерено.</p>
+  </div>
+</section>
+
+<!-- ============ 5. SQLite ============ -->
+<section class="card" id="s5">
+  <div class="card-head">
+    <h2><span class="idx">05</span>SQLite &mdash; все места записи</h2>
+    <span class="status partial">&#9679; PARTIAL</span>
+  </div>
+  <p class="lede">4 store-класса, все с открытым соединением на протяжении жизни объекта. Главные риски (частичный коммит, close() не сбрасывающий _conn) закрыты сегодня. Осталось: несимметричная PRAGMA-конфигурация и отсутствие application-level retry.</p>
+
+  <h3 class="sub">PRAGMA по каждому store</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Store</th><th>WAL</th><th>busy_timeout</th><th>foreign_keys</th></tr></thead>
+      <tbody>
+        <tr><td><strong>ModerationStore</strong></td><td><span class="tag yes">да</span></td><td><span class="tag yes">5000</span></td><td><span class="tag yes">ON</span></td></tr>
+        <tr><td><strong>RegistryStore</strong></td><td><span class="tag yes">да</span></td><td><span class="tag yes">5000</span></td><td><span class="tag no">нет</span></td></tr>
+        <tr><td><strong>FingerprintStore</strong></td><td><span class="tag yes">да</span></td><td><span class="tag yes">5000</span></td><td><span class="tag no">нет</span></td></tr>
+        <tr><td><strong>bot/database.py</strong></td><td><span class="tag yes">да</span></td><td><span class="tag yes">5000</span></td><td><span class="tag no">нет</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="finding done">
+    <div class="finding-head"><span class="chip done">FIXED</span><strong>close() не сбрасывал _conn &mdash; все 4 store</strong></div>
+    <p>Ловушка для connect()-идемпотентности: connect() после close() либо молча не переоткрывал соединение, либо guard-property _db пропускал уже закрытое соединение. Исправлено везде одинаково, проверено методом &laquo;сломай-проверь-почини&raquo;.</p>
+  </div>
+  <div class="finding done">
+    <div class="finding-head"><span class="chip done">CONFIRMED</span><strong>Многошаговые записи без rollback &mdash; только в ModerationStore, уже закрыто</strong></div>
+    <p>Разведка сегодня подтвердила: в RegistryStore, FingerprintStore, bot/database.py <strong>не найдено ни одной</strong> последовательности из нескольких execute() перед одним commit(). Весь риск был локализован в ModerationStore.</p>
+  </div>
+
+  <h3 class="sub">Не закрыто</h3>
+  <div class="finding partial">
+    <div class="finding-head"><span class="chip partial">OPEN</span><strong>Retry-логика на "database is locked" &mdash; полагается только на busy_timeout</strong></div>
+    <p>SQLite сам ждёт до 5 сек снятия блокировки, затем возвращает ошибку. Application-level retry (try/except на OperationalError с повторной попыткой) не найден ни в одном из 4 store-классов.</p>
+  </div>
+  <div class="finding risk">
+    <div class="finding-head"><span class="chip risk">RISK</span><strong>foreign_keys=ON только у ModerationStore</strong></div>
+    <p>У RegistryStore/FingerprintStore/bot/database.py PRAGMA не включена &mdash; если схема этих БД объявляет FK-constraints, они сейчас молча игнорируются SQLite (тот же класс проблемы, что был найден и закрыт в ModerationStore).</p>
+  </div>
+  <div class="finding partial">
+    <div class="finding-head"><span class="chip partial">DESIGN, NOT FIXED</span><strong>2N+3 независимых соединения aiosqlite на процесс бота, плюс новое на каждый HTTP-запрос панели</strong></div>
+    <p>Панель не разделяет соединения с процессом бота, открывает новое на каждый REST-запрос (см. раздел 02) &mdash; сознательное дизайн-решение цикла 2, не исправлено.</p>
+  </div>
+</section>
+
+<!-- ============ 6. Executor / Pipelines ============ -->
+<section class="card" id="s6">
+  <div class="card-head">
+    <h2><span class="idx">06</span>Executor / Pipelines</h2>
+    <span class="status risk">&#9679; RISK</span>
+  </div>
+  <p class="lede">Потеря аудита при исключении в батче &mdash; закрыто. Реальный race condition в reclaim-логике &mdash; не закрыт, потенциально приводит к двойному исполнению банов/таймаутов.</p>
+
+  <div class="finding done">
+    <div class="finding-head"><span class="chip done">FIXED</span><strong>Потеря аудита при исключении посреди батча &mdash; roadmap #10</strong></div>
+    <p>_run_per_target теперь оборачивает каждый вызов в try/except, сбой одной цели не прерывает обработку остальных и не стирает уже накопленные succeeded/failed.</p>
+  </div>
+
+  <div class="finding notdone">
+    <div class="finding-head"><span class="chip notdone">NOT FIXED</span><strong>reclaim_stuck_actions не проверяет, жив ли исполнитель &mdash; race condition</strong></div>
+    <p>Условие реклейма &mdash; только <code>started_at &lt; cutoff</code>, без heartbeat/lease/owner-токена. Точная цепочка: executor A берёт задание на 40 целей, обработка растягивается &gt;120с (цепочка временных 5xx &mdash; не редкость), reclaim_stuck_actions возвращает задание в pending, не проверяя, что A всё ещё активно его исполняет. Executor B берёт то же задание, оба параллельно бьют Helix по одному списку user_id.</p>
+    <p><strong>Для TIMEOUT это не no-op:</strong> повторный вызов обновляет длительность таймаута, а prior_timeouts инкрементируется дважды за одно логическое действие &mdash; раздувает будущую эскалацию сильнее, чем должно быть. Комментарий в коде осознаёт проблему (<span class="loc">twitch_api.py:236-241</span>), но исправлен только триггер (Ratelimit-Reset на 5xx), не сама гонка.</p>
+  </div>
+
+  <div class="finding risk">
+    <div class="finding-head"><span class="chip risk">UNVERIFIED ASSUMPTION</span><strong>&laquo;Helix идемпотентен&raquo; &mdash; допущение в докстринге, не проверено тестом</strong></div>
+    <p>Docstring reclaim_stuck_actions утверждает: &laquo;ban_user()/timeout_user() в Twitch Helix идемпотентны&raquo;. В кодовой базе нет теста, который бы проверял это против мокового сценария повторного вызова. Для BAN это правдоподобно (конечное состояние одно), для TIMEOUT &mdash; неверно (см. выше).</p>
+  </div>
+
+  <h3 class="sub">Очереди &mdash; поведение при переполнении</h3>
+  <div class="finding done">
+    <p><strong>asyncio.Queue (чат, maxsize=10000):</strong> при переполнении событие теряется безвозвратно, задокументировано намеренно &mdash; чтение чата не должно ждать. Счётчик дропов не троттлится, лог &mdash; не чаще раза в минуту.</p>
+    <p><strong>SQL-очередь заданий:</strong> никогда не отбрасывает, растёт без ограничения при заторе. FIFO строго по id, starvation между каналами структурно невозможен (разные файлы БД), starvation внутри канала теоретически возможен при устойчивом заторе &mdash; не приоритизируется.</p>
+  </div>
+</section>
+
+<!-- ============ 7. Clip Engine ============ -->
+<section class="card" id="s7">
+  <div class="card-head">
+    <h2><span class="idx">07</span>Clip Engine</h2>
+    <span class="status notdone">&#9679; NOT DONE</span>
+  </div>
+  <p class="lede">Два известных бага закрыты и защищены тестами. Но фундаментальный пробел не устранён: результат создания клипа нигде не сохраняется, кроме текстового лога.</p>
+
+  <div class="finding done">
+    <div class="finding-head"><span class="chip done">FIXED, TESTED</span><strong>_apply_auto_scale терял capture_delay_seconds</strong></div>
+    <p>CRITICAL цикла 2 &mdash; исправлено, поле теперь явно присутствует в конструкторе. Тестовое покрытие слабое: make_config() не принимает параметр для этого поля, регрессия конкретно этого бага прошла бы незамеченной.</p>
+  </div>
+  <div class="finding done">
+    <div class="finding-head"><span class="chip done">FIXED, TESTED</span><strong>Кулдаун не выставлялся при неудаче Helix &mdash; исправлено И защищено регрессионным тестом</strong></div>
+    <p>test_failed_clip_does_not_set_cooldown явно эмулирует неуспех первого create_clip, проверяет, что второй триггер реально доходит до Helix.</p>
+  </div>
+
+  <div class="finding notdone">
+    <div class="finding-head"><span class="chip notdone">NOT DONE</span><strong>Нет персистентности результата &mdash; ни одной строки в БД</strong></div>
+    <p>clip_id/edit_url/успех/ошибка живут только в log.info/log.error. Единственная таблица со словом &laquo;clip&raquo; &mdash; mod_clip_token, и это исключительно credential-хранилище OAuth-токена, не история созданных клипов. Если Twitch создал клип (физически существует), но процесс упал до записи лога &mdash; бот навсегда не знает об этом клипе. Панель не может показать историю клипов, потому что данных нет ни в памяти между рестартами, ни на диске.</p>
+  </div>
+  <div class="finding notdone">
+    <div class="finding-head"><span class="chip notdone">NOT DONE</span><strong>Риск дублирования клипа через сам Helix-retry</strong></div>
+    <p>create_clip использует общий _request с ретраями на TransportError/5xx, без idempotency-key. Если физический POST дошёл до Twitch и создал клип, а ответ потерялся (обрыв/5xx после фактического успеха на стороне Twitch) &mdash; retry-цикл шлёт второй POST /clips, создавая второй, отдельный клип. Одно логическое событие может, в худшем случае, привести к 1-3 физически созданным клипам.</p>
+  </div>
+  <div class="finding done">
+    <p><strong>Блокировка при зависании create_clip:</strong> проверено &mdash; блокирует только собственную очередь/канал (следующие триггеры копятся в очереди этого канала до QUEUE_MAXSIZE), не блокирует event loop процесса, не блокирует другие каналы автоклипа, не блокирует модерацию чата (у той полностью отдельный HelixClient).</p>
+  </div>
+</section>
+
+<!-- ============ 8. Discord Alerts ============ -->
+<section class="card" id="s8">
+  <div class="card-head">
+    <h2><span class="idx">08</span>Discord Alerts</h2>
+    <span class="status done">&#9679; DONE</span>
+  </div>
+  <p class="lede">Главная находка цикла 2 закрыта сегодня. Изоляция от основного пайплайна подтверждена полностью &mdash; проблема Discord не может остановить или повредить модерацию.</p>
+
+  <div class="finding done">
+    <div class="finding-head"><span class="chip done">FIXED</span><strong>mark_digest_sent / mark_escalation_sent теперь условны</strong></div>
+    <p>send_digest/send_escalation возвращают bool. Метка &laquo;отправлено&raquo; ставится только при delivered=True &mdash; иначе Discord 429/сбой сети откладывал бы следующую попытку на сутки (digest) или час (эскалация), теряя ровно то, ради чего механизм существует.</p>
+  </div>
+  <div class="finding done">
+    <div class="finding-head"><span class="chip done">CONFIRMED</span><strong>Полная изоляция от горячего пути &mdash; главный вопрос закрыт</strong></div>
+    <p>send_cluster_alert/send_escalation вызываются через отдельный asyncio.create_task из observe(), не блокируя чтение чата. send_digest &mdash; отдельная фоновая задача канала (poll_digest), полностью независимая от consume_queue. Таймаут HTTP-запроса &mdash; 10 секунд, жёсткая верхняя граница, вечного зависания нет.</p>
+  </div>
+
+  <h3 class="sub">Новые находки &mdash; не в исходном списке аудита</h3>
+  <div class="finding partial">
+    <div class="finding-head"><span class="chip partial">GAP</span><strong>Нет специальной обработки 429/Retry-After</strong></div>
+    <p>Единственная ветка обработки &mdash; raise_for_status() внутри одного except Exception. 429, 404 (webhook удалён), 500, timeout &mdash; обрабатываются идентично. Заголовок Retry-After не читается вообще (для сравнения: twitch_api.py читает Ratelimit-Reset на аналогичный случай).</p>
+  </div>
+  <div class="finding partial">
+    <div class="finding-head"><span class="chip partial">GAP</span><strong>Нет retry на уровне alerts.py</strong></div>
+    <p>Один HTTP-запрос за вызов, без повторной попытки внутри функции. Единственный retry &mdash; естественный внешний цикл (следующий тик поллера) при условии, что mark_*_sent не был вызван.</p>
+  </div>
+  <div class="finding partial">
+    <div class="finding-head"><span class="chip partial">GAP</span><strong>Оператор не может отличить &laquo;webhook мёртв&raquo; от &laquo;временный сбой&raquo;</strong></div>
+    <p>Оба случая логируются одинаковым log.exception без структурного поля. DiscordWebhookConfig не хранит last_delivery_error/consecutive_failures.</p>
+  </div>
+</section>
+
+<!-- ============ 9. Permissions ============ -->
+<section class="card" id="s9">
+  <div class="card-head">
+    <h2><span class="idx">09</span>Permissions (RBAC)</h2>
+    <span class="status done">&#9679; DONE</span>
+  </div>
+  <p class="lede">Полная карта построена по всем 4 роутерам. Путь обхода проверки роли (VIEWER &rarr; MODERATOR-действие) не найден. Одна структурная асимметрия в registry_api.py &mdash; не эксплуатируема при текущей ролевой модели, но не по-канальна.</p>
+
+  <h3 class="sub">moderation_api.py &mdash; per-channel везде, кроме двух намеренных исключений</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Область</th><th>Мин. роль</th><th>По каналу?</th><th>Примечание</th></tr></thead>
+      <tbody>
+        <tr><td>clusters, verdicts, audit, users, patterns (чтение)</td><td>MODERATOR</td><td><span class="tag yes">да</span></td><td>через channel_store</td></tr>
+        <tr><td>patterns, content_rules, attack_mode, panel_users (запись)</td><td>ADMIN</td><td><span class="tag yes">да</span></td><td></td></tr>
+        <tr><td>actions (BAN/TIMEOUT)</td><td>MODERATOR</td><td><span class="tag yes">да</span></td><td>payload.profile</td></tr>
+        <tr><td>ws, content_ws (WebSocket)</td><td>MODERATOR</td><td><span class="tag yes">да</span></td><td>profile из первого сообщения</td></tr>
+        <tr><td>overview</td><td>любая</td><td><span class="tag na">нет</span></td><td>намеренно &mdash; сводка по всем каналам</td></tr>
+        <tr><td>config (GET/POST)</td><td>MODERATOR/ADMIN</td><td><span class="tag na">нет</span></td><td>session-wide, но конфиг общий не per-channel</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 class="sub">bots_api.py &mdash; весь роутер session-wide OWNER</h3>
+  <div class="finding done">
+    <p>Находка цикла 2 &laquo;модератор канала A получает MODERATOR-права над профилем бота B&raquo; закрыта не переходом на per-channel-проверку, а поднятием минимальной роли до OWNER для <strong>всего роутера</strong> &mdash; 23 эндпоинта + /ws/logs. Структурно устраняет межканальную эскалацию для MODERATOR/ADMIN-сессий (у них просто нет доступа вообще).</p>
+  </div>
+
+  <h3 class="sub">registry_api.py &mdash; найдена parameter confusion</h3>
+  <div class="finding risk">
+    <div class="finding-head"><span class="chip risk">STRUCTURAL</span><strong>channels/&#123;broadcaster_id&#125;/start|stop|reset_crash &mdash; broadcaster_id из пути, роль session-wide</strong></div>
+    <p>Действие явно относится к конкретному каналу, но проверяется session-wide роль ADMIN, не role_for_profile(request, broadcaster_id). <span class="loc">registry_api.py:173-174, 191-192, 212-213</span></p>
+    <p><strong>Почему не эксплуатируема сейчас:</strong> единственные роли, проходящие _require_role, это ADMIN/OWNER, а ADMIN в этой системе уже задуман как глобальный ручной оверрайд (не per-channel сущность) &mdash; см. auth.py:702-705. Путаницы ролей по факту нет. Но код структурно не по-канальный, в отличие от остального moderation_api.py &mdash; если в будущем появится роль &laquo;ADMIN только своего канала&raquo;, это станет дырой немедленно.</p>
+  </div>
+
+  <h3 class="sub">Главный вопрос промпта</h3>
+  <div class="finding done">
+    <p><strong>Путь, которым VIEWER мог бы вызвать MODERATOR+-действие в обход проверки &mdash; не найден.</strong> Везде, где встречается MODERATOR/ADMIN-проверка, она либо через channel_store (store физически недостижим без прохождения require_role), либо явный require_role/_require_role перед мутацией. WebSocket-роуты проверяют роль до отправки данных (у /ws/logs &mdash; до accept(), у /ws и /content_ws &mdash; после accept(), но до отправки данных: асимметрия в моменте закрытия соединения, не дыра в данных).</p>
+  </div>
+</section>
+
+<!-- ============ 10. Dead Code ============ -->
+<section class="card" id="s10">
+  <div class="card-head">
+    <h2><span class="idx">10</span>Dead Code Hunt</h2>
+    <span class="status partial">&#9679; PARTIAL</span>
+  </div>
+  <p class="lede">TODO/FIXME/HACK &mdash; ноль совпадений, подтверждено третий раз подряд. Список известного мёртвого кода частично закрылся сам собой (функции стали использоваться), частично остаётся.</p>
+
+  <h3 class="sub">Изменилось со времени прошлого аудита</h3>
+  <div class="finding done">
+    <div class="finding-head"><span class="chip done">NOW USED</span><strong>POST /api/channels и /channels/&#123;id&#125;/start|stop &mdash; больше не мёртвые</strong></div>
+    <p>Ранее числились как HIGH &laquo;мёртвый, докстринг ссылается на несуществующий bot/registry.py&raquo;. Сейчас реально вызываются из moderation.js (кнопки &laquo;Подключить канал&raquo;, &laquo;Запустить/Остановить&raquo;). Докстринг при этом не обновлён &mdash; всё ещё ссылается на несуществующий модуль.</p>
+  </div>
+  <div class="finding done">
+    <div class="finding-head"><span class="chip done">REMOVED</span><strong>increment_daily_stats &mdash; удалён сегодня</strong></div>
+  </div>
+
+  <h3 class="sub">Остаётся мёртвым</h3>
+  <div class="finding partial">
+    <p><code>ScriptProfile.dominant</code>, <code>SlidingWindow.recent_arrivals</code>/<code>streak_start</code> &mdash; используются только в tests/. <code>GET /api/moderation/verdicts</code>, <code>POST /channels/&#123;id&#125;/reset_crash</code> &mdash; нет вызова из JS. <code>is_trusted</code>, <code>upsert_cluster_by_members</code> без _ex &mdash; живы только в тестах.</p>
+  </div>
+  <div class="finding partial">
+    <div class="finding-head"><span class="chip partial">NOT EXHAUSTIVE</span><strong>Не пройдена вся сверка эндпоинтов с JS</strong></div>
+    <p>Разведка проверила ~15 эндпоинтов из ~90 системно (те, что уже фигурировали в прошлых аудитах или всплыли попутно). panel_users, content_events и ещё ~70 роутов не сверялись отдельно в этом проходе.</p>
+  </div>
+  <div class="finding done">
+    <p>Неиспользуемых файлов в src/ не найдено &mdash; первый проход дал ложные срабатывания на detector-модули (регистрируются через __init__.py, реэкспорт, не прямой импорт). panel/services.py (новый модуль) &mdash; используется полностью.</p>
+  </div>
+</section>
+
+<!-- ============ SUMMARY ============ -->
+<section class="card" id="summary">
+  <div class="card-head">
+    <h2>Сводная таблица</h2>
+  </div>
+  <div class="tablewrap">
+    <table class="summary-table">
+      <thead><tr><th>Область</th><th class="status-cell">Статус</th><th>Проблемы</th><th>Риск</th><th>Приоритет</th></tr></thead>
+      <tbody>
+        <tr><td><strong>ModerationStore</strong></td><td class="status-cell"><span class="status partial">PARTIAL</span></td><td>God Class, 13 singleton-повторов</td><td>Низкий &mdash; работает корректно</td><td>MEDIUM</td></tr>
+        <tr><td><strong>moderation_api.py</strong></td><td class="status-cell"><span class="status done">DONE</span></td><td>Соединения без пула</td><td>Низкий</td><td>LOW</td></tr>
+        <tr><td><strong>auth.py</strong></td><td class="status-cell"><span class="status done">DONE</span></td><td>5 концернов в файле</td><td>Низкий (было критично, закрыто)</td><td>LOW</td></tr>
+        <tr><td><strong>Multi-Channel</strong></td><td class="status-cell"><span class="status risk">RISK</span></td><td>Утечка соединения при сбое старта; N не тестировался</td><td>Средний &mdash; линейно, но не измерено</td><td>MEDIUM</td></tr>
+        <tr><td><strong>SQLite</strong></td><td class="status-cell"><span class="status partial">PARTIAL</span></td><td>Нет retry на lock; FK несимметрично включена</td><td>Средний</td><td>MEDIUM</td></tr>
+        <tr><td><strong>Executor/Pipelines</strong></td><td class="status-cell"><span class="status risk">RISK</span></td><td>Race condition в reclaim &mdash; двойное исполнение</td><td>Высокий при масштабе/сбоях сети</td><td>HIGH</td></tr>
+        <tr><td><strong>Clip Engine</strong></td><td class="status-cell"><span class="status notdone">NOT DONE</span></td><td>Нет персистентности; риск дублей</td><td>Высокий &mdash; потеря данных навсегда</td><td>HIGH</td></tr>
+        <tr><td><strong>Discord Alerts</strong></td><td class="status-cell"><span class="status done">DONE</span></td><td>Нет обработки 429/Retry-After</td><td>Низкий &mdash; изолировано от ядра</td><td>LOW</td></tr>
+        <tr><td><strong>Permissions</strong></td><td class="status-cell"><span class="status done">DONE</span></td><td>1 структурная асимметрия, не эксплуатируема</td><td>Низкий</td><td>LOW</td></tr>
+        <tr><td><strong>Dead Code</strong></td><td class="status-cell"><span class="status partial">PARTIAL</span></td><td>Неполная сверка (~15/90 эндпоинтов)</td><td>Косметический</td><td>LOW</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ============ PRIORITIES ============ -->
+<section class="card" id="priorities">
+  <div class="card-head">
+    <h2>Приоритеты действий</h2>
+  </div>
+  <div class="priogrid">
+    <div class="priobox critical">
+      <div class="priobox-head"><span>CRITICAL</span><span>0</span></div>
+      <ul><li>Не найдено. Всё, что имело статус CRITICAL в прошлых циклах, закрыто.</li></ul>
+    </div>
+    <div class="priobox high">
+      <div class="priobox-head"><span>HIGH</span><span>2</span></div>
+      <ul>
+        <li>Clip Engine: сохранять результат создания клипа в БД хотя бы одной таблицей (clip_id, edit_url, status, event) &mdash; сейчас данные существуют только в логе.</li>
+        <li>Executor: закрыть race condition в <code>reclaim_stuck_actions</code> &mdash; heartbeat или CAS (<code>UPDATE ... WHERE status='pending'</code>) перед стартом исполнения.</li>
+      </ul>
+    </div>
+    <div class="priobox medium">
+      <div class="priobox-head"><span>MEDIUM</span><span>4</span></div>
+      <ul>
+        <li>Оставшиеся ~25 пунктов MEDIUM-списка цикла 2 (поллинг-циклы, кэш role_for_profile, PID reuse).</li>
+        <li>Разбить ModerationStore на репозитории &mdash; карта готова, физически не сделано.</li>
+        <li>Включить foreign_keys=ON симметрично во всех store, не только ModerationStore.</li>
+        <li>try/finally вокруг ChannelPipeline.start() на случай частичного сбоя.</li>
+      </ul>
+    </div>
+    <div class="priobox low">
+      <div class="priobox-head"><span>LOW</span><span>3</span></div>
+      <ul>
+        <li>Retry-After/429-обработка в alerts.py.</li>
+        <li>Завершить сверку эндпоинтов с JS (Dead Code Hunt не исчерпывающий).</li>
+        <li>registry_api.py &mdash; привести start/stop/reset_crash к role_for_profile для консистентности, не срочно.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ============ FULL VERDICT ============ -->
+<section class="card" id="verdict-full">
+  <div class="card-head">
+    <h2>Финальный вердикт</h2>
+    <span class="status partial">&#9679; READY WITH CONDITIONS</span>
+  </div>
+
+  <div class="qa">
+    <div class="qa-item">
+      <div class="q">1. Что мы уже прошли</div>
+      <div class="a">Два полных цикла формального аудита (15 категорий, CRITICAL/HIGH закрыты полностью) плюс пять точечных проходов сегодня: Twitch-интеграции, ModerationStore, moderation_api.py, auth.py (security review с тремя воспроизведёнными эксплойтами), bots_api.py, первый заход в MEDIUM-список. <strong>Пять коммитов, 1121/1121 тестов, mypy и ruff чисты.</strong></div>
+    </div>
+    <div class="qa-item">
+      <div class="q">2. Что осталось пройти</div>
+      <div class="a">~25 пунктов MEDIUM-списка цикла 2 не тронуты. Dead Code Hunt не исчерпывающий (15 из ~90 эндпоинтов сверено с JS). Multi-Channel не проверялся на реальном N &gt; десятка &mdash; только статически.</div>
+    </div>
+    <div class="qa-item">
+      <div class="q">3. Что нужно исправить перед добавлением новых функций</div>
+      <div class="a"><strong>Clip Engine персистентность</strong> &mdash; если новые функции будут строиться поверх истории клипов (например, аналитика, повторные попытки), а данных нет вообще, каждая такая функция унаследует эту дыру. <strong>Race condition в executor</strong> &mdash; если добавляется больше типов массовых действий, вероятность попасть в 120-секундное окно растёт пропорционально.</div>
+    </div>
+    <div class="qa-item">
+      <div class="q">4. Что можно оставить на потом</div>
+      <div class="a">Разбиение ModerationStore на репозитории &mdash; работает корректно, боль чисто в поддерживаемости, не в надёжности. Discord 429-обработка &mdash; изолирована от ядра, максимум теряет один алерт. Соединения панели без пула &mdash; терпимо при текущем масштабе панели (один оператор, не сотни одновременных запросов).</div>
+    </div>
+    <div class="qa-item">
+      <div class="q">5. Какие архитектурные изменения желательно сделать сейчас</div>
+      <div class="a">Добавить таблицу <code>mod_clips</code> (или аналог) в схему ModerationStore/отдельного clip-store &mdash; до того, как автоклип станет более активно используемой фичей и объём непрослеживаемых клипов вырастет. Добавить lease-механизм в mod_action_queue (owner_pid + heartbeat) &mdash; сейчас как раз тот момент, пока схема ещё не оброс потребителями, которые будут ломаться при её изменении.</div>
+    </div>
+    <div class="qa-item">
+      <div class="q">6. Какие изменения делать НЕ нужно</div>
+      <div class="a">Не стоит сейчас трогать 13 singleton-паттернов в ModerationStore ради архитектурной чистоты &mdash; работает, риска нет, это чистый техдолг. Не стоит добавлять connection pooling в панель до реальных признаков нагрузки &mdash; преждевременная оптимизация непроверенной гипотезы. Не стоит менять ролевую модель registry_api.py (start/stop/reset_crash) &mdash; риск не эксплуатируем при текущей семантике ADMIN как глобальной роли, трогать её ради консистентности сейчас создаст больше риска, чем оставить.</div>
+    </div>
+  </div>
+</section>
+
+</main>
+</div>
+
+<footer>
+  CigilBot &middot; инженерный аудит &middot; составлено 2026-08-18 на основе кода после коммита 01faf23 &middot; код не изменялся в ходе этого аудита
+</footer>
+
+</div>

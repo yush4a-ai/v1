@@ -562,6 +562,26 @@ CREATE INDEX IF NOT EXISTS idx_mod_actions_created_at ON mod_actions(created_at)
 CREATE INDEX IF NOT EXISTS idx_mod_actions_actor ON mod_actions(actor);
 """
 
+# Lease-токен на mod_action_queue (bug-аудит 2026-08-15/2026-08-18) —
+# reclaim_stuck_actions определял "зависшее" задание только по возрасту
+# started_at, не проверяя, жив ли исполнитель. Если два процесса бота
+# одновременно работают с одним mod.<id>.db (старый завис, но не убит,
+# новый уже стартовал), новый исполнитель мог реклеймить и взять задание,
+# которое старый ещё физически доисполняет — задвоенный аудит и, для
+# TIMEOUT, задвоенное продление длительности/инкремент prior_timeouts.
+#
+# lease_token — случайная строка, выданная mark_action_started() тому
+# конкретному вызову, который взял задание. update_action_progress()
+# (дёргается на каждую цель — см. executor.py::_run_per_target) и
+# complete_action() пишут только при совпадении токена: если задание уже
+# успели реклеймить (и тем самым обнулить токен) и передать другому
+# исполнителю, поздние UPDATE от "зомби"-исполнителя находят 0 строк и
+# тихо не применяются, вместо того чтобы затереть прогресс/результат
+# актуального исполнителя.
+_MIGRATION_023_ACTION_QUEUE_LEASE_TOKEN = """
+ALTER TABLE mod_action_queue ADD COLUMN lease_token TEXT;
+"""
+
 MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, _MIGRATION_001_CORE_AUDIT),
     (2, _MIGRATION_002_ACTIONS),
@@ -585,6 +605,7 @@ MIGRATIONS: tuple[tuple[int, str], ...] = (
     (20, _MIGRATION_020_CLIP_TOKEN),
     (21, _MIGRATION_021_AUTOCLIP_CAPTURE_DELAY),
     (22, _MIGRATION_022_ACTIONS_CLUSTER_ID_SOFT_REF),
+    (23, _MIGRATION_023_ACTION_QUEUE_LEASE_TOKEN),
 )
 
 
