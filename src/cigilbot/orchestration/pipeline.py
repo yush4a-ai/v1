@@ -310,7 +310,11 @@ class ChannelPipeline:
         )
         verdict = await self.engine.observe(event)
 
-        if verdict.is_provisional:
+        # bug-аудит 2026-08-15, MEDIUM: без account_age_client _poll_account_age
+        # не запускает свой цикл вовсе (см. её же guard) — множество копилось
+        # бы здесь безусловно и никогда не дренировалось, неограниченный рост
+        # памяти на активном чате без PANEL_TWITCH_CLIENT_ID/SECRET.
+        if verdict.is_provisional and self.account_age_client is not None:
             self._pending_account_age.add(event.user_id)
 
         if verdict.risk_level != RiskLevel.LOW:

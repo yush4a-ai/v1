@@ -365,7 +365,36 @@ def _list_env_profile_channels(roots: PanelRoots) -> dict[str, str]:
     return result
 
 
+# bug-аудит 2026-08-15, MEDIUM: role_for_profile вызывал
+# _list_profile_channels на КАЖДЫЙ запрос (каждый channel_store/
+# require_role_min) — .env-файлы читаются с диска и Registry коннектится
+# заново на каждый HTTP-запрос/WS-сообщение, хотя набор каналов меняется
+# редко (новый канал через панель, новый профиль бота через bots_api).
+# TTL короткий — не "закрывает" эту стоимость, а размазывает её по времени:
+# несколько запросов в узком окне (страница с параллельными fetch, WS-поток
+# сообщений) платят один раз, а админ, только что добавивший канал, видит
+# результат в пределах нескольких секунд, не после рестарта панели.
+_PROFILE_CHANNELS_CACHE_TTL_SECONDS = 5.0
+_profile_channels_cache: dict[Path, tuple[float, dict[str, str]]] = {}
+
+
 async def _list_profile_channels(roots: PanelRoots) -> dict[str, str]:
+    """Кэширующая обёртка вокруг _list_profile_channels_uncached — см. её
+    докстринг для семантики результата. Кэш ключуется по roots.repo, не по
+    самим roots (dataclass без __hash__): тесты создают новый PanelRoots на
+    tmp_path на каждый прогон, тот же путь не переиспользуется между ними,
+    так что коллизий между тестами это не создаёт."""
+    now = time.time()
+    cached = _profile_channels_cache.get(roots.repo)
+    if cached is not None and cached[0] > now:
+        return cached[1]
+
+    result = await _list_profile_channels_uncached(roots)
+    _profile_channels_cache[roots.repo] = (now + _PROFILE_CHANNELS_CACHE_TTL_SECONDS, result)
+    return result
+
+
+async def _list_profile_channels_uncached(roots: PanelRoots) -> dict[str, str]:
     """Все каналы, по которым вообще имеет смысл считать роль вошедшего —
     объединение двух моделей каналов, сосуществующих в монорепо:
 

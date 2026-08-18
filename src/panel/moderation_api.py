@@ -39,6 +39,7 @@ from cigilbot.storage.registry_store import RegistryStore
 from cigilbot.storage.store import ModerationStore, PatternInput
 from panel import services
 from panel.auth import SESSION_KEY, require_authenticated, role_for_profile
+from panel.rate_limit import limiter
 from paths import MOD_VAR, REGISTRY_DB, REPO_ROOT, safe_segment
 
 # Где лежат mod.<broadcaster_id>.db и registry.db. Раньше это был
@@ -434,13 +435,20 @@ class ActionRequestBody(BaseModel):
     cluster_id: int | None = None
 
 
+@limiter.limit("20/minute")
 @router.post("/actions")
 async def api_enqueue_action(
     request: Request, payload: ActionRequestBody
 ) -> dict[str, object]:
     """Правила (подстановка состава кластера из БД, лимит целей, валидация
     payload) живут в services.enqueue_moderation_action — здесь только
-    перевод доменных ошибок в HTTP-коды."""
+    перевод доменных ошибок в HTTP-коды.
+
+    bug-аудит 2026-08-15, MEDIUM: единственный роут, реально ставящий
+    бан/таймаут в очередь исполнения (executor.py), оставался без rate
+    limit — тот же лимит, что auth.py применяет к чувствительным
+    действиям (20/minute), MAX_MANUAL_BULK_TARGETS в services.py уже
+    ограничивает размер одного запроса, но не их частоту."""
     async with channel_store(request, payload.profile, "MODERATOR") as (store, role, actor):
         try:
             queue_id, target_count = await services.enqueue_moderation_action(
