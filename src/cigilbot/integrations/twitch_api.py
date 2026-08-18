@@ -33,6 +33,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Literal
 
 import httpx
 
@@ -54,7 +55,15 @@ BACKOFF_BASE_SECONDS = 1.0
 
 
 class HelixError(Exception):
-    """Ошибка Helix API — с кодом статуса и телом ответа для диагностики."""
+    """Ошибка Helix API — с кодом статуса и телом ответа для диагностики.
+
+    status_code=0 означает чистую транспортную ошибку (обрыв соединения,
+    DNS-сбой, таймаут) — ни одного HTTP-ответа получено не было. Ненулевой
+    status_code при исчерпании ретраев (см. _request) — последний код,
+    который вернул Helix перед тем, как попытки закончились (429/5xx).
+    Различие важно для create_clip(): 429 означает "запрос отклонён до
+    создания клипа" (failed), 5xx/0 — "исход неизвестен" (unknown), см.
+    bug-аудит 2026-08-18."""
 
     def __init__(self, status_code: int, message: str, body: str = "") -> None:
         super().__init__(f"Helix {status_code}: {message}")
@@ -103,13 +112,26 @@ class ActionResult:
 class ClipResult:
     """Результат создания клипа — отдельно от ActionResult: edit_url это
     клип-специфичные данные, которых нет у бана/таймаута/удаления
-    сообщения, тащить их через ActionResult.error было бы слоевым хаком."""
+    сообщения, тащить их через ActionResult.error было бы слоевым хаком.
+
+    outcome — не идемпотентность (Twitch Clips API её не даёт), а честная
+    классификация неопределённости (bug-аудит 2026-08-18):
+      created — Twitch подтвердил (202), clip_id/edit_url заполнены
+      failed  — Twitch синхронно отклонил запрос (4xx кроме 429, или 429
+                — оба означают "клип не начал создаваться на стороне
+                Twitch"), исход точно известен
+      unknown — 5xx или транспортная ошибка при исчерпании ретраев:
+                сервер мог упасть и до, и после фактического создания
+                клипа, _request не различает эти случаи технически
+    success=True эквивалентно outcome="created", оставлено для мест, где
+    важен только факт успеха, не причина неуспеха."""
 
     broadcaster_id: str
     success: bool
     clip_id: str = ""
     edit_url: str = ""
     error: str = ""
+    outcome: Literal["created", "failed", "unknown"] = "failed"
 
 
 def _parse_iso8601(value: str) -> float:
@@ -204,11 +226,24 @@ class HelixClient:
         token: str,
         params: Sequence[tuple[str, str | int | float | bool | None]] | None = None,
         json_body: dict[str, object] | None = None,
+        retry: bool = True,
     ) -> httpx.Response:
+        """retry=False — ровно одна попытка, без ретраев на 429/5xx/
+        TransportError (bug-аудит 2026-08-18): create_clip() передаёт это
+        явно — Twitch Clips API не даёт idempotency-key, повторный POST
+        после потерянного ответа физически создал бы второй клип на
+        стороне Twitch. Остальные вызывающие (ban_user, get_users и т.д.)
+        не передают retry — их поведение не меняется."""
         headers = {"Client-ID": self._client_id, "Authorization": f"Bearer {token}"}
+        attempts = MAX_RETRIES if retry else 1
 
         last_error: Exception | None = None
-        for attempt in range(MAX_RETRIES):
+        # 0 — чистая транспортная ошибка (ни одного HTTP-ответа не было).
+        # Ненулевое значение — последний код, который вернул Helix перед
+        # тем, как попытки закончились (см. HelixError про то, зачем это
+        # нужно create_clip() для различения failed/unknown).
+        last_status_code = 0
+        for attempt in range(attempts):
             await self._rate_limiter.wait()
             try:
                 resp = await self._http.request(
@@ -220,10 +255,15 @@ class HelixClient:
                 )
             except httpx.TransportError as exc:
                 last_error = exc
+                if attempt + 1 == attempts:
+                    break
                 await asyncio.sleep(self._backoff_base * (2**attempt))
                 continue
 
             if resp.status_code == 429 or resp.status_code >= 500:
+                last_status_code = resp.status_code
+                if attempt + 1 == attempts:
+                    break
                 delay = self._backoff_base * (2**attempt)
                 # Ratelimit-Reset — момент сброса счётчика запросов, валиден
                 # только для 429 (превышен лимит). Раньше применялся и к
@@ -246,14 +286,16 @@ class HelixClient:
                             delay = max(delay, float(retry_after) - time.time())
                 log.warning(
                     "Helix %s %s -> %d, повтор через %.1f сек (попытка %d/%d)",
-                    method, path, resp.status_code, delay, attempt + 1, MAX_RETRIES,
+                    method, path, resp.status_code, delay, attempt + 1, attempts,
                 )
                 await asyncio.sleep(max(0.0, delay))
                 continue
 
             return resp
 
-        raise HelixError(0, f"исчерпаны попытки запроса к {path}", str(last_error or ""))
+        raise HelixError(
+            last_status_code, f"исчерпаны попытки запроса к {path}", str(last_error or "")
+        )
 
     # -- публичные методы --------------------------------------------------
 
@@ -380,14 +422,33 @@ class HelixClient:
         нарезку в очередь (сама нарезка асинхронна на их стороне, готовый
         клип появляется не мгновенно). Требует User Access Token со scope
         clips:edit, принадлежащий вещателю, модератору или редактору канала
-        — не App Access Token и не токен модератора банов (другой scope)."""
+        — не App Access Token и не токен модератора банов (другой scope).
+
+        retry=False (bug-аудит 2026-08-18): Twitch Clips API не даёт
+        idempotency-key. Если первый физический POST дошёл до Twitch и
+        создал клип, а ответ потерялся (обрыв/5xx после факта) — retry
+        внутри _request послал бы ВТОРОЙ POST и создал второй, отдельный
+        клип. Одна попытка — не идемпотентность (её тут физически нельзя
+        обеспечить), а отказ от автоматического дублирования: при неудаче
+        вызывающий код (bot/autoclip.py) записывает исход как
+        failed/unknown и не ретраит сам, следующий независимый триггер
+        решает, нужен ли новый клип."""
         try:
             resp = await self._request(
                 "POST", "/clips", token=user_token,
                 params=[("broadcaster_id", broadcaster_id)],
+                retry=False,
             )
         except HelixError as exc:
-            return ClipResult(broadcaster_id=broadcaster_id, success=False, error=str(exc))
+            # 429 — Twitch отклонил запрос ДО создания клипа (рейт-лимит
+            # проверяется раньше бизнес-логики) — исход точно известен.
+            # 5xx и транспортные сбои (status_code=0) — исход неизвестен:
+            # ошибка могла произойти и после того, как клип физически
+            # поставлен в очередь на стороне Twitch (см. HelixError).
+            outcome: Literal["failed", "unknown"] = "failed" if exc.status_code == 429 else "unknown"
+            return ClipResult(
+                broadcaster_id=broadcaster_id, success=False, error=str(exc), outcome=outcome
+            )
 
         if resp.status_code == 202:
             data = resp.json().get("data") or [{}]
@@ -397,7 +458,14 @@ class HelixClient:
                 success=True,
                 clip_id=row.get("id", ""),
                 edit_url=row.get("edit_url", ""),
+                outcome="created",
             )
+        # Любой другой код, дошедший сюда без исключения — 4xx кроме 429,
+        # _request возвращает resp напрямую без ретрая (см. условие
+        # resp.status_code == 429 or resp.status_code >= 500 внутри
+        # _request). Twitch синхронно ответил отказом, исход точно
+        # известен, клип не создан.
         return ClipResult(
-            broadcaster_id=broadcaster_id, success=False, error=f"{resp.status_code}: {resp.text[:300]}"
+            broadcaster_id=broadcaster_id, success=False,
+            error=f"{resp.status_code}: {resp.text[:300]}", outcome="failed",
         )

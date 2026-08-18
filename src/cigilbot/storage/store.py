@@ -1911,6 +1911,107 @@ class ModerationStore:
         )
         await self._db.commit()
 
+    # -- Персистентность автоклипа (bug-аудит 2026-08-18) ---------------------
+    #
+    # Не идемпотентность (Twitch Clips API её не даёт — нет idempotency-key),
+    # а устойчивость к неопределённому исходу внешнего POST: запись создаётся
+    # ДО вызова Helix, чтобы падение процесса между запросом и ответом было
+    # видно как факт, а не молчанием. Ни один из методов ниже не приводит к
+    # повторному обращению к Twitch — только фиксируют состояние в БД. См.
+    # докстринг миграции 024 (migrations.py) про все пять статусов.
+
+    async def create_clip_attempt(
+        self, *, created_at: float, trigger_reason: str, trigger_text: str
+    ) -> int:
+        """Вызывается bot/autoclip.py::_create_clip ДО обращения к Helix —
+        сама постановка в 'pending' и есть персистентность: если процесс
+        падает до ответа Twitch, запись остаётся 'pending' и при следующем
+        старте канала станет 'unknown' (mark_stale_pending_clips_unknown),
+        а не пропадёт без следа."""
+        cursor = await self._db.execute(
+            """
+            INSERT INTO mod_clips (created_at, trigger_reason, trigger_text, status)
+            VALUES (?, ?, ?, 'pending')
+            """,
+            (created_at, trigger_reason, trigger_text),
+        )
+        await self._db.commit()
+        if cursor.lastrowid is None:
+            raise RuntimeError("INSERT в mod_clips не вернул id")
+        return cursor.lastrowid
+
+    async def mark_clip_created(self, clip_attempt_id: int, *, clip_id: str, edit_url: str) -> None:
+        """Twitch подтвердил (202), запись удаётся с первой попытки —
+        обычный успешный путь. Если этот UPDATE сам не пройдёт (SQLite
+        locked и т.п.), вызывающий код (autoclip.py) ловит исключение и
+        зовёт mark_clip_lost_after_success с теми же clip_id/edit_url —
+        данные не теряются, просто помечаются как потребовавшие второй
+        попытки со стороны бота, не Twitch."""
+        await self._db.execute(
+            "UPDATE mod_clips SET status = 'created', clip_id = ?, edit_url = ?, finished_at = ? "
+            "WHERE id = ?",
+            (clip_id, edit_url, time.time(), clip_attempt_id),
+        )
+        await self._db.commit()
+
+    async def mark_clip_lost_after_success(
+        self, clip_attempt_id: int, *, clip_id: str, edit_url: str, error: str
+    ) -> None:
+        """Twitch точно подтвердил создание (clip_id/edit_url известны
+        ЖИВОМУ процессу — это не 'unknown', это подтверждённый факт), но
+        первая попытка mark_clip_created провалилась. Данные сохраняются
+        здесь же, второй попыткой того же процесса — отдельный статус
+        нужен только чтобы отличить "обычный успех" от "успех, потребовавший
+        подстраховки", не потому что данные под вопросом."""
+        await self._db.execute(
+            "UPDATE mod_clips SET status = 'lost_after_success', clip_id = ?, edit_url = ?, "
+            "error = ?, finished_at = ? WHERE id = ?",
+            (clip_id, edit_url, error, time.time(), clip_attempt_id),
+        )
+        await self._db.commit()
+
+    async def mark_clip_failed(self, clip_attempt_id: int, *, error: str) -> None:
+        """Twitch синхронно отклонил запрос (4xx кроме 429, или 429) —
+        исход точно известен, клип не создан. Не ретраится автоматически:
+        следующий естественный триггер (новый burst/keyword/voice) создаст
+        независимую новую попытку, это не повторная обработка этого
+        события."""
+        await self._db.execute(
+            "UPDATE mod_clips SET status = 'failed', error = ?, finished_at = ? WHERE id = ?",
+            (error, time.time(), clip_attempt_id),
+        )
+        await self._db.commit()
+
+    async def mark_clip_unknown(self, clip_attempt_id: int, *, error: str) -> None:
+        """Процесс ЖИВ и знает, что исход неопределён (HelixClient вернул
+        outcome="unknown" — 5xx/TransportError, см. twitch_api.py::create_clip)
+        — в отличие от mark_stale_pending_clips_unknown ниже, здесь есть
+        error с диагностикой, а не только факт "было pending, стало
+        unknown после рестарта"."""
+        await self._db.execute(
+            "UPDATE mod_clips SET status = 'unknown', error = ?, finished_at = ? WHERE id = ?",
+            (error, time.time(), clip_attempt_id),
+        )
+        await self._db.commit()
+
+    async def mark_stale_pending_clips_unknown(self) -> int:
+        """Вызывается ChannelAutoclip.start() ДО запуска consumer-задачи —
+        любая запись status='pending', найденная на старте, принадлежит
+        прошлому процессу (текущий ещё не успел создать ни одной новой):
+        никакого cutoff по времени не нужно, в отличие от
+        reclaim_stuck_actions в mod_action_queue — там задание может
+        легитимно исполняться минутами (батч банов), здесь 'pending'
+        живёт секунды (время одного HTTP-запроса), и мы НЕ можем задним
+        числом узнать, дошёл ли POST до Twitch до убийства процесса —
+        единственный честный статус здесь unknown, не автоматический
+        retry. Возвращает число затронутых записей (для лога)."""
+        cursor = await self._db.execute(
+            "UPDATE mod_clips SET status = 'unknown', finished_at = ? WHERE status = 'pending'",
+            (time.time(),),
+        )
+        await self._db.commit()
+        return cursor.rowcount if cursor.rowcount is not None and cursor.rowcount > 0 else 0
+
     # -- Content Violations (эскалация по категории) -------------------------
 
     async def get_content_violation_count(self, user_id: str, category: ContentCategory) -> int:

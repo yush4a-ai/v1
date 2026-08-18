@@ -1622,3 +1622,131 @@ class TestDailyStats:
             "total_messages": 0, "suspicious": 0, "would_timeout": 0, "would_ban": 0,
             "actual_timeouts": 0, "actual_bans": 0, "clusters": 0, "false_positives": 0,
         }
+
+
+class TestClipAttempts:
+    """Персистентность Clip Engine (bot/autoclip.py): pending -> created /
+    lost_after_success / failed / unknown. См. докстринги методов в store.py
+    за обоснованием каждого перехода."""
+
+    async def _row(self, store: ModerationStore, clip_attempt_id: int) -> tuple[object, ...]:
+        cursor = await store._db.execute(  # noqa: SLF001
+            "SELECT status, clip_id, edit_url, error, finished_at FROM mod_clips WHERE id = ?",
+            (clip_attempt_id,),
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        return tuple(row)
+
+    async def test_create_clip_attempt_starts_pending(self, store: ModerationStore) -> None:
+        clip_attempt_id = await store.create_clip_attempt(
+            created_at=time.time(), trigger_reason="burst", trigger_text="pog x5"
+        )
+
+        assert clip_attempt_id > 0
+        status, clip_id, edit_url, error, finished_at = await self._row(store, clip_attempt_id)
+        assert status == "pending"
+        assert clip_id is None
+        assert edit_url is None
+        assert error is None
+        assert finished_at is None
+
+    async def test_mark_clip_created_sets_status_and_ids(self, store: ModerationStore) -> None:
+        clip_attempt_id = await store.create_clip_attempt(
+            created_at=time.time(), trigger_reason="burst", trigger_text="pog x5"
+        )
+
+        await store.mark_clip_created(clip_attempt_id, clip_id="clip123", edit_url="https://clips.twitch.tv/clip123")
+
+        status, clip_id, edit_url, error, finished_at = await self._row(store, clip_attempt_id)
+        assert status == "created"
+        assert clip_id == "clip123"
+        assert edit_url == "https://clips.twitch.tv/clip123"
+        assert error is None
+        assert finished_at is not None
+
+    async def test_mark_clip_lost_after_success_keeps_confirmed_ids(
+        self, store: ModerationStore
+    ) -> None:
+        clip_attempt_id = await store.create_clip_attempt(
+            created_at=time.time(), trigger_reason="keyword", trigger_text="clip it"
+        )
+
+        await store.mark_clip_lost_after_success(
+            clip_attempt_id, clip_id="clip456", edit_url="https://clips.twitch.tv/clip456",
+            error="запись в БД не удалась после успешного создания клипа",
+        )
+
+        status, clip_id, edit_url, error, finished_at = await self._row(store, clip_attempt_id)
+        assert status == "lost_after_success"
+        assert clip_id == "clip456"
+        assert edit_url == "https://clips.twitch.tv/clip456"
+        assert error == "запись в БД не удалась после успешного создания клипа"
+        assert finished_at is not None
+
+    async def test_mark_clip_failed_has_no_clip_id(self, store: ModerationStore) -> None:
+        clip_attempt_id = await store.create_clip_attempt(
+            created_at=time.time(), trigger_reason="voice", trigger_text="clip that"
+        )
+
+        await store.mark_clip_failed(clip_attempt_id, error="400: Bad Request")
+
+        status, clip_id, edit_url, error, finished_at = await self._row(store, clip_attempt_id)
+        assert status == "failed"
+        assert clip_id is None
+        assert edit_url is None
+        assert error == "400: Bad Request"
+        assert finished_at is not None
+
+    async def test_mark_clip_unknown_has_no_clip_id(self, store: ModerationStore) -> None:
+        clip_attempt_id = await store.create_clip_attempt(
+            created_at=time.time(), trigger_reason="burst", trigger_text="pog x5"
+        )
+
+        await store.mark_clip_unknown(clip_attempt_id, error="503: Service Unavailable")
+
+        status, clip_id, edit_url, error, finished_at = await self._row(store, clip_attempt_id)
+        assert status == "unknown"
+        assert clip_id is None
+        assert edit_url is None
+        assert error == "503: Service Unavailable"
+        assert finished_at is not None
+
+    async def test_mark_stale_pending_clips_unknown_affects_only_pending(
+        self, store: ModerationStore
+    ) -> None:
+        pending_id = await store.create_clip_attempt(
+            created_at=time.time(), trigger_reason="burst", trigger_text="a"
+        )
+        created_id = await store.create_clip_attempt(
+            created_at=time.time(), trigger_reason="burst", trigger_text="b"
+        )
+        await store.mark_clip_created(created_id, clip_id="clipX", edit_url="https://clips.twitch.tv/clipX")
+
+        reclaimed = await store.mark_stale_pending_clips_unknown()
+
+        assert reclaimed == 1
+        status, *_rest = await self._row(store, pending_id)
+        assert status == "unknown"
+        status_created, *_rest = await self._row(store, created_id)
+        assert status_created == "created"
+
+    async def test_mark_stale_pending_clips_unknown_no_pending_returns_zero(
+        self, store: ModerationStore
+    ) -> None:
+        reclaimed = await store.mark_stale_pending_clips_unknown()
+
+        assert reclaimed == 0
+
+    async def test_mark_stale_pending_clips_unknown_does_not_touch_error(
+        self, store: ModerationStore
+    ) -> None:
+        clip_attempt_id = await store.create_clip_attempt(
+            created_at=time.time(), trigger_reason="burst", trigger_text="a"
+        )
+
+        await store.mark_stale_pending_clips_unknown()
+
+        status, clip_id, edit_url, error, finished_at = await self._row(store, clip_attempt_id)
+        assert status == "unknown"
+        assert error is None

@@ -37,6 +37,7 @@ YAML — см. _merge_config.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 from dataclasses import dataclass
@@ -216,6 +217,7 @@ class ChannelAutoclip:
         config: AutoclipChannelConfig,
         clip_token_manager: ClipTokenManager,
         helix_client: HelixClient,
+        store: ModerationStore,
     ) -> None:
         self.channel = channel
         self.broadcaster_id = broadcaster_id
@@ -229,6 +231,12 @@ class ChannelAutoclip:
         self.enabled: bool = config.enabled
         self._clip_token_manager = clip_token_manager
         self._helix_client = helix_client
+        # Переиспользует уже открытое соединение AutoclipHub._settings_stores
+        # (см. AutoclipHub._start_channel) — не открывает своё: то соединение
+        # и так живёт между тиками на этом же канале, второе было бы лишним.
+        # Персистентность результата клипа (bug-аудит 2026-08-18) — см.
+        # _create_clip и докстринг миграции 024.
+        self._store = store
         self._burst_window = BurstWindow(config.burst.window_seconds)
         # None = ещё не клипали в этом процессе. Не 0.0: событие с
         # timestamp=0.0 (в частности в тестах) иначе сразу считалось бы
@@ -338,7 +346,25 @@ class ChannelAutoclip:
     async def _consume(self) -> None:
         """Строго последовательно, без параллелизма — как
         ChannelPipeline._consume_queue: два клипа подряд не должны гнаться
-        друг за другом через параллельные запросы к Helix."""
+        друг за другом через параллельные запросы к Helix.
+
+        Стартовая уборка (bug-аудит 2026-08-18) — ДО первого self._queue.get():
+        любая запись mod_clips со status='pending' на этот момент принадлежит
+        прошлому процессу (текущий ещё не успел создать ни одной новой) —
+        см. докстринг store.mark_stale_pending_clips_unknown про то, почему
+        здесь не нужен cutoff по времени, в отличие от reclaim_stuck_actions."""
+        try:
+            reclaimed = await self._store.mark_stale_pending_clips_unknown()
+            if reclaimed:
+                log.warning(
+                    "Канал %s: %d незавершённых попыток клипа из прошлого "
+                    "запуска помечены unknown — исход неизвестен, автоматически "
+                    "не пересоздаются",
+                    self.channel, reclaimed,
+                )
+        except Exception:
+            log.exception("Не удалось выполнить стартовую уборку mod_clips на канале %s", self.channel)
+
         while True:
             event = await self._queue.get()
             try:
@@ -349,6 +375,28 @@ class ChannelAutoclip:
                 self._queue.task_done()
 
     async def _create_clip(self, event: ClipTriggerEvent) -> None:
+        # Запись создаётся ДО capture_delay_seconds-паузы и ДО обращения к
+        # Helix — не после (bug-аудит 2026-08-18): если процесс падает
+        # прямо во время паузы или во время самого HTTP-запроса, запись
+        # уже существует в БД со status='pending' и при следующем старте
+        # канала честно станет 'unknown', а не пропадёт бесследно. См.
+        # докстринг миграции 024 (migrations.py) про все статусы.
+        try:
+            attempt_id = await self._store.create_clip_attempt(
+                created_at=event.timestamp, trigger_reason=event.reason, trigger_text=event.text,
+            )
+        except Exception:
+            # Если даже саму попытку не удалось записать — ничего не
+            # остаётся, кроме как отказаться от клипа: без attempt_id
+            # некуда записывать дальнейший исход, а идти в Helix без
+            # персистентности значило бы вернуться к исходной проблеме
+            # аудита (клип создан, но бот о нём не узнает).
+            log.exception(
+                "Не удалось создать запись mod_clips на канале %s — клип не запрашивается",
+                self.channel,
+            )
+            return
+
         # См. AutoclipChannelConfig.capture_delay_seconds: Twitch сам решает
         # окно клипа относительно момента вызова API, поэтому единственный
         # способ захватить то, что было ДО реакции стримера — самим
@@ -363,33 +411,89 @@ class ChannelAutoclip:
                 "Токен для клиппинга недействителен — получите новый в панели "
                 "(Settings -> Twitch: получить токен для клиппинга)"
             )
+            await self._mark_failed_safely(attempt_id, error="токен для клиппинга недействителен")
             return
 
         result = await self._helix_client.create_clip(
             broadcaster_id=event.broadcaster_id, user_token=access_token
         )
 
-        if result.success:
+        if result.outcome == "created":
+            try:
+                await self._store.mark_clip_created(
+                    attempt_id, clip_id=result.clip_id, edit_url=result.edit_url
+                )
+            except Exception:
+                # Twitch ТОЧНО подтвердил (clip_id/edit_url уже в result,
+                # процесс ЖИВ) — это не неопределённость, а сбой самой
+                # записи. Вторая попытка с теми же данными, отдельным
+                # статусом (см. докстринг mark_clip_lost_after_success).
+                log.exception(
+                    "Клип создан на канале %s (id=%s, %s), но не удалось сохранить "
+                    "результат в БД — записываю как lost_after_success",
+                    self.channel, result.clip_id, result.edit_url,
+                )
+                with contextlib.suppress(Exception):
+                    await self._store.mark_clip_lost_after_success(
+                        attempt_id, clip_id=result.clip_id, edit_url=result.edit_url,
+                        error="запись mod_clips не удалась после успешного создания клипа",
+                    )
             # Кулдаун обновляется ПОСЛЕ попытки создания, а не в submit_* —
             # иначе гонка при двух триггерах, всплывших в одном тике до
-            # завершения первого запроса к Helix.
+            # завершения первого запроса к Helix. Выставляется независимо
+            # от того, удалась ли запись в БД — клип реально создан на
+            # Twitch, канал должен уйти в кулдаун в любом случае.
             self._last_clip_at = event.timestamp
             log.info(
                 "Клип создан на канале %s (причина=%s, id=%s, %s)",
                 event.channel, event.reason, result.clip_id, result.edit_url,
             )
         else:
-            # Кулдаун НЕ выставляется при неудаче (стрим офлайн, истёкший
-            # scope, транзиентная ошибка Helix) — иначе канал уходит в
-            # полноценный cooldown_seconds как будто клип реально создан, и
-            # следующий genuine-триггер молча отбрасывается _in_cooldown()
-            # без единого сигнала оператору (bug-аудит 2026-08-15, CRITICAL
-            # #2 — ранее не найденная вторая причина инцидента "клипы не
-            # создаются на paverpapa", отдельная от общего/per-channel
-            # токена). Следующий триггер получает шанс попробовать снова.
+            # Кулдаун НЕ выставляется при неудаче/неопределённости (стрим
+            # офлайн, истёкший scope, транзиентная ошибка Helix) — иначе
+            # канал уходит в полноценный cooldown_seconds как будто клип
+            # реально создан, и следующий genuine-триггер молча
+            # отбрасывается _in_cooldown() без единого сигнала оператору
+            # (bug-аудит 2026-08-15, CRITICAL #2 — ранее не найденная
+            # вторая причина инцидента "клипы не создаются на paverpapa",
+            # отдельная от общего/per-channel токена). Следующий триггер
+            # получает шанс попробовать снова — НЕ автоматический retry
+            # этого события, а независимая новая попытка (bug-аудит
+            # 2026-08-18: устойчивость к неопределённости, не
+            # идемпотентность, см. докстринг ClipResult.outcome).
             log.error(
-                "Не удалось создать клип на канале %s (причина=%s): %s",
-                event.channel, event.reason, result.error,
+                "Не удалось создать клип на канале %s (причина=%s, исход=%s): %s",
+                event.channel, event.reason, result.outcome, result.error,
+            )
+            if result.outcome == "failed":
+                await self._mark_failed_safely(attempt_id, error=result.error)
+            else:
+                await self._mark_unknown_safely(attempt_id, error=result.error)
+
+    async def _mark_failed_safely(self, attempt_id: int, *, error: str) -> None:
+        """Обёртка вокруг store.mark_clip_failed — сбой самой записи здесь
+        не должен уронить _consume() (тот же принцип, что try/except в
+        _consume вокруг всего _create_clip, но точечно и с логом,
+        объясняющим, что именно не записалось)."""
+        try:
+            await self._store.mark_clip_failed(attempt_id, error=error)
+        except Exception:
+            log.exception(
+                "Не удалось записать status='failed' для попытки клипа #%d на канале %s",
+                attempt_id, self.channel,
+            )
+
+    async def _mark_unknown_safely(self, attempt_id: int, *, error: str) -> None:
+        """См. _mark_failed_safely. unknown здесь пишется ЖИВЫМ процессом
+        (HelixClient сам классифицировал исход как неопределённый) — не
+        путать со стартовой уборкой mark_stale_pending_clips_unknown,
+        которая не знает причину."""
+        try:
+            await self._store.mark_clip_unknown(attempt_id, error=error)
+        except Exception:
+            log.exception(
+                "Не удалось записать status='unknown' для попытки клипа #%d на канале %s",
+                attempt_id, self.channel,
             )
 
 
@@ -685,6 +789,21 @@ class AutoclipHub:
             )
             return
 
+        # _read_settings(broadcaster_id) выше уже должно было открыть и
+        # закэшировать store в self._settings_stores — переиспользуем то же
+        # соединение для персистентности клипов (bug-аудит 2026-08-18), не
+        # открываем новое. Ключа может не быть, если store.connect() внутри
+        # _read_settings упал (БД временно недоступна, см. её докстринг) —
+        # тогда тот же паттерн, что ниже для manager is None: не запускаем
+        # канал сейчас, следующий _reconcile-тик попробует снова.
+        store = self._settings_stores.get(broadcaster_id)
+        if store is None:
+            log.info(
+                "БД канала %s временно недоступна — автоклип не запущен на этом тике",
+                login,
+            )
+            return
+
         config = _merge_config(yaml_config, settings, enabled=enabled)
         config = _apply_auto_scale(config, viewer_count=self._viewer_counts.get(broadcaster_id))
         autoclip = ChannelAutoclip(
@@ -693,6 +812,7 @@ class AutoclipHub:
             config=config,
             clip_token_manager=manager,
             helix_client=self._helix_client,
+            store=store,
         )
         autoclip.start()
         self._channels[broadcaster_id] = autoclip

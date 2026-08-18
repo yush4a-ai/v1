@@ -255,6 +255,7 @@ class TestCreateClip:
         await client.close()
 
         assert result.success is True
+        assert result.outcome == "created"
         assert result.clip_id == "clip123"
         assert result.edit_url == "https://clips.twitch.tv/clip123/edit"
 
@@ -267,9 +268,27 @@ class TestCreateClip:
         await client.close()
 
         assert result.success is False
+        assert result.outcome == "failed"
         assert "403" in result.error
 
-    async def test_exhausted_retries_returns_failure_not_raise(self) -> None:
+    async def test_429_classified_as_failed_not_unknown(self) -> None:
+        """bug-аудит 2026-08-18: 429 означает "Twitch отклонил запрос ДО
+        создания клипа" (rate limit проверяется раньше бизнес-логики) —
+        исход точно известен, в отличие от 5xx/TransportError."""
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(429, json={"message": "rate limited"})
+
+        client = make_client(handler)
+        result = await client.create_clip(broadcaster_id="1", user_token="usertok")
+        await client.close()
+
+        assert result.success is False
+        assert result.outcome == "failed"
+
+    async def test_5xx_classified_as_unknown_not_failed(self) -> None:
+        """bug-аудит 2026-08-18: 5xx может произойти и ДО, и ПОСЛЕ
+        фактического создания клипа на стороне Twitch — исход не
+        известен, не failed."""
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(500, text="internal error")
 
@@ -278,7 +297,81 @@ class TestCreateClip:
         await client.close()
 
         assert result.success is False
-        assert result.broadcaster_id == "1"
+        assert result.outcome == "unknown"
+
+    async def test_transport_error_classified_as_unknown(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("no route to host")
+
+        client = make_client(handler)
+        result = await client.create_clip(broadcaster_id="1", user_token="usertok")
+        await client.close()
+
+        assert result.success is False
+        assert result.outcome == "unknown"
+
+    async def test_does_not_retry_on_5xx_exactly_one_post(self) -> None:
+        """Главная проверка bug-аудита 2026-08-18: create_clip() передаёт
+        retry=False — ровно один физический POST, независимо от того,
+        сколько раз Twitch отвечает 500. Без этого второй POST после
+        потерянного успешного ответа создал бы второй, отдельный клип
+        (Twitch Clips API не даёт idempotency-key)."""
+        attempts = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            attempts["n"] += 1
+            return httpx.Response(500, text="internal error")
+
+        client = make_client(handler)
+        await client.create_clip(broadcaster_id="1", user_token="usertok")
+        await client.close()
+
+        assert attempts["n"] == 1
+
+    async def test_does_not_retry_on_429_exactly_one_post(self) -> None:
+        attempts = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            attempts["n"] += 1
+            return httpx.Response(429, json={"message": "rate limited"})
+
+        client = make_client(handler)
+        await client.create_clip(broadcaster_id="1", user_token="usertok")
+        await client.close()
+
+        assert attempts["n"] == 1
+
+    async def test_does_not_retry_on_transport_error_exactly_one_attempt(self) -> None:
+        attempts = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            attempts["n"] += 1
+            raise httpx.ConnectError("no route to host")
+
+        client = make_client(handler)
+        await client.create_clip(broadcaster_id="1", user_token="usertok")
+        await client.close()
+
+        assert attempts["n"] == 1
+
+    async def test_other_endpoints_still_retry_unaffected_by_retry_false(self) -> None:
+        """retry=False в create_clip() не должен менять поведение остальных
+        методов HelixClient — они не передают retry явно, дефолт True."""
+        attempts = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "oauth2/token" in str(request.url):
+                return token_handler(request)
+            attempts["n"] += 1
+            if attempts["n"] < 2:
+                return httpx.Response(500, text="internal error")
+            return httpx.Response(200, json={"data": []})
+
+        client = make_client(handler)
+        await client.get_users(logins=["a"])
+        await client.close()
+
+        assert attempts["n"] == 2
 
 
 class TestGetStreams:
@@ -392,6 +485,39 @@ class TestRetryAndRateLimit:
         with pytest.raises(HelixError):
             await client.get_users(logins=["a"])
         await client.close()
+
+    async def test_helix_error_carries_last_status_code_on_5xx(self) -> None:
+        """bug-аудит 2026-08-18: раньше HelixError при исчерпании попыток
+        всегда нёс status_code=0, независимо от того, был ли получен
+        реальный HTTP-ответ. create_clip() теперь классифицирует
+        failed/unknown по exc.status_code — без этого различие 429 vs 5xx
+        было бы невозможно на уровне исключения."""
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "oauth2/token" in str(request.url):
+                return token_handler(request)
+            return httpx.Response(503, text="service unavailable")
+
+        client = make_client(handler)
+        with pytest.raises(HelixError) as exc_info:
+            await client.get_users(logins=["a"])
+        await client.close()
+
+        assert exc_info.value.status_code == 503
+
+    async def test_helix_error_status_code_zero_on_pure_transport_error(self) -> None:
+        """Чистый TransportError (ни одного HTTP-ответа получено не было)
+        — status_code остаётся 0, отличимо от "Twitch ответил 5xx"."""
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "oauth2/token" in str(request.url):
+                return token_handler(request)
+            raise httpx.ConnectError("no route to host")
+
+        client = make_client(handler)
+        with pytest.raises(HelixError) as exc_info:
+            await client.get_users(logins=["a"])
+        await client.close()
+
+        assert exc_info.value.status_code == 0
 
     async def test_ratelimit_reset_header_ignored_on_5xx(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Регрессия на bug-аудит 2026-08-15 (HIGH #11): Ratelimit-Reset

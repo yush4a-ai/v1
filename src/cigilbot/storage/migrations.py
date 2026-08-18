@@ -582,6 +582,57 @@ _MIGRATION_023_ACTION_QUEUE_LEASE_TOKEN = """
 ALTER TABLE mod_action_queue ADD COLUMN lease_token TEXT;
 """
 
+# Персистентность результата автоклипа (bug-аудит 2026-08-18) — раньше
+# _create_clip (bot/autoclip.py) писал clip_id/edit_url только в log.info,
+# ни одной строки в БД. Если Twitch создал клип, а процесс падал до записи
+# лога — клип физически существовал, но бот навсегда не знал о нём.
+#
+# Запись создаётся ДО вызова Helix (status='pending'), не после — это и
+# есть персистентность: если процесс падает между INSERT и ответом Twitch,
+# при следующем старте канала мы ТОЧНО знаем, что было незавершённое
+# событие, а не молчим о нём.
+#
+# Пять статусов, не идемпотентность, а устойчивость к неопределённости
+# (Twitch Clips API не даёт idempotency-key, повторный POST после
+# потерянного ответа создал бы второй клип — retry на этот эндпоинт
+# отключён явно, см. HelixClient.create_clip(retry=False)):
+#   pending             — событие поставлено, ответа от Twitch ещё нет
+#   created             — Twitch подтвердил (202), clip_id/edit_url
+#                         записаны с первой попытки
+#   failed              — Twitch точно отклонил (4xx кроме 429, или 429 —
+#                         оба означают "запрос не дошёл до создания клипа
+#                         на стороне Twitch", см. HelixClient.create_clip)
+#   lost_after_success  — Twitch подтвердил, clip_id/edit_url известны
+#                         ЖИВОМУ процессу, но первая попытка записать их
+#                         не удалась (SQLite locked и т.п.) — данные не
+#                         теряются, просто эта запись потребовала второй
+#                         попытки со стороны бота, не Twitch
+#   unknown             — либо HelixClient сам вернул outcome="unknown"
+#                         (5xx/TransportError — сервер мог упасть и до, и
+#                         после фактического создания клипа, не различимо
+#                         в текущей реализации _request), либо запись
+#                         осталась 'pending' через рестарт процесса (никто
+#                         не может задним числом узнать, дошёл ли POST)
+#
+# Ни один статус не запускает автоматический повторный POST к Twitch —
+# единственный источник нового клипа это новый независимый
+# ClipTriggerEvent от реального нового триггера в чате/голосе.
+_MIGRATION_024_CLIPS = """
+CREATE TABLE IF NOT EXISTS mod_clips (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at REAL NOT NULL,
+    trigger_reason TEXT NOT NULL,
+    trigger_text TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    clip_id TEXT,
+    edit_url TEXT,
+    error TEXT,
+    finished_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_mod_clips_status ON mod_clips(status);
+CREATE INDEX IF NOT EXISTS idx_mod_clips_created_at ON mod_clips(created_at);
+"""
+
 MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, _MIGRATION_001_CORE_AUDIT),
     (2, _MIGRATION_002_ACTIONS),
@@ -606,6 +657,7 @@ MIGRATIONS: tuple[tuple[int, str], ...] = (
     (21, _MIGRATION_021_AUTOCLIP_CAPTURE_DELAY),
     (22, _MIGRATION_022_ACTIONS_CLUSTER_ID_SOFT_REF),
     (23, _MIGRATION_023_ACTION_QUEUE_LEASE_TOKEN),
+    (24, _MIGRATION_024_CLIPS),
 )
 
 
